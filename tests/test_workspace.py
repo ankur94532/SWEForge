@@ -86,6 +86,71 @@ def test_workspace_reports_staged_unstaged_and_untracked_changes(tmp_path):
         workspace.cleanup()
 
 
+def test_workspace_reports_rename_target(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "old.txt").write_text("content\n")
+    git(repo, "add", "old.txt")
+    git(
+        repo,
+        "-c",
+        "user.name=SWEForge",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "initial",
+    )
+
+    workspace = Workspace.create(repo)
+    try:
+        (workspace.path / "old.txt").rename(workspace.path / "new.txt")
+        git(workspace.path, "add", "-A")
+        assert workspace.changed_files() == ["new.txt"]
+        assert "new.txt" in workspace.diff()
+    finally:
+        workspace.cleanup()
+
+
+def test_workspace_reports_changes_committed_inside_worktree(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "tracked.txt").write_text("initial\n")
+    git(repo, "add", "tracked.txt")
+    git(
+        repo,
+        "-c",
+        "user.name=SWEForge",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "initial",
+    )
+
+    workspace = Workspace.create(repo)
+    try:
+        (workspace.path / "tracked.txt").write_text("committed in worktree\n")
+        git(workspace.path, "add", "tracked.txt")
+        git(
+            workspace.path,
+            "-c",
+            "user.name=SWEForge",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "agent commit",
+        )
+        assert workspace.changed_files() == ["tracked.txt"]
+        assert "committed in worktree" in workspace.diff()
+        assert (repo / "tracked.txt").read_text() == "initial\n"
+    finally:
+        workspace.cleanup()
+
+
 def test_workspace_rejects_non_git_directory(tmp_path):
     with pytest.raises(WorkspaceError, match="Not a Git repository"):
         Workspace.create(tmp_path)

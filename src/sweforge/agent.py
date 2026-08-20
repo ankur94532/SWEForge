@@ -17,10 +17,8 @@ def run_task(*, model: str, worktree: str, task: str) -> str:
     )
     backend = CompositeBackend(
         default=local,
-        routes={
-            "/large_tool_results/": StateBackend(),
-            "/conversation_history/": StateBackend(),
-        },
+        routes={"/sweforge_internal/": StateBackend()},
+        artifacts_root="/sweforge_internal/",
     )
     agent = create_deep_agent(
         model=model,

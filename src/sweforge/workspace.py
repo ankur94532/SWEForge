@@ -60,7 +60,9 @@ class Workspace:
         return cls(repository=root, path=temp_path, base_commit=base)
 
     def changed_files(self) -> list[str]:
-        return sorted(path for _, path in self._status_entries())
+        tracked = [path for _, path in self._tracked_entries()]
+        untracked = [path for status, path in self._status_entries() if status == "??"]
+        return sorted(set(tracked + untracked))
 
     def diff(self) -> str:
         tracked = subprocess.run(
@@ -75,7 +77,7 @@ class Workspace:
             if status != "??":
                 continue
             result = subprocess.run(
-                ["git", "diff", "--no-index", "--binary", "--", "/dev/null", path],
+                ["git", "diff", "--no-index", "--binary", "--", os.devnull, path],
                 cwd=self.path,
                 check=False,
                 capture_output=True,
@@ -87,6 +89,39 @@ class Workspace:
                 )
             untracked.append(result.stdout)
         return tracked + "".join(untracked)
+
+    def _tracked_entries(self) -> list[tuple[str, str]]:
+        result = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--name-status",
+                "-z",
+                "--find-renames",
+                self.base_commit,
+                "--",
+            ],
+            cwd=self.path,
+            check=True,
+            capture_output=True,
+        )
+        fields = result.stdout.split(b"\0")
+        entries = []
+        index = 0
+        while index < len(fields) - 1:
+            status = os.fsdecode(fields[index])
+            index += 1
+            if not status:
+                continue
+            path = os.fsdecode(fields[index])
+            index += 1
+            if status[0] in "RC":
+                if index >= len(fields):
+                    raise WorkspaceError("malformed Git rename diff")
+                path = os.fsdecode(fields[index])
+                index += 1
+            entries.append((status[0], path))
+        return entries
 
     def _status_entries(self) -> list[tuple[str, str]]:
         result = subprocess.run(
@@ -108,7 +143,6 @@ class Workspace:
             if status[0] in "RC" or status[1] in "RC":
                 if index >= len(fields):
                     raise WorkspaceError("malformed Git rename status")
-                path = os.fsdecode(fields[index])
                 index += 1
             entries.append((status, path))
         return entries
