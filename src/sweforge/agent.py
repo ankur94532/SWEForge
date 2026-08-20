@@ -1,18 +1,30 @@
 """Deep Agent construction and invocation."""
 
+import os
 from typing import Any
 
 from deepagents import create_deep_agent
-from deepagents.backends import LocalShellBackend
+from deepagents.backends import CompositeBackend, LocalShellBackend, StateBackend
 
 
 def run_task(*, model: str, worktree: str, task: str) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
+    local = LocalShellBackend(
+        root_dir=worktree,
+        virtual_mode=True,
+        env={"PATH": os.environ.get("PATH", "")},
+        inherit_env=False,
+    )
+    backend = CompositeBackend(
+        default=local,
+        routes={
+            "/large_tool_results/": StateBackend(),
+            "/conversation_history/": StateBackend(),
+        },
+    )
     agent = create_deep_agent(
         model=model,
-        backend=LocalShellBackend(
-            root_dir=worktree, virtual_mode=True, inherit_env=False
-        ),
+        backend=backend,
         system_prompt=(
             "Work only within the provided repository worktree. Inspect the code, "
             "make the requested changes, and run relevant tests or validation. "

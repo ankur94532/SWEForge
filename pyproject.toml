@@ -5,7 +5,7 @@ description = "A small local software-engineering agent harness built on Deep Ag
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "deepagents>=0.6.10",
+    "deepagents>=0.7.0",
 ]
 
 [project.scripts]

@@ -765,7 +765,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "deepagents", specifier = ">=0.6.10" }]
+requires-dist = [{ name = "deepagents", specifier = ">=0.7.0" }]
 
 [package.metadata.requires-dev]
 dev = [

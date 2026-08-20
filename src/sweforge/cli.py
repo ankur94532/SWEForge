@@ -15,9 +15,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("task")
     parser.add_argument("--model")
     parser.add_argument(
-        "--keep-worktree",
+        "--discard-worktree",
         action="store_true",
-        help="retain the temporary worktree and print its path",
+        help="remove the temporary worktree after the run",
     )
     return parser
 
@@ -40,20 +40,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nBase commit: {workspace.base_commit}")
         print("\nGit diff:\n")
         print(diff or "(no diff)")
-        if args.keep_worktree:
-            print(f"\nWorktree retained at: {workspace.path}")
-        else:
+        if args.discard_worktree:
             workspace.cleanup()
+            print(f"\nWorktree discarded: {workspace.path}")
+        else:
+            print(f"\nWorktree retained at: {workspace.path}")
         return 0
     except (WorkspaceError, ValueError) as exc:
         print(f"sweforge: {exc}", file=sys.stderr)
         return 2
-    finally:
-        if workspace is not None and not args.keep_worktree and not workspace._removed:
-            try:
-                workspace.cleanup()
-            except Exception as exc:  # pragma: no cover - best-effort error path
-                print(f"sweforge: cleanup failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(f"sweforge: agent failed: {exc}", file=sys.stderr)
+        if workspace is not None:
+            print(f"Worktree retained at: {workspace.path}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

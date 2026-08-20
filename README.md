@@ -1,8 +1,8 @@
 # SWEForge
 
-SWEForge is a small local walking skeleton for software-engineering agents.
-It creates a temporary Git worktree, runs a Deep Agent against that worktree,
-and reports the agent's response and resulting diff.
+SWEForge V0 is a small local walking skeleton for software-engineering agents.
+Its flow is: task → temporary Git worktree → Deep Agent → inspect/edit/test →
+diff/result.
 
 ## Setup
 
@@ -22,8 +22,9 @@ provider package and credentials installed.
 uv run sweforge /path/to/git/repository "Fix the failing tests"
 ```
 
-Use `--keep-worktree` to retain the temporary worktree for inspection. Without
-it, SWEForge removes the temporary worktree after collecting the result.
+The temporary worktree is preserved by default and its path is printed for
+human inspection. Use `--discard-worktree` to explicitly remove it after the
+run. Failed runs also retain their worktree for debugging.
 
 ## Safety boundary
 
@@ -31,3 +32,17 @@ The worktree isolates changes from the primary checkout, but it is not a
 security sandbox. Deep Agents' `LocalShellBackend` executes commands directly
 on the host with the process user's permissions. Do not use this V0 CLI with
 untrusted tasks or repositories.
+
+## Conceptual boundaries
+
+- TOOLS are what the agent can do.
+- SKILLS are specialized procedural knowledge.
+- MEMORY is previously learned repository knowledge.
+- MODEL is the reasoning engine.
+- DEEP AGENTS is the inner agent harness.
+- LANGGRAPH is the durable orchestration/runtime.
+- SWEFORGE owns the SWE-specific lifecycle and composition.
+
+Future work may add GitHub polling, durable threads, per-thread
+sandboxes/workspaces, repository-scoped memory/skills/tools, and
+multi-repository execution. Those are planned boundaries, not V0 features.
