@@ -8,7 +8,9 @@ from sweforge.agent import _build_backend, run_task
 from sweforge.github_store import SQLiteGitHubStore
 from sweforge.repo_memory import (
     DEFAULT_MEMORY_CONTENT,
-    MEMORY_FILE,
+    LEGACY_MEMORY_STORE_KEY,
+    MEMORY_STORE_KEY,
+    MEMORY_VIRTUAL_PATH,
     SQLiteMemoryStore,
     ensure_repo_memory,
     read_repo_memory,
@@ -68,11 +70,60 @@ def test_store_backend_routes_memory_and_preserves_workspace_routes(tmp_path: Pa
     assert isinstance(backend.default, LocalShellBackend)
     assert isinstance(backend.routes["/sweforge_internal/"], StateBackend)
     assert isinstance(backend.routes["/memories/"], StoreBackend)
-    backend.routes["/memories/"].write(MEMORY_FILE, "memory")
+    write_repo_memory(memory.store, repo_memory_namespace(101), "memory")
     assert (
-        backend.routes["/memories/"].read(MEMORY_FILE).file_data["content"] == "memory"
+        memory.store.get(repo_memory_namespace(101), MEMORY_STORE_KEY).value["content"]
+        == "memory"
     )
+    assert backend.read(MEMORY_VIRTUAL_PATH).file_data["content"] == "memory"
+    downloaded = backend.download_files([MEMORY_VIRTUAL_PATH])[0]
+    assert downloaded.content == b"memory"
+    assert downloaded.error is None
+    backend.write("/memories/test.md", "test")
+    assert memory.store.get(repo_memory_namespace(101), "/test.md") is not None
     assert backend.default.execute("test -d .").exit_code == 0
+    memory.close()
+
+
+def test_store_search_is_scoped_to_namespace_segments():
+    memory = SQLiteMemoryStore(":memory:")
+    repo_one = repo_memory_namespace(1)
+    repo_twelve = repo_memory_namespace(12)
+    write_repo_memory(memory.store, repo_one, "repo one")
+    write_repo_memory(memory.store, repo_twelve, "repo twelve")
+
+    results = memory.store.search(repo_one)
+    assert [item.value["content"] for item in results] == ["repo one"]
+    memory.close()
+
+
+def test_legacy_memory_key_is_migrated_and_correct_key_wins():
+    memory = SQLiteMemoryStore(":memory:")
+    namespace = repo_memory_namespace(101)
+    legacy_content = "legacy operator memory\n"
+    memory.store.put(
+        namespace,
+        LEGACY_MEMORY_STORE_KEY,
+        {"content": legacy_content, "encoding": "utf-8"},
+    )
+    ensure_repo_memory(memory.store, namespace)
+    assert (
+        memory.store.get(namespace, MEMORY_STORE_KEY).value["content"] == legacy_content
+    )
+    backend = _build_backend(
+        "/tmp", memory_store=memory.store, memory_namespace=namespace
+    )
+    assert backend.read(MEMORY_VIRTUAL_PATH).file_data["content"] == legacy_content
+
+    correct_content = "correct operator memory\n"
+    write_repo_memory(memory.store, namespace, correct_content)
+    memory.store.put(
+        namespace,
+        LEGACY_MEMORY_STORE_KEY,
+        {"content": "stale legacy memory\n", "encoding": "utf-8"},
+    )
+    ensure_repo_memory(memory.store, namespace)
+    assert read_repo_memory(memory.store, namespace) == correct_content
     memory.close()
 
 
@@ -101,15 +152,21 @@ def test_run_task_wires_native_memory_and_denies_memory_writes(monkeypatch, tmp_
         == "done"
     )
 
-    assert calls["memory"] == [MEMORY_FILE]
+    assert calls["memory"] == [MEMORY_VIRTUAL_PATH]
     assert calls["store"] is memory.store
     permission = calls["permissions"][0]
     assert permission.operations == ["write"]
     assert permission.paths == ["/memories/**"]
     assert permission.mode == "deny"
     assert str(memory.path) not in calls["backend"].default._env.values()
-    assert _check_fs_permission(calls["permissions"], "write", MEMORY_FILE) == "deny"
-    assert _check_fs_permission(calls["permissions"], "read", MEMORY_FILE) == "allow"
+    assert (
+        _check_fs_permission(calls["permissions"], "write", MEMORY_VIRTUAL_PATH)
+        == "deny"
+    )
+    assert (
+        _check_fs_permission(calls["permissions"], "read", MEMORY_VIRTUAL_PATH)
+        == "allow"
+    )
     assert (
         _check_fs_permission(calls["permissions"], "write", "/calculator.py") == "allow"
     )

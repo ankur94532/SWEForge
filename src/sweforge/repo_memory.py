@@ -6,7 +6,9 @@ from pathlib import Path
 from langgraph.store.base import BaseStore
 from langgraph.store.sqlite import SqliteStore
 
-MEMORY_FILE = "/memories/AGENTS.md"
+MEMORY_VIRTUAL_PATH = "/memories/AGENTS.md"
+MEMORY_STORE_KEY = "/AGENTS.md"
+LEGACY_MEMORY_STORE_KEY = "/memories/AGENTS.md"
 DEFAULT_MEMORY_PATH = Path("~/.sweforge/memory.sqlite")
 DEFAULT_MEMORY_CONTENT = "# SWEForge Repository Memory\n"
 
@@ -48,17 +50,22 @@ class SQLiteMemoryStore:
 
 def ensure_repo_memory(store: BaseStore, namespace: tuple[str, ...]) -> None:
     """Create the canonical memory file with a safe header when absent."""
-    if store.get(namespace, MEMORY_FILE) is None:
-        store.put(
-            namespace,
-            MEMORY_FILE,
-            {"content": DEFAULT_MEMORY_CONTENT, "encoding": "utf-8"},
-        )
+    if store.get(namespace, MEMORY_STORE_KEY) is not None:
+        return
+    legacy = store.get(namespace, LEGACY_MEMORY_STORE_KEY)
+    if legacy is not None:
+        store.put(namespace, MEMORY_STORE_KEY, dict(legacy.value))
+        return
+    store.put(
+        namespace,
+        MEMORY_STORE_KEY,
+        {"content": DEFAULT_MEMORY_CONTENT, "encoding": "utf-8"},
+    )
 
 
 def read_repo_memory(store: BaseStore, namespace: tuple[str, ...]) -> str | None:
     """Read the canonical repository memory file, if it exists."""
-    item = store.get(namespace, MEMORY_FILE)
+    item = store.get(namespace, MEMORY_STORE_KEY)
     if item is None:
         return None
     content = item.value.get("content")
@@ -69,11 +76,12 @@ def write_repo_memory(
     store: BaseStore, namespace: tuple[str, ...], content: str
 ) -> None:
     """Replace the canonical repository memory file."""
-    store.put(namespace, MEMORY_FILE, {"content": content, "encoding": "utf-8"})
+    store.put(namespace, MEMORY_STORE_KEY, {"content": content, "encoding": "utf-8"})
 
 
 def append_repo_memory(store: BaseStore, namespace: tuple[str, ...], text: str) -> None:
     """Append trusted operator text to the canonical repository memory file."""
+    ensure_repo_memory(store, namespace)
     current = read_repo_memory(store, namespace)
     if current is None:
         current = DEFAULT_MEMORY_CONTENT

@@ -15,6 +15,8 @@ from deepagents.middleware.permissions import FilesystemPermission
 from langchain_core.messages import HumanMessage
 from langgraph.store.base import BaseStore
 
+from .repo_memory import MEMORY_VIRTUAL_PATH
+
 
 def _normalize_response_text(message: Any) -> str:
     """Return user-facing text without serializing structured message content."""
@@ -83,7 +85,7 @@ def run_task(
     backend = _build_backend(
         worktree, memory_store=memory_store, memory_namespace=memory_namespace
     )
-    memory = ["/memories/AGENTS.md"] if memory_store is not None else None
+    memory = [MEMORY_VIRTUAL_PATH] if memory_store is not None else None
     permissions = (
         [
             FilesystemPermission(
