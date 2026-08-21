@@ -98,6 +98,59 @@ CREATE TABLE IF NOT EXISTS event_publications (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS issue_workflow_state (
+    thread_id TEXT PRIMARY KEY REFERENCES issue_threads(thread_id),
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    repo_full_name TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    phase TEXT NOT NULL,
+    cycle_id INTEGER NOT NULL,
+    root_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    current_plan_id TEXT,
+    mode TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS issue_plans (
+    plan_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    repo_full_name TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    cycle_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    root_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    plan_text TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    posted_at TEXT,
+    posted_comment_id INTEGER,
+    approved_at TEXT,
+    approved_by TEXT,
+    approval_event_key TEXT,
+    UNIQUE(thread_id, cycle_id, version)
+);
+CREATE TABLE IF NOT EXISTS execution_permits (
+    permit_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    plan_id TEXT NOT NULL REFERENCES issue_plans(plan_id),
+    plan_version INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    source_event_key TEXT,
+    created_at TEXT NOT NULL,
+    consumed_at TEXT,
+    invalidated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS thread_input_consumptions (
+    event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    status TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    consumed_at TEXT
+);
 """
 
 
@@ -127,6 +180,42 @@ class PublicationStatus(StrEnum):
     COMPLETED = "COMPLETED"
     NO_CHANGES = "NO_CHANGES"
     FAILED = "FAILED"
+
+
+class WorkflowPhase(StrEnum):
+    IDLE = "IDLE"
+    PLANNING = "PLANNING"
+    WAITING_FOR_PLAN_APPROVAL = "WAITING_FOR_PLAN_APPROVAL"
+    EXECUTION_READY = "EXECUTION_READY"
+    EXECUTING = "EXECUTING"
+    AWAITING_PUBLICATION = "AWAITING_PUBLICATION"
+
+
+class WorkflowMode(StrEnum):
+    INTERACTIVE = "INTERACTIVE"
+    AUTO = "AUTO"
+
+
+class PlanStatus(StrEnum):
+    DRAFT = "DRAFT"
+    POSTED = "POSTED"
+    SUPERSEDED = "SUPERSEDED"
+    APPROVED = "APPROVED"
+    AUTO_APPROVED = "AUTO_APPROVED"
+    EXECUTED = "EXECUTED"
+
+
+class PermitSource(StrEnum):
+    USER = "USER"
+    AUTO = "AUTO"
+
+
+class InputPurpose(StrEnum):
+    CYCLE_ROOT = "CYCLE_ROOT"
+    PLAN_FEEDBACK = "PLAN_FEEDBACK"
+    LIVE_PLANNING_INPUT = "LIVE_PLANNING_INPUT"
+    LIVE_EXECUTION_INPUT = "LIVE_EXECUTION_INPUT"
+    PLAN_APPROVAL = "PLAN_APPROVAL"
 
 
 RESUMABLE_PUBLICATION_STATUSES = (
@@ -192,6 +281,66 @@ class PublicationRecord:
     error_message: str | None
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class WorkflowStateRecord:
+    thread_id: str
+    repo_id: int
+    repo_full_name: str
+    issue_number: int
+    phase: WorkflowPhase
+    cycle_id: int
+    root_event_key: str
+    current_plan_id: str | None
+    mode: WorkflowMode
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class PlanRecord:
+    plan_id: str
+    thread_id: str
+    repo_id: int
+    repo_full_name: str
+    issue_number: int
+    cycle_id: int
+    version: int
+    root_event_key: str
+    plan_text: str
+    status: PlanStatus
+    created_at: str
+    posted_at: str | None
+    posted_comment_id: int | None
+    approved_at: str | None
+    approved_by: str | None
+    approval_event_key: str | None
+
+
+@dataclass(frozen=True)
+class ExecutionPermit:
+    permit_id: str
+    thread_id: str
+    cycle_id: int
+    plan_id: str
+    plan_version: int
+    source: PermitSource
+    source_event_key: str | None
+    created_at: str
+    consumed_at: str | None
+    invalidated_at: str | None
+
+
+@dataclass(frozen=True)
+class WorkflowInputRecord:
+    event_key: str
+    thread_id: str
+    cycle_id: int
+    purpose: InputPurpose
+    status: str
+    claimed_at: str
+    consumed_at: str | None
 
 
 class SQLiteGitHubStore:
@@ -909,6 +1058,260 @@ class SQLiteGitHubStore:
                 "AND thread_id IS NULL",
                 (thread_id, repo_id, pr_number),
             )
+
+    def source_event(self, event_key: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM source_events WHERE event_key = ?", (event_key,)
+        ).fetchone()
+
+    def source_events_for_thread(self, thread_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            "SELECT * FROM source_events WHERE thread_id = ? "
+            "ORDER BY source_updated_at, discovered_at, event_key",
+            (thread_id,),
+        ).fetchall()
+
+    def workflow_state(self, thread_id: str) -> WorkflowStateRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM issue_workflow_state WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
+        return self._workflow_state_record(row) if row else None
+
+    def save_workflow_state(self, record: WorkflowStateRecord) -> WorkflowStateRecord:
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO issue_workflow_state(
+                   thread_id, repo_id, repo_full_name, issue_number, phase,
+                   cycle_id, root_event_key, current_plan_id, mode, created_at,
+                   updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(thread_id) DO UPDATE SET phase=excluded.phase,
+                   cycle_id=excluded.cycle_id, root_event_key=excluded.root_event_key,
+                   current_plan_id=excluded.current_plan_id, mode=excluded.mode,
+                   updated_at=excluded.updated_at""",
+                (
+                    record.thread_id,
+                    record.repo_id,
+                    record.repo_full_name,
+                    record.issue_number,
+                    record.phase.value,
+                    record.cycle_id,
+                    record.root_event_key,
+                    record.current_plan_id,
+                    record.mode.value,
+                    record.created_at,
+                    record.updated_at,
+                ),
+            )
+        return self.workflow_state(record.thread_id)  # type: ignore[return-value]
+
+    @staticmethod
+    def _workflow_state_record(row: sqlite3.Row) -> WorkflowStateRecord:
+        values = dict(row)
+        values["phase"] = WorkflowPhase(values["phase"])
+        values["mode"] = WorkflowMode(values["mode"])
+        return WorkflowStateRecord(**values)
+
+    def plans_for_thread(self, thread_id: str) -> list[PlanRecord]:
+        rows = self.connection.execute(
+            "SELECT * FROM issue_plans WHERE thread_id = ? ORDER BY cycle_id, version",
+            (thread_id,),
+        ).fetchall()
+        return [self._plan_record(row) for row in rows]
+
+    def plan(self, plan_id: str) -> PlanRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM issue_plans WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        return self._plan_record(row) if row else None
+
+    def current_plan(self, thread_id: str) -> PlanRecord | None:
+        state = self.workflow_state(thread_id)
+        return (
+            self.plan(state.current_plan_id)
+            if state and state.current_plan_id
+            else None
+        )
+
+    def insert_plan(self, record: PlanRecord) -> PlanRecord:
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO issue_plans(
+                   plan_id, thread_id, repo_id, repo_full_name, issue_number,
+                   cycle_id, version, root_event_key, plan_text, status,
+                   created_at, posted_at, posted_comment_id, approved_at,
+                   approved_by, approval_event_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.plan_id,
+                    record.thread_id,
+                    record.repo_id,
+                    record.repo_full_name,
+                    record.issue_number,
+                    record.cycle_id,
+                    record.version,
+                    record.root_event_key,
+                    record.plan_text,
+                    record.status.value,
+                    record.created_at,
+                    record.posted_at,
+                    record.posted_comment_id,
+                    record.approved_at,
+                    record.approved_by,
+                    record.approval_event_key,
+                ),
+            )
+        return self.plan(record.plan_id)  # type: ignore[return-value]
+
+    def update_plan(self, plan_id: str, **fields: object) -> PlanRecord:
+        allowed = {
+            "status",
+            "posted_at",
+            "posted_comment_id",
+            "approved_at",
+            "approved_by",
+            "approval_event_key",
+        }
+        if set(fields) - allowed:
+            raise ValueError(f"unknown plan fields: {sorted(set(fields) - allowed)}")
+        assignments: list[str] = []
+        values: list[object] = []
+        for key, value in fields.items():
+            assignments.append(f"{key} = ?")
+            values.append(value.value if isinstance(value, StrEnum) else value)
+        if not assignments:
+            return self.plan(plan_id)  # type: ignore[return-value]
+        values.append(plan_id)
+        with self.transaction(immediate=True) as db:
+            if (
+                db.execute(
+                    f"UPDATE issue_plans SET {', '.join(assignments)} "
+                    "WHERE plan_id = ?",
+                    values,
+                ).rowcount
+                != 1
+            ):
+                raise ValueError("unknown plan")
+        return self.plan(plan_id)  # type: ignore[return-value]
+
+    def permit(self, permit_id: str) -> ExecutionPermit | None:
+        row = self.connection.execute(
+            "SELECT * FROM execution_permits WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        return self._permit_record(row) if row else None
+
+    def permit_for_plan(self, plan_id: str) -> ExecutionPermit | None:
+        row = self.connection.execute(
+            "SELECT * FROM execution_permits WHERE plan_id = ? "
+            "AND invalidated_at IS NULL ORDER BY created_at DESC LIMIT 1",
+            (plan_id,),
+        ).fetchone()
+        return self._permit_record(row) if row else None
+
+    def insert_permit(self, record: ExecutionPermit) -> ExecutionPermit:
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO execution_permits(
+                   permit_id, thread_id, cycle_id, plan_id, plan_version, source,
+                   source_event_key, created_at, consumed_at, invalidated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    record.permit_id,
+                    record.thread_id,
+                    record.cycle_id,
+                    record.plan_id,
+                    record.plan_version,
+                    record.source.value,
+                    record.source_event_key,
+                    record.created_at,
+                    record.consumed_at,
+                    record.invalidated_at,
+                ),
+            )
+        return self.permit(record.permit_id)  # type: ignore[return-value]
+
+    def consume_permit(self, permit_id: str, *, consumed_at: str) -> ExecutionPermit:
+        with self.transaction(immediate=True) as db:
+            if (
+                db.execute(
+                    "UPDATE execution_permits SET consumed_at = ? "
+                    "WHERE permit_id = ? AND consumed_at IS NULL "
+                    "AND invalidated_at IS NULL",
+                    (consumed_at, permit_id),
+                ).rowcount
+                != 1
+            ):
+                raise ValueError("permit is missing, consumed, or invalidated")
+        return self.permit(permit_id)  # type: ignore[return-value]
+
+    def invalidate_permits(self, thread_id: str, cycle_id: int, *, now: str) -> None:
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                "UPDATE execution_permits SET invalidated_at = ? "
+                "WHERE thread_id = ? AND cycle_id = ? AND consumed_at IS NULL "
+                "AND invalidated_at IS NULL",
+                (now, thread_id, cycle_id),
+            )
+
+    def input_consumption(self, event_key: str) -> WorkflowInputRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM thread_input_consumptions WHERE event_key = ?",
+            (event_key,),
+        ).fetchone()
+        return self._input_record(row) if row else None
+
+    def consume_input(
+        self,
+        event_key: str,
+        *,
+        thread_id: str,
+        cycle_id: int,
+        purpose: InputPurpose,
+        claimed_at: str,
+        status: str = "CONSUMED",
+    ) -> WorkflowInputRecord:
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO thread_input_consumptions(
+                   event_key, thread_id, cycle_id, purpose, status, claimed_at,
+                   consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(event_key) DO NOTHING""",
+                (
+                    event_key,
+                    thread_id,
+                    cycle_id,
+                    purpose.value,
+                    status,
+                    claimed_at,
+                    claimed_at,
+                ),
+            )
+        return self.input_consumption(event_key)  # type: ignore[return-value]
+
+    def unconsumed_inputs(self, thread_id: str, *, after_event_key: str | None = None):
+        rows = self.source_events_for_thread(thread_id)
+        if after_event_key is not None:
+            keys = [row["event_key"] for row in rows]
+            if after_event_key in keys:
+                rows = rows[keys.index(after_event_key) + 1 :]
+        return [row for row in rows if self.input_consumption(row["event_key"]) is None]
+
+    @staticmethod
+    def _plan_record(row: sqlite3.Row) -> PlanRecord:
+        values = dict(row)
+        values["status"] = PlanStatus(values["status"])
+        return PlanRecord(**values)
+
+    @staticmethod
+    def _permit_record(row: sqlite3.Row) -> ExecutionPermit:
+        values = dict(row)
+        values["source"] = PermitSource(values["source"])
+        return ExecutionPermit(**values)
+
+    @staticmethod
+    def _input_record(row: sqlite3.Row) -> WorkflowInputRecord:
+        values = dict(row)
+        values["purpose"] = InputPurpose(values["purpose"])
+        return WorkflowInputRecord(**values)
 
     def events(self) -> list[sqlite3.Row]:
         return self.connection.execute(
