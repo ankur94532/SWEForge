@@ -8,6 +8,7 @@ import httpx
 from .github_auth import (
     DEFAULT_API_VERSION,
     POLL_READ,
+    REPO_WRITE,
     GitHubTokenProvider,
     StaticGitHubTokenProvider,
 )
@@ -31,6 +32,18 @@ class GitHubClient(Protocol):
     ) -> PollResponse: ...
 
     def issue(self, repo: RepositoryRef, number: int) -> dict: ...
+
+    def pull_requests(
+        self, repo: RepositoryRef, *, head: str, base: str
+    ) -> list[dict]: ...
+
+    def create_pull_request(
+        self, repo: RepositoryRef, *, head: str, base: str, title: str, body: str
+    ) -> dict: ...
+
+    def comments(self, repo: RepositoryRef, number: int) -> list[dict]: ...
+
+    def create_comment(self, repo: RepositoryRef, number: int, body: str) -> dict: ...
 
 
 class HttpxGitHubClient:
@@ -62,7 +75,11 @@ class HttpxGitHubClient:
 
     def repository(self, full_name: str) -> RepositoryRef:
         data = self._request("GET", f"/repos/{full_name}", token_scope=full_name).json()
-        return RepositoryRef(repo_id=int(data["id"]), full_name=data["full_name"])
+        return RepositoryRef(
+            repo_id=int(data["id"]),
+            full_name=data["full_name"],
+            default_branch=data.get("default_branch", "main"),
+        )
 
     def issue(self, repo: RepositoryRef, number: int) -> dict:
         return self._request(
@@ -83,6 +100,51 @@ class HttpxGitHubClient:
         self, repo: RepositoryRef, since: str, etag: str | None
     ) -> PollResponse:
         return self._poll(repo, "pulls/comments", since, etag)
+
+    def pull_requests(self, repo: RepositoryRef, *, head: str, base: str) -> list[dict]:
+        response = self._request(
+            "GET",
+            f"/repos/{repo.full_name}/pulls",
+            params={
+                "state": "all",
+                "head": f"{repo.full_name.split('/')[0]}:{head}",
+                "base": base,
+                "per_page": "100",
+            },
+            token_scope=repo.full_name,
+            profile=REPO_WRITE,
+        )
+        return list(self._pages(response, repo.full_name, REPO_WRITE))
+
+    def create_pull_request(
+        self, repo: RepositoryRef, *, head: str, base: str, title: str, body: str
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/repos/{repo.full_name}/pulls",
+            token_scope=repo.full_name,
+            profile=REPO_WRITE,
+            json={"head": head, "base": base, "title": title, "body": body},
+        ).json()
+
+    def comments(self, repo: RepositoryRef, number: int) -> list[dict]:
+        response = self._request(
+            "GET",
+            f"/repos/{repo.full_name}/issues/{number}/comments",
+            params={"per_page": "100"},
+            token_scope=repo.full_name,
+            profile=REPO_WRITE,
+        )
+        return list(self._pages(response, repo.full_name, REPO_WRITE))
+
+    def create_comment(self, repo: RepositoryRef, number: int, body: str) -> dict:
+        return self._request(
+            "POST",
+            f"/repos/{repo.full_name}/issues/{number}/comments",
+            token_scope=repo.full_name,
+            profile=REPO_WRITE,
+            json={"body": body},
+        ).json()
 
     def _poll(
         self, repo: RepositoryRef, endpoint: str, since: str, etag: str | None
@@ -105,7 +167,9 @@ class HttpxGitHubClient:
         items = list(self._pages(first, repo.full_name))
         return PollResponse(items=tuple(items), etag=first.headers.get("etag"))
 
-    def _pages(self, first: httpx.Response, repository: str) -> Iterator[dict]:
+    def _pages(
+        self, first: httpx.Response, repository: str, profile=POLL_READ
+    ) -> Iterator[dict]:
         response = first
         while True:
             payload = response.json()
@@ -115,7 +179,9 @@ class HttpxGitHubClient:
             next_url = response.links.get("next", {}).get("url")
             if not next_url:
                 return
-            response = self._request("GET", next_url, token_scope=repository)
+            response = self._request(
+                "GET", next_url, token_scope=repository, profile=profile
+            )
 
     def _request(
         self,
@@ -125,14 +191,17 @@ class HttpxGitHubClient:
         params: dict[str, str] | None = None,
         etag: str | None = None,
         token_scope: str,
+        profile=POLL_READ,
+        json: dict | None = None,
     ) -> httpx.Response:
         headers = {"If-None-Match": etag} if etag else None
-        token = self._token_provider.token_for(token_scope, POLL_READ)
+        token = self._token_provider.token_for(token_scope, profile)
         response = self._client.request(
             method,
             url,
             params=params,
             headers={**(headers or {}), "Authorization": f"Bearer {token}"},
+            json=json,
         )
         if response.status_code == 304:
             return response

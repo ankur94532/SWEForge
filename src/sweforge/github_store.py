@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
@@ -77,6 +78,23 @@ CREATE TABLE IF NOT EXISTS event_executions (
     error_message TEXT,
     workspace_path TEXT
 );
+CREATE TABLE IF NOT EXISTS event_publications (
+    event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    repo_full_name TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    branch_name TEXT NOT NULL,
+    local_commit_sha TEXT,
+    remote_commit_sha TEXT,
+    pr_number INTEGER,
+    pr_url TEXT,
+    comment_id INTEGER,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -95,6 +113,17 @@ class ExecutionStatus(StrEnum):
     INTERRUPTED = "INTERRUPTED"
     RETRY_PENDING = "RETRY_PENDING"
     SKIPPED = "SKIPPED"
+
+
+class PublicationStatus(StrEnum):
+    PENDING = "PENDING"
+    COMMITTED = "COMMITTED"
+    PUSHED = "PUSHED"
+    PR_CREATED = "PR_CREATED"
+    COMMENTED = "COMMENTED"
+    COMPLETED = "COMPLETED"
+    NO_CHANGES = "NO_CHANGES"
+    FAILED = "FAILED"
 
 
 @dataclass(frozen=True)
@@ -130,6 +159,25 @@ class ThreadWorkspaceRecord:
     workspace_path: str
     branch_name: str
     base_commit: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class PublicationRecord:
+    event_key: str
+    thread_id: str
+    repo_id: int
+    repo_full_name: str
+    issue_number: int
+    status: PublicationStatus
+    branch_name: str
+    local_commit_sha: str | None
+    remote_commit_sha: str | None
+    pr_number: int | None
+    pr_url: str | None
+    comment_id: int | None
+    error_message: str | None
     created_at: str
     updated_at: str
 
@@ -477,6 +525,119 @@ class SQLiteGitHubStore:
         return self.connection.execute(
             "SELECT * FROM event_executions WHERE event_key = ?", (event_key,)
         ).fetchone()
+
+    def publication_for_event(self, event_key: str) -> PublicationRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM event_publications WHERE event_key = ?", (event_key,)
+        ).fetchone()
+        return self._publication_record(row) if row else None
+
+    def next_publication(
+        self, event_key: str | None = None
+    ) -> PublicationRecord | None:
+        query = """SELECT ee.event_key FROM event_executions ee
+                   JOIN source_events se ON se.event_key = ee.event_key
+                   LEFT JOIN event_publications ep ON ep.event_key = ee.event_key
+                   WHERE ee.status = ? AND (ep.event_key IS NULL OR
+                         ep.status NOT IN (?, ?))"""
+        args: list[object] = [
+            ExecutionStatus.SUCCEEDED.value,
+            PublicationStatus.COMPLETED.value,
+            PublicationStatus.NO_CHANGES.value,
+        ]
+        if event_key is not None:
+            query += " AND ep.event_key = ?"
+            args.append(event_key)
+        query += " ORDER BY ee.completed_at, ee.event_key LIMIT 1"
+        row = self.connection.execute(query, args).fetchone()
+        if row is None:
+            return None
+        return self.ensure_publication(
+            row["event_key"], now=datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        )
+
+    def ensure_publication(self, event_key: str, *, now: str) -> PublicationRecord:
+        existing = self.publication_for_event(event_key)
+        if existing:
+            return existing
+        with self.transaction() as db:
+            row = db.execute(
+                """SELECT se.event_key, se.thread_id, se.repo_id, se.repo_full_name,
+                          se.subject_number, tw.branch_name
+                   FROM source_events se
+                   JOIN thread_workspaces tw ON tw.thread_id = se.thread_id
+                   JOIN event_executions ee ON ee.event_key = se.event_key
+                   WHERE se.event_key = ? AND ee.status = ?""",
+                (event_key, ExecutionStatus.SUCCEEDED.value),
+            ).fetchone()
+            if row is None:
+                raise ValueError("successful execution or workspace not found")
+            db.execute(
+                """INSERT INTO event_publications(
+                   event_key, thread_id, repo_id, repo_full_name, issue_number,
+                   status, branch_name, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_key,
+                    row["thread_id"],
+                    row["repo_id"],
+                    row["repo_full_name"],
+                    row["subject_number"],
+                    PublicationStatus.PENDING.value,
+                    row["branch_name"],
+                    now,
+                    now,
+                ),
+            )
+        return self.publication_for_event(event_key)  # type: ignore[return-value]
+
+    def update_publication(
+        self, event_key: str, *, status: PublicationStatus, now: str, **fields: object
+    ) -> PublicationRecord:
+        allowed = {
+            "local_commit_sha",
+            "remote_commit_sha",
+            "pr_number",
+            "pr_url",
+            "comment_id",
+            "error_message",
+        }
+        unknown = set(fields) - allowed
+        if unknown:
+            raise ValueError(f"unknown publication fields: {sorted(unknown)}")
+        assignments = ["status = ?", "updated_at = ?"]
+        values: list[object] = [status.value, now]
+        for key, value in fields.items():
+            assignments.append(f"{key} = ?")
+            values.append(value)
+        values.append(event_key)
+        with self.transaction() as db:
+            if (
+                db.execute(
+                    "UPDATE event_publications SET "
+                    f"{', '.join(assignments)} WHERE event_key = ?",
+                    values,
+                ).rowcount
+                != 1
+            ):
+                raise ValueError("publication does not exist")
+        return self.publication_for_event(event_key)  # type: ignore[return-value]
+
+    def retry_publication(self, event_key: str, *, now: str) -> PublicationRecord:
+        publication = self.publication_for_event(event_key)
+        if publication is None:
+            return self.ensure_publication(event_key, now=now)
+        if publication.status != PublicationStatus.FAILED:
+            raise ValueError("only failed publications can be retried")
+        return self.update_publication(
+            event_key, status=PublicationStatus.PENDING, now=now, error_message=None
+        )
+
+    @staticmethod
+    def _publication_record(row: sqlite3.Row) -> PublicationRecord:
+        values = dict(row)
+        values["status"] = PublicationStatus(values["status"])
+        return PublicationRecord(**values)
 
     def thread_workspace(self, thread_id: str) -> ThreadWorkspaceRecord | None:
         row = self.connection.execute(

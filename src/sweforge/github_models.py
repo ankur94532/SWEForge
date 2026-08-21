@@ -21,6 +21,7 @@ class SubjectKind(StrEnum):
 class RepositoryRef:
     repo_id: int
     full_name: str
+    default_branch: str = "main"
 
 
 @dataclass(frozen=True)

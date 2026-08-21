@@ -44,3 +44,39 @@ def test_http_client_headers_pagination_and_304():
     unchanged = client.issues(repo, "2026-01-01T00:00:00Z", "etag-1")
     assert unchanged.not_modified
     client.close()
+
+
+def test_writeback_endpoints_use_repository_write_scope():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "GET" and request.url.path.endswith("/repos/example/repo"):
+            return httpx.Response(200, json={"id": 123, "full_name": "example/repo"})
+        if request.method == "GET" and request.url.path.endswith("/pulls"):
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path.endswith("/pulls"):
+            return httpx.Response(201, json={"number": 4})
+        if request.method == "GET" and request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(201, json={"id": 8})
+
+    client = HttpxGitHubClient(
+        "token-value",
+        api_url="https://api.example",
+        transport=httpx.MockTransport(handler),
+    )
+    repo = client.repository("example/repo")
+    assert client.pull_requests(repo, head="sweforge/issue-7", base="main") == []
+    assert (
+        client.create_pull_request(
+            repo, head="sweforge/issue-7", base="main", title="title", body="body"
+        )["number"]
+        == 4
+    )
+    assert client.comments(repo, 7) == []
+    assert client.create_comment(repo, 7, "body")["id"] == 8
+    assert all(
+        request.headers["authorization"] == "Bearer token-value" for request in requests
+    )
+    client.close()

@@ -43,7 +43,7 @@ untrusted tasks or repositories.
 - LANGGRAPH is the durable orchestration/runtime.
 - SWEFORGE owns the SWE-specific lifecycle and composition.
 
-Future work may add GitHub writeback, per-thread sandboxes/workspaces,
+Future work may add per-thread sandboxes/workspaces,
 repository-scoped memory/skills/tools, and multi-repository execution. Those
 are planned boundaries, not V0 features.
 
@@ -76,8 +76,8 @@ discovers that repository's installation, then mints a short-lived,
 repository-scoped installation token with only `contents: read`, `issues: read`,
 and `pull_requests: read`. JWTs and installation tokens are held only in
 process memory and refreshed before expiry. Webhooks are not used; polling
-remains the ingestion mechanism. Future write operations will use separate
-narrowed permission profiles and are not implemented yet.
+remains the ingestion mechanism. Writeback uses a separate narrowed
+`contents/issues/pull_requests: write` permission profile.
 
 The REST API URL can be overridden with `SWEFORGE_GITHUB_API_URL`; the version
 header can be overridden with `SWEFORGE_GITHUB_API_VERSION` or `--api-version`.
@@ -110,8 +110,7 @@ uv run sweforge-github-execute \
 ```
 
 Execution is explicitly one-shot: one invocation claims at most one routed
-event. `--repo-path` mappings are trusted local checkouts; authenticated clone,
-GitHub writes, commits, pushes, and PR creation are not implemented. Worktrees
+event. `--repo-path` mappings are trusted local checkouts. Worktrees
 remain under `~/.sweforge/workspaces/{repo_id}/issue-{number}/`, while
 checkpoints live in their separate SQLite file. The same deterministic
 `IssueThread.thread_id` is the LangGraph `thread_id`, so follow-up events reuse
@@ -137,3 +136,27 @@ uv run sweforge-github-execution --db ~/.sweforge/state.db recover-stale
 uv run sweforge-github-execution --db ~/.sweforge/state.db retry EVENT_KEY
 uv run sweforge-github-execution --db ~/.sweforge/state.db skip EVENT_KEY
 ```
+
+### Crash-safe GitHub writeback
+
+After a successful execution, publish one result with the App credentials:
+
+```bash
+uv run sweforge-github-publish --db ~/.sweforge/state.db \
+  --lock-root ~/.sweforge/locks
+```
+
+Writeback durably records commit, push, pull request, comment, and completion
+states. It commits only non-empty IssueThread changes using the deterministic
+message `sweforge: address issue #N`, pushes only the IssueThread branch, and
+refuses divergent remote branches. Existing pull requests and comments are
+reconciled by repository/branch/base and the stable marker
+`<!-- sweforge:publication:<event-key> -->`; ambiguous matches fail safely.
+Use `--retry EVENT_KEY` for a publication recorded as `FAILED`.
+
+Git HTTP authentication uses a short-lived installation token through a
+temporary `GIT_ASKPASS` helper. The token is never placed in a remote URL,
+Git config, SQLite state, or command-line argument. The publisher derives the
+credential-free HTTPS remote from the configured GitHub API host and does not
+trust an arbitrary credential-bearing remote. Publication failures preserve
+the workspace and durable progress for retry.
