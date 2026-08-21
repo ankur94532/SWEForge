@@ -8,6 +8,7 @@ dependencies = [
     "deepagents>=0.7.0",
     "httpx>=0.28.0",
     "langgraph-checkpoint-sqlite>=2.0.0",
+    "pyjwt[crypto]>=2.9.0",
 ]
 
 [project.scripts]

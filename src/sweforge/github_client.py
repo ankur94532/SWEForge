@@ -5,6 +5,13 @@ from typing import Protocol
 
 import httpx
 
+from .github_auth import (
+    DEFAULT_API_VERSION,
+    POLL_READ,
+    GitHubTokenProvider,
+    StaticGitHubTokenProvider,
+)
+from .github_errors import GitHubAPIError
 from .github_models import PollResponse, RepositoryRef
 
 
@@ -26,27 +33,27 @@ class GitHubClient(Protocol):
     def issue(self, repo: RepositoryRef, number: int) -> dict: ...
 
 
-class GitHubAPIError(RuntimeError):
-    """A safe GitHub API error that does not include response bodies."""
-
-
 class HttpxGitHubClient:
     def __init__(
         self,
-        token: str,
+        token: str | None = None,
         *,
+        token_provider: GitHubTokenProvider | None = None,
         api_url: str = "https://api.github.com",
+        api_version: str = DEFAULT_API_VERSION,
         timeout: float = 20.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
+        if token_provider is not None and token is not None:
+            raise ValueError("provide token or token_provider, not both")
+        self._token_provider = token_provider or StaticGitHubTokenProvider(token or "")
         self._client = httpx.Client(
             base_url=api_url.rstrip("/"),
             timeout=timeout,
             transport=transport,
             headers={
-                "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
+                "X-GitHub-Api-Version": api_version,
             },
         )
 
@@ -54,11 +61,15 @@ class HttpxGitHubClient:
         self._client.close()
 
     def repository(self, full_name: str) -> RepositoryRef:
-        data = self._request("GET", f"/repos/{full_name}").json()
+        data = self._request("GET", f"/repos/{full_name}", token_scope=full_name).json()
         return RepositoryRef(repo_id=int(data["id"]), full_name=data["full_name"])
 
     def issue(self, repo: RepositoryRef, number: int) -> dict:
-        return self._request("GET", f"/repos/{repo.full_name}/issues/{number}").json()
+        return self._request(
+            "GET",
+            f"/repos/{repo.full_name}/issues/{number}",
+            token_scope=repo.full_name,
+        ).json()
 
     def issues(self, repo: RepositoryRef, since: str, etag: str | None) -> PollResponse:
         return self._poll(repo, "issues", since, etag)
@@ -83,14 +94,18 @@ class HttpxGitHubClient:
             "per_page": "100",
         }
         first = self._request(
-            "GET", f"/repos/{repo.full_name}/{endpoint}", params=params, etag=etag
+            "GET",
+            f"/repos/{repo.full_name}/{endpoint}",
+            params=params,
+            etag=etag,
+            token_scope=repo.full_name,
         )
         if first.status_code == 304:
             return PollResponse(etag=etag, not_modified=True)
-        items = list(self._pages(first))
+        items = list(self._pages(first, repo.full_name))
         return PollResponse(items=tuple(items), etag=first.headers.get("etag"))
 
-    def _pages(self, first: httpx.Response) -> Iterator[dict]:
+    def _pages(self, first: httpx.Response, repository: str) -> Iterator[dict]:
         response = first
         while True:
             payload = response.json()
@@ -100,7 +115,7 @@ class HttpxGitHubClient:
             next_url = response.links.get("next", {}).get("url")
             if not next_url:
                 return
-            response = self._request("GET", next_url)
+            response = self._request("GET", next_url, token_scope=repository)
 
     def _request(
         self,
@@ -109,9 +124,16 @@ class HttpxGitHubClient:
         *,
         params: dict[str, str] | None = None,
         etag: str | None = None,
+        token_scope: str,
     ) -> httpx.Response:
         headers = {"If-None-Match": etag} if etag else None
-        response = self._client.request(method, url, params=params, headers=headers)
+        token = self._token_provider.token_for(token_scope, POLL_READ)
+        response = self._client.request(
+            method,
+            url,
+            params=params,
+            headers={**(headers or {}), "Authorization": f"Bearer {token}"},
+        )
         if response.status_code == 304:
             return response
         if response.is_error:

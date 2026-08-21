@@ -43,9 +43,9 @@ untrusted tasks or repositories.
 - LANGGRAPH is the durable orchestration/runtime.
 - SWEFORGE owns the SWE-specific lifecycle and composition.
 
-Future work may add GitHub polling, durable threads, per-thread
-sandboxes/workspaces, repository-scoped memory/skills/tools, and
-multi-repository execution. Those are planned boundaries, not V0 features.
+Future work may add GitHub writeback, per-thread sandboxes/workspaces,
+repository-scoped memory/skills/tools, and multi-repository execution. Those
+are planned boundaries, not V0 features.
 
 ## GitHub ingestion foundation
 
@@ -54,15 +54,40 @@ polling-based rather than webhook-based and records durable `SourceEvent` and
 `IssueThread` state without executing an agent.
 
 ```bash
-SWEFORGE_GITHUB_TOKEN=... uv run sweforge-github-poll \
+SWEFORGE_GITHUB_APP_ID=... \
+SWEFORGE_GITHUB_APP_PRIVATE_KEY_PATH=~/.sweforge/credentials/sweforge-dev.pem \
+uv run sweforge-github-poll \
   --repo owner/repository \
   --repo owner/another-repository \
   --db ~/.sweforge/state.db
 ```
 
-The token is read from `SWEFORGE_GITHUB_TOKEN`, the API URL can be overridden
-with `SWEFORGE_GITHUB_API_URL` or `--api-url`, and the default SQLite database
-path can be overridden with `--db`. Do not commit tokens or the state database.
+GitHub App authentication is the preferred model. Configure the App ID with
+`SWEFORGE_GITHUB_APP_ID` and keep its private key outside repositories at the
+path in `SWEFORGE_GITHUB_APP_PRIVATE_KEY_PATH`. A Client ID may optionally be
+set with `SWEFORGE_GITHUB_APP_CLIENT_ID`; when present it is used as the JWT
+issuer, otherwise the App ID is used. The legacy
+`SWEFORGE_GITHUB_CLIENT_ID` name is accepted as a compatibility alias. The
+private key contents are never accepted on a CLI argument, logged, or stored
+in SQLite.
+
+The App must be installed on each explicitly selected repository. Polling first
+discovers that repository's installation, then mints a short-lived,
+repository-scoped installation token with only `contents: read`, `issues: read`,
+and `pull_requests: read`. JWTs and installation tokens are held only in
+process memory and refreshed before expiry. Webhooks are not used; polling
+remains the ingestion mechanism. Future write operations will use separate
+narrowed permission profiles and are not implemented yet.
+
+The REST API URL can be overridden with `SWEFORGE_GITHUB_API_URL`; the version
+header can be overridden with `SWEFORGE_GITHUB_API_VERSION` or `--api-version`.
+The default is the current documented GitHub REST API version. The default
+SQLite database path can be overridden with `--db`. Do not commit keys, tokens,
+or the state database.
+
+For local development only, `SWEFORGE_GITHUB_TOKEN` remains a legacy fallback
+when App credentials are absent. App credentials always take precedence, and
+the two authentication modes are never combined.
 
 The boundary is: GitHub → poller → durable `SourceEvent`/`IssueThread`;
 execution comes later.
