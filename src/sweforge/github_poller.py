@@ -15,6 +15,7 @@ from .github_models import (
     classify_subject,
     contains_agent_mention,
     parse_timestamp,
+    starts_with_agent_invocation,
 )
 from .github_store import RecordBatchResult, SQLiteGitHubStore
 
@@ -129,7 +130,12 @@ class GitHubPoller:
     ) -> Iterable[SourceEvent]:
         for item in items:
             body = item.get("body")
-            if not contains_agent_mention(body):
+            actionable = (
+                contains_agent_mention(body)
+                if stream == "issues"
+                else starts_with_agent_invocation(body)
+            )
+            if not actionable:
                 continue
             if stream == "issues":
                 if item.get("pull_request"):

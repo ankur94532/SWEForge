@@ -136,6 +136,28 @@ def test_issue_comment_classification_is_cached_per_poll(tmp_path):
     store.close()
 
 
+def test_comments_require_leading_agent_invocation(tmp_path):
+    repo = RepositoryRef(123, "example/repo")
+    fake = FakeGitHub(
+        {repo.full_name: repo},
+        {
+            (123, "issue_comments"): PollResponse(
+                (
+                    comment_item(comment_id=1, body="@agent accepted"),
+                    comment_item(comment_id=2, body="  @AGENT accepted"),
+                    comment_item(comment_id=3, body="hello @agent rejected"),
+                    comment_item(comment_id=4, body="FYI @agent rejected"),
+                )
+            )
+        },
+        {(123, 7): {}},
+    )
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    poller(fake, store).poll([repo.full_name])
+    assert {row["source_id"] for row in store.events()} == {"1", "2"}
+    store.close()
+
+
 def test_result_counts_new_threads_routing_and_duplicates_precisely(tmp_path):
     repo = RepositoryRef(123, "example/repo")
     fake = FakeGitHub(

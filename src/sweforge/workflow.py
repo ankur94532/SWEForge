@@ -11,6 +11,7 @@ from langgraph.store.base import BaseStore
 
 from .execution import ExecutionResult, execute_one, normalize_task
 from .github_client import GitHubClient
+from .github_models import starts_with_agent_invocation
 from .github_store import (
     ExecutionPermit,
     InputPurpose,
@@ -42,6 +43,13 @@ def invocation_text(body: str) -> str | None:
     if not _PREFIX_RE.match(body):
         return None
     return _PREFIX_RE.sub("", body, count=1).strip()
+
+
+def issue_has_auto_label(issue_payload: dict) -> bool:
+    return any(
+        isinstance(label, dict) and str(label.get("name", "")).casefold() == "auto"
+        for label in issue_payload.get("labels", [])
+    )
 
 
 def _stable_id(*parts: object) -> str:
@@ -209,7 +217,12 @@ class WorkflowEngine:
         )
         if workspace.head_sha() != before_head or not workspace.is_clean():
             raise WorkspaceError("planner changed the workspace")
-        return self.start_cycle(event_key=event_key, plan_text=plan_text)
+        mode = WorkflowMode.INTERACTIVE
+        if self.client is not None:
+            repo = self.client.repository(event["repo_full_name"])
+            if issue_has_auto_label(self.client.issue(repo, event["subject_number"])):
+                mode = WorkflowMode.AUTO
+        return self.start_cycle(event_key=event_key, plan_text=plan_text, mode=mode)
 
     def publish_plan(self, plan_id: str) -> PlanRecord:
         plan = self.store.plan(plan_id)
@@ -257,6 +270,8 @@ class WorkflowEngine:
                 }
             )
         )
+        if self.store.workflow_state(plan.thread_id).mode == WorkflowMode.AUTO:
+            self.authorize_auto(thread_id=plan.thread_id)
         return updated
 
     def approve(
@@ -325,7 +340,10 @@ class WorkflowEngine:
         if event is None or not event["thread_id"]:
             raise ValueError("unknown workflow input")
         state = self.store.workflow_state(event["thread_id"])
-        if state is None or state.phase != WorkflowPhase.WAITING_FOR_PLAN_APPROVAL:
+        if state is None or state.phase not in (
+            WorkflowPhase.WAITING_FOR_PLAN_APPROVAL,
+            WorkflowPhase.EXECUTION_READY,
+        ):
             raise ValueError("feedback is not currently accepted for planning")
         current = self.store.current_plan(state.thread_id)
         if current is None:
@@ -398,6 +416,20 @@ class WorkflowEngine:
         state = self.store.workflow_state(thread_id)
         if state is None or state.mode != WorkflowMode.AUTO:
             raise ValueError("AUTO authorization is not enabled")
+        if self.client is not None:
+            repo = self.client.repository(state.repo_full_name)
+            if not issue_has_auto_label(self.client.issue(repo, state.issue_number)):
+                self.store.save_workflow_state(
+                    WorkflowStateRecord(
+                        **{
+                            **state.__dict__,
+                            "mode": WorkflowMode.INTERACTIVE,
+                            "phase": WorkflowPhase.WAITING_FOR_PLAN_APPROVAL,
+                            "updated_at": self.clock(),
+                        }
+                    )
+                )
+                raise ValueError("AUTO label was removed before authorization")
         plan = self.store.current_plan(thread_id)
         if state.phase != WorkflowPhase.WAITING_FOR_PLAN_APPROVAL or plan is None:
             raise ValueError("AUTO authorization requires a current posted plan")
@@ -432,7 +464,11 @@ class WorkflowEngine:
         return self.store.permit(permit.permit_id)  # type: ignore[return-value]
 
     def execute_authorized(
-        self, *, permit_id: str, **execute_kwargs
+        self,
+        *,
+        permit_id: str,
+        live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
+        **execute_kwargs,
     ) -> ExecutionResult:
         permit = self.validate_permit(permit_id)
         state = self.store.workflow_state(permit.thread_id)
@@ -447,7 +483,16 @@ class WorkflowEngine:
                 }
             )
         )
-        result = execute_one(store=self.store, **execute_kwargs)
+        if live_input_provider is None:
+
+            def live_input_provider() -> list[tuple[str, str]]:
+                return self.pending_live_inputs(permit.thread_id)
+
+        result = execute_one(
+            store=self.store,
+            live_input_provider=live_input_provider,
+            **execute_kwargs,
+        )
         if result.status == "SUCCEEDED":
             current = self.store.workflow_state(permit.thread_id)
             if current:
@@ -461,6 +506,92 @@ class WorkflowEngine:
                     )
                 )
         return result
+
+    def pending_live_inputs(self, thread_id: str) -> list[tuple[str, str]]:
+        state = self.store.workflow_state(thread_id)
+        if state is None or state.phase not in (
+            WorkflowPhase.PLANNING,
+            WorkflowPhase.EXECUTING,
+            WorkflowPhase.AWAITING_PUBLICATION,
+        ):
+            return []
+        return [
+            (row["event_key"], row["body"])
+            for row in self.store.unconsumed_inputs(
+                thread_id, after_event_key=state.root_event_key
+            )
+            if starts_with_agent_invocation(row["body"])
+            and not is_exact_approval(row["body"])
+        ]
+
+    def acknowledge_live_inputs(self, thread_id: str, *, purpose: InputPurpose) -> None:
+        state = self.store.workflow_state(thread_id)
+        if state is None:
+            return
+        for event_key, _body in self.pending_live_inputs(thread_id):
+            self.store.consume_input(
+                event_key,
+                thread_id=thread_id,
+                cycle_id=state.cycle_id,
+                purpose=purpose,
+                claimed_at=self.clock(),
+            )
+
+    def complete_publication(
+        self,
+        *,
+        thread_id: str,
+        publication_status: str,
+        response_text: str = "",
+        changed_files: tuple[str, ...] = (),
+        pr_url: str | None = None,
+    ) -> str | None:
+        if publication_status not in {"COMPLETED", "NO_CHANGES"}:
+            return None
+        state = self.store.workflow_state(thread_id)
+        if state is None or self.client is None:
+            raise ValueError("workflow and GitHub client are required")
+        marker = f"<!-- sweforge:execution-summary:{state.root_event_key} -->"
+        repo = self.client.repository(state.repo_full_name)
+        comments = self.client.comments(repo, state.issue_number)
+        matching = [item for item in comments if marker in (item.get("body") or "")]
+        if len(matching) > 1:
+            raise WorkspaceError("multiple execution summary comments are ambiguous")
+        if matching:
+            comment_id = str(matching[0]["id"])
+        else:
+            body = [marker, "### SWEForge Execution", ""]
+            body.append(
+                "No repository changes were required."
+                if publication_status == "NO_CHANGES"
+                else response_text[:6_000] or "Execution completed."
+            )
+            if changed_files:
+                body.extend(["", "Changed files:"])
+                body.extend(f"- {name}" for name in changed_files[:200])
+            if pr_url:
+                body.extend(["", f"PR: {pr_url}"])
+            comment_id = str(
+                self.client.create_comment(
+                    repo, state.issue_number, "\n".join(body)[:MAX_COMMENT_CHARS]
+                )["id"]
+            )
+        plan = self.store.current_plan(thread_id)
+        if plan:
+            self.store.update_plan(plan.plan_id, status=PlanStatus.EXECUTED)
+        self.acknowledge_live_inputs(
+            thread_id, purpose=InputPurpose.LIVE_EXECUTION_INPUT
+        )
+        self.store.save_workflow_state(
+            WorkflowStateRecord(
+                **{
+                    **state.__dict__,
+                    "phase": WorkflowPhase.IDLE,
+                    "updated_at": self.clock(),
+                }
+            )
+        )
+        return comment_id
 
     def next_root(self, thread_id: str) -> str | None:
         state = self.store.workflow_state(thread_id)
@@ -482,3 +613,121 @@ class WorkflowEngine:
             if self.store.execution_for_event(row["event_key"]) is None:
                 return self.plan_event(event_key=row["event_key"], **plan_kwargs)
         return None
+
+    def advance(
+        self,
+        *,
+        thread_id: str,
+        model: str,
+        repo_paths: dict[str, str | Path],
+        workspace_root: str | Path,
+        memory_store: BaseStore | None = None,
+        execute_kwargs: dict | None = None,
+    ) -> WorkflowAdvanceResult:
+        """Advance one durable worker tick for a single IssueThread.
+
+        The per-thread caller supplies the existing execution arguments. Every
+        transition is persisted before the method returns, so a later tick can
+        safely recover after a process crash.
+        """
+        state = self.store.workflow_state(thread_id)
+        if state is None or state.phase == WorkflowPhase.IDLE:
+            plan = self.begin_next_cycle(
+                thread_id=thread_id,
+                model=model,
+                repo_paths=repo_paths,
+                workspace_root=workspace_root,
+                memory_store=memory_store,
+            )
+            if plan is None:
+                return WorkflowAdvanceResult(WorkflowPhase.IDLE, thread_id)
+            if self.client is not None:
+                plan = self.publish_plan(plan.plan_id)
+            return WorkflowAdvanceResult(
+                self.store.workflow_state(thread_id).phase,
+                thread_id,
+                plan_id=plan.plan_id,
+                message="plan created",
+            )
+
+        pending = self.store.unconsumed_inputs(
+            thread_id, after_event_key=state.root_event_key
+        )
+        if state.phase == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL and pending:
+            row = pending[0]
+            if is_exact_approval(row["body"]):
+                permit = self.approve(event_key=row["event_key"])
+                return WorkflowAdvanceResult(
+                    WorkflowPhase.EXECUTION_READY,
+                    thread_id,
+                    plan_id=permit.plan_id,
+                    permit_id=permit.permit_id,
+                    message="plan approved",
+                )
+            feedback = invocation_text(row["body"]) or row["body"]
+            plan = self._replan(
+                state=state,
+                feedback=feedback,
+                model=model,
+                repo_paths=repo_paths,
+                workspace_root=workspace_root,
+                memory_store=memory_store,
+                event_key=row["event_key"],
+            )
+            if self.client is not None:
+                plan = self.publish_plan(plan.plan_id)
+            return WorkflowAdvanceResult(
+                self.store.workflow_state(thread_id).phase,
+                thread_id,
+                plan_id=plan.plan_id,
+                message="plan revised",
+            )
+
+        if state.phase == WorkflowPhase.EXECUTION_READY:
+            permit = self.store.permit_for_plan(state.current_plan_id or "")
+            if permit is None:
+                raise ValueError("execution-ready workflow has no permit")
+            result = self.execute_authorized(
+                permit_id=permit.permit_id,
+                **(execute_kwargs or {}),
+            )
+            return WorkflowAdvanceResult(
+                self.store.workflow_state(thread_id).phase,
+                thread_id,
+                plan_id=permit.plan_id,
+                permit_id=permit.permit_id,
+                execution=result,
+            )
+        return WorkflowAdvanceResult(state.phase, thread_id, message="waiting")
+
+    def _replan(
+        self,
+        *,
+        state,
+        feedback: str,
+        model: str,
+        repo_paths: dict[str, str | Path],
+        workspace_root: str | Path,
+        memory_store: BaseStore | None,
+        event_key: str,
+    ) -> PlanRecord:
+        workspace = self.store.thread_workspace(state.thread_id)
+        if workspace is None:
+            raise WorkspaceError("planning workspace is missing")
+        root = self.store.source_event(state.root_event_key)
+        if root is None:
+            raise ValueError("planning root event is missing")
+        context = PlannerContext(
+            worktree=workspace.workspace_path,
+            memory_store=memory_store,
+            memory_namespace=repo_memory_namespace(state.repo_id)
+            if memory_store is not None
+            else None,
+        )
+        plan_text = self.planner(
+            context=context,
+            model=model,
+            task=normalize_task(root["body"]),
+            feedback=feedback,
+        )
+        return self.revise(event_key=event_key, plan_text=plan_text)

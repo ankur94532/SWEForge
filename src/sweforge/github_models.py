@@ -80,6 +80,14 @@ def contains_agent_mention(body: str | None, token: str = "@agent") -> bool:
     )
 
 
+def starts_with_agent_invocation(body: str | None, token: str = "@agent") -> bool:
+    """Return true only when a comment begins with the invocation token."""
+    if not body:
+        return False
+    escaped = re.escape(token)
+    return re.match(rf"^\s*{escaped}(?![A-Za-z0-9_])", body, re.IGNORECASE) is not None
+
+
 def classify_subject(issue_payload: dict) -> SubjectKind:
     """Classify an issue API object without confusing pull requests for issues."""
     return (

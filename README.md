@@ -92,6 +92,29 @@ the two authentication modes are never combined.
 The boundary is: GitHub → poller → durable `SourceEvent`/`IssueThread`;
 execution comes later.
 
+## Durable planning workflow
+
+IssueThread execution is gated by an application-owned workflow state machine.
+In INTERACTIVE mode, an actionable root enters planning, SWEForge posts a
+versioned plan to the original issue, and only the exact command
+`@agent approve` creates a permit for that exact plan version. Other leading
+`@agent` comments revise the plan. The planner uses a structurally read-only
+filesystem backend: it cannot execute a shell or mutate the worktree.
+
+An issue labeled `AUTO` follows the same plan-and-post sequence, then the
+application re-checks the label and creates an AUTO permit. AUTO skips the
+human wait; it does not skip planning or observability. Removing the label
+before permit creation returns the workflow to interactive approval.
+
+Comments must start with `@agent` to be actionable. While planning or
+executing, persisted leading-invocation comments are injected before the next
+model call using stable event-derived LangGraph message IDs. The delivery is
+at-least-once and logically deduplicated. Control comments are consumed by the
+workflow and cannot later become independent coding executions. Plan and
+execution-summary comments use deterministic markers so publication retries do
+not duplicate them. Repository memory remains read-only to both planner and
+executor agents.
+
 ## Repository-scoped long-term memory
 
 IssueThread conversation state and repository memory have separate lifetimes:

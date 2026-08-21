@@ -42,6 +42,7 @@ class TaskRunner(Protocol):
         resume_if_present: bool,
         memory_store: BaseStore | None,
         memory_namespace: tuple[str, ...] | None,
+        live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
     ) -> str: ...
 
 
@@ -175,6 +176,7 @@ def execute_one(
     runner: TaskRunner = run_task,
     memory_store: BaseStore | None = None,
     now: Callable[[], datetime] | None = None,
+    live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
 ) -> ExecutionResult:
     clock = now or (lambda: datetime.now(UTC))
     event = store.claim_next_event(now=utc_timestamp(clock()))
@@ -192,6 +194,7 @@ def execute_one(
                 checkpointer=checkpointer,
                 runner=runner,
                 memory_store=memory_store,
+                live_input_provider=live_input_provider,
                 now=clock,
             )
     except ThreadLockUnavailable:
@@ -220,6 +223,7 @@ def _execute_claim(
     checkpointer: object,
     runner: TaskRunner,
     memory_store: BaseStore | None,
+    live_input_provider: Callable[[], list[tuple[str, str]]] | None,
     now: Callable[[], datetime],
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
@@ -267,17 +271,20 @@ def _execute_claim(
         memory_namespace = repo_memory_namespace(event.repo_id)
         if memory_store is not None:
             ensure_repo_memory(memory_store, memory_namespace)
-        response = runner(
-            model=model,
-            worktree=str(workspace.path),
-            task=task,
-            thread_id=event.thread_id,
-            checkpointer=checkpointer,
-            message_id=event_message_id(event.event_key),
-            resume_if_present=True,
-            memory_store=memory_store,
-            memory_namespace=memory_namespace if memory_store is not None else None,
-        )
+        runner_kwargs = {
+            "model": model,
+            "worktree": str(workspace.path),
+            "task": task,
+            "thread_id": event.thread_id,
+            "checkpointer": checkpointer,
+            "message_id": event_message_id(event.event_key),
+            "resume_if_present": True,
+            "memory_store": memory_store,
+            "memory_namespace": memory_namespace if memory_store is not None else None,
+        }
+        if live_input_provider is not None:
+            runner_kwargs["live_input_provider"] = live_input_provider
+        response = runner(**runner_kwargs)
         changed = tuple(workspace.changed_files())
         diff = workspace.diff()
         end_head_sha = workspace.head_sha()

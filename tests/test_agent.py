@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
-from sweforge.agent import _build_backend, _normalize_response_text
+from sweforge.agent import LiveInputMiddleware, _build_backend, _normalize_response_text
 
 
 def test_shell_execution_uses_worktree_as_current_directory(tmp_path: Path):
@@ -15,6 +15,19 @@ def test_shell_execution_uses_worktree_as_current_directory(tmp_path: Path):
     assert pwd.output.strip() == str(tmp_path)
     assert pwd.exit_code == 0
     assert file_check.exit_code == 0
+
+
+def test_live_input_middleware_injects_stable_deduplicated_messages():
+    def pending():
+        return [("event-1", "@agent preserve compatibility")]
+
+    middleware = LiveInputMiddleware(pending)
+    first = middleware.before_model({"messages": []}, None)
+    assert len(first["messages"]) == 1
+    message = first["messages"][0]
+    assert isinstance(message, HumanMessage)
+    assert message.id.startswith("sweforge:event:")
+    assert middleware.before_model({"messages": [message]}, None) is None
 
 
 def test_normalize_response_text_handles_string_content():

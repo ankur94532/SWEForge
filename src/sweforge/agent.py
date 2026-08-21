@@ -1,7 +1,8 @@
 """Deep Agent construction and invocation."""
 
+import hashlib
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from deepagents import create_deep_agent
@@ -12,10 +13,41 @@ from deepagents.backends import (
     StoreBackend,
 )
 from deepagents.middleware.permissions import FilesystemPermission
+from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
 from langgraph.store.base import BaseStore
 
 from .repo_memory import MEMORY_VIRTUAL_PATH
+
+
+def _live_message_id(event_key: str) -> str:
+    return f"sweforge:event:{hashlib.sha256(event_key.encode()).hexdigest()}"
+
+
+class LiveInputMiddleware(AgentMiddleware):
+    """Inject durable actionable inputs before each model call.
+
+    The provider returns persisted events and their stable IDs. The middleware
+    deliberately does not acknowledge before the checkpointed message update;
+    retries are therefore at-least-once physically and deduplicated logically
+    by LangGraph message IDs.
+    """
+
+    def __init__(self, pending: Callable[[], list[tuple[str, str]]]) -> None:
+        self.pending = pending
+
+    def before_model(self, state, runtime):
+        existing = {
+            getattr(message, "id", None)
+            for message in state.get("messages", [])
+            if getattr(message, "id", None)
+        }
+        messages = [
+            HumanMessage(content=body, id=_live_message_id(event_key))
+            for event_key, body in self.pending()
+            if _live_message_id(event_key) not in existing
+        ]
+        return {"messages": messages} if messages else None
 
 
 def _normalize_response_text(message: Any) -> str:
@@ -78,6 +110,7 @@ def run_task(
     resume_if_present: bool = False,
     memory_store: BaseStore | None = None,
     memory_namespace: tuple[str, ...] | None = None,
+    live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
@@ -95,6 +128,11 @@ def run_task(
         if memory_store is not None
         else None
     )
+    middleware = (
+        [LiveInputMiddleware(live_input_provider)]
+        if live_input_provider is not None
+        else []
+    )
     agent = create_deep_agent(
         model=model,
         backend=backend,
@@ -111,6 +149,7 @@ def run_task(
         permissions=permissions,
         store=memory_store,
         checkpointer=checkpointer,
+        middleware=middleware,
     )
     input_state: dict[str, Any] | None = {
         "messages": [{"role": "user", "content": task}]
