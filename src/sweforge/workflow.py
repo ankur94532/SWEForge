@@ -11,7 +11,7 @@ from langgraph.store.base import BaseStore
 
 from .execution import ExecutionResult, execute_one, normalize_task
 from .github_client import GitHubClient
-from .github_models import starts_with_agent_invocation
+from .github_models import format_source_context, starts_with_agent_invocation
 from .github_store import (
     ExecutionPermit,
     InputPurpose,
@@ -153,6 +153,11 @@ class WorkflowEngine:
                 mode=mode,
                 created_at=state.created_at if state else timestamp,
                 updated_at=timestamp,
+                response_surface=event["origin_surface"],
+                response_subject_number=event["subject_number"],
+                response_comment_id=event["source_id"],
+                response_url=event["html_url"],
+                review_thread_root_id=event["review_thread_root_id"],
             )
         )
         return self.store.plan(plan_id)  # type: ignore[return-value]
@@ -213,7 +218,7 @@ class WorkflowEngine:
         plan_text = (planner or self.planner)(
             context=context,
             model=model,
-            task=normalize_task(event["body"]),
+            task=format_source_context(event, normalize_task(event["body"])),
         )
         if workspace.head_sha() != before_head or not workspace.is_clean():
             raise WorkspaceError("planner changed the workspace")
@@ -231,14 +236,24 @@ class WorkflowEngine:
         if self.client is None:
             raise ValueError("GitHub client is required to publish a plan")
         repo = self.client.repository(plan.repo_full_name)
+        state = self.store.workflow_state(plan.thread_id)
+        if state is None:
+            raise ValueError("workflow state disappeared")
         marker = f"<!-- sweforge:plan:{plan.plan_id} -->"
-        comments = self.client.comments(repo, plan.issue_number)
+        inline = state.response_surface == "PR_INLINE_REVIEW"
+        comments = (
+            self.client.review_comments_for_pull_request(repo, plan.issue_number)
+            if inline
+            else self.client.comments(
+                repo, state.response_subject_number or plan.issue_number
+            )
+        )
         matching = [item for item in comments if marker in (item.get("body") or "")]
         if len(matching) > 1:
             raise WorkspaceError("multiple plan comments are ambiguous")
         comment_id = int(matching[0]["id"]) if matching else None
         if comment_id is None:
-            mode = self.store.workflow_state(plan.thread_id).mode
+            mode = state.mode
             suffix = (
                 "\n\n`AUTO` is enabled, so SWEForge will continue without waiting "
                 "for approval."
@@ -249,18 +264,27 @@ class WorkflowEngine:
             body = f"{marker}\n### SWEForge Plan — v{plan.version}"
             body += " · AUTO" if mode == WorkflowMode.AUTO else ""
             body += f"\n\n{plan.plan_text[:MAX_COMMENT_CHARS]}{suffix}"
-            comment_id = int(
-                self.client.create_comment(repo, plan.issue_number, body)["id"]
-            )
+            if inline:
+                reply_to = state.review_thread_root_id or state.response_comment_id
+                if not reply_to:
+                    raise WorkspaceError("inline review response target is missing")
+                comment_id = int(
+                    self.client.create_review_comment_reply(repo, int(reply_to), body)[
+                        "id"
+                    ]
+                )
+            else:
+                comment_id = int(
+                    self.client.create_comment(
+                        repo, state.response_subject_number or plan.issue_number, body
+                    )["id"]
+                )
         updated = self.store.update_plan(
             plan.plan_id,
             status=PlanStatus.POSTED,
             posted_at=self.clock(),
             posted_comment_id=comment_id,
         )
-        state = self.store.workflow_state(plan.thread_id)
-        if state is None:
-            raise ValueError("workflow state disappeared")
         self.store.save_workflow_state(
             WorkflowStateRecord(
                 **{
@@ -287,6 +311,8 @@ class WorkflowEngine:
         state = self.store.workflow_state(event["thread_id"])
         if state is None or state.phase != WorkflowPhase.WAITING_FOR_PLAN_APPROVAL:
             raise ValueError("approval is only valid while waiting for a posted plan")
+        if event["origin_surface"] != state.response_surface:
+            raise ValueError("approval came from a different conversation surface")
         plan = self.store.current_plan(state.thread_id)
         if plan is None or plan.status != PlanStatus.POSTED:
             raise ValueError("no current posted plan can be approved")
@@ -345,6 +371,8 @@ class WorkflowEngine:
             WorkflowPhase.EXECUTION_READY,
         ):
             raise ValueError("feedback is not currently accepted for planning")
+        if event["origin_surface"] != state.response_surface:
+            raise ValueError("feedback came from a different conversation surface")
         current = self.store.current_plan(state.thread_id)
         if current is None:
             raise ValueError("current plan is missing")
@@ -516,10 +544,14 @@ class WorkflowEngine:
         ):
             return []
         return [
-            (row["event_key"], row["body"])
+            (
+                row["event_key"],
+                format_source_context(row, normalize_task(row["body"])),
+            )
             for row in self.store.unconsumed_inputs(
                 thread_id, after_event_key=state.root_event_key
             )
+            if row["origin_surface"] == state.response_surface
             if starts_with_agent_invocation(row["body"])
             and not is_exact_approval(row["body"])
         ]
@@ -553,7 +585,14 @@ class WorkflowEngine:
             raise ValueError("workflow and GitHub client are required")
         marker = f"<!-- sweforge:execution-summary:{state.root_event_key} -->"
         repo = self.client.repository(state.repo_full_name)
-        comments = self.client.comments(repo, state.issue_number)
+        inline = state.response_surface == "PR_INLINE_REVIEW"
+        comments = (
+            self.client.review_comments_for_pull_request(repo, state.issue_number)
+            if inline
+            else self.client.comments(
+                repo, state.response_subject_number or state.issue_number
+            )
+        )
         matching = [item for item in comments if marker in (item.get("body") or "")]
         if len(matching) > 1:
             raise WorkspaceError("multiple execution summary comments are ambiguous")
@@ -571,11 +610,24 @@ class WorkflowEngine:
                 body.extend(f"- {name}" for name in changed_files[:200])
             if pr_url:
                 body.extend(["", f"PR: {pr_url}"])
-            comment_id = str(
-                self.client.create_comment(
-                    repo, state.issue_number, "\n".join(body)[:MAX_COMMENT_CHARS]
-                )["id"]
-            )
+            rendered = "\n".join(body)[:MAX_COMMENT_CHARS]
+            if inline:
+                reply_to = state.review_thread_root_id or state.response_comment_id
+                if not reply_to:
+                    raise WorkspaceError("inline review response target is missing")
+                comment_id = str(
+                    self.client.create_review_comment_reply(
+                        repo, int(reply_to), rendered
+                    )["id"]
+                )
+            else:
+                comment_id = str(
+                    self.client.create_comment(
+                        repo,
+                        state.response_subject_number or state.issue_number,
+                        rendered,
+                    )["id"]
+                )
         plan = self.store.current_plan(thread_id)
         if plan:
             self.store.update_plan(plan.plan_id, status=PlanStatus.EXECUTED)
@@ -653,6 +705,9 @@ class WorkflowEngine:
         pending = self.store.unconsumed_inputs(
             thread_id, after_event_key=state.root_event_key
         )
+        pending = [
+            row for row in pending if row["origin_surface"] == state.response_surface
+        ]
         if state.phase == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL and pending:
             row = pending[0]
             if is_exact_approval(row["body"]):
@@ -727,7 +782,9 @@ class WorkflowEngine:
         plan_text = self.planner(
             context=context,
             model=model,
-            task=normalize_task(root["body"]),
-            feedback=feedback,
+            task=format_source_context(root, normalize_task(root["body"])),
+            feedback=format_source_context(
+                self.store.source_event(event_key) or {}, feedback
+            ),
         )
         return self.revise(event_key=event_key, plan_text=plan_text)

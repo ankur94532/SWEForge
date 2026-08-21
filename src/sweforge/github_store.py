@@ -39,7 +39,19 @@ CREATE TABLE IF NOT EXISTS source_events (
     body TEXT NOT NULL,
     html_url TEXT,
     thread_id TEXT REFERENCES issue_threads(thread_id),
-    discovered_at TEXT NOT NULL
+    discovered_at TEXT NOT NULL,
+    origin_surface TEXT NOT NULL DEFAULT 'ISSUE',
+    path TEXT,
+    line INTEGER,
+    start_line INTEGER,
+    side TEXT,
+    start_side TEXT,
+    diff_hunk TEXT,
+    commit_id TEXT,
+    original_commit_id TEXT,
+    in_reply_to_id TEXT,
+    pull_request_review_id TEXT,
+    review_thread_root_id TEXT
 );
 CREATE TABLE IF NOT EXISTS poll_cursors (
     repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
@@ -108,6 +120,11 @@ CREATE TABLE IF NOT EXISTS issue_workflow_state (
     root_event_key TEXT NOT NULL REFERENCES source_events(event_key),
     current_plan_id TEXT,
     mode TEXT NOT NULL,
+    response_surface TEXT NOT NULL DEFAULT 'ISSUE',
+    response_subject_number INTEGER,
+    response_comment_id TEXT,
+    response_url TEXT,
+    review_thread_root_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -237,6 +254,18 @@ class ClaimedEvent:
     body: str
     workspace_path: str | None
     retrying: bool = False
+    origin_surface: str = "ISSUE"
+    path: str | None = None
+    line: int | None = None
+    start_line: int | None = None
+    side: str | None = None
+    start_side: str | None = None
+    diff_hunk: str | None = None
+    commit_id: str | None = None
+    original_commit_id: str | None = None
+    in_reply_to_id: str | None = None
+    pull_request_review_id: str | None = None
+    review_thread_root_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -296,6 +325,11 @@ class WorkflowStateRecord:
     mode: WorkflowMode
     created_at: str
     updated_at: str
+    response_surface: str = "ISSUE"
+    response_subject_number: int | None = None
+    response_comment_id: str | None = None
+    response_url: str | None = None
+    review_thread_root_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -375,6 +409,66 @@ class SQLiteGitHubStore:
         for column, statement in migrations.items():
             if column not in columns:
                 self.connection.execute(statement)
+        source_columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(source_events)")
+        }
+        source_migrations = {
+            "origin_surface": (
+                "ALTER TABLE source_events ADD COLUMN origin_surface TEXT "
+                "NOT NULL DEFAULT 'ISSUE'"
+            ),
+            "path": "ALTER TABLE source_events ADD COLUMN path TEXT",
+            "line": "ALTER TABLE source_events ADD COLUMN line INTEGER",
+            "start_line": "ALTER TABLE source_events ADD COLUMN start_line INTEGER",
+            "side": "ALTER TABLE source_events ADD COLUMN side TEXT",
+            "start_side": "ALTER TABLE source_events ADD COLUMN start_side TEXT",
+            "diff_hunk": "ALTER TABLE source_events ADD COLUMN diff_hunk TEXT",
+            "commit_id": "ALTER TABLE source_events ADD COLUMN commit_id TEXT",
+            "original_commit_id": (
+                "ALTER TABLE source_events ADD COLUMN original_commit_id TEXT"
+            ),
+            "in_reply_to_id": (
+                "ALTER TABLE source_events ADD COLUMN in_reply_to_id TEXT"
+            ),
+            "pull_request_review_id": (
+                "ALTER TABLE source_events ADD COLUMN pull_request_review_id TEXT"
+            ),
+            "review_thread_root_id": (
+                "ALTER TABLE source_events ADD COLUMN review_thread_root_id TEXT"
+            ),
+        }
+        for column, statement in source_migrations.items():
+            if column not in source_columns:
+                self.connection.execute(statement)
+        workflow_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(issue_workflow_state)"
+            )
+        }
+        workflow_migrations = {
+            "response_surface": (
+                "ALTER TABLE issue_workflow_state ADD COLUMN response_surface TEXT "
+                "NOT NULL DEFAULT 'ISSUE'"
+            ),
+            "response_subject_number": (
+                "ALTER TABLE issue_workflow_state ADD COLUMN "
+                "response_subject_number INTEGER"
+            ),
+            "response_comment_id": (
+                "ALTER TABLE issue_workflow_state ADD COLUMN response_comment_id TEXT"
+            ),
+            "response_url": (
+                "ALTER TABLE issue_workflow_state ADD COLUMN response_url TEXT"
+            ),
+            "review_thread_root_id": (
+                "ALTER TABLE issue_workflow_state ADD COLUMN review_thread_root_id TEXT"
+            ),
+        }
+        for column, statement in workflow_migrations.items():
+            if column not in workflow_columns:
+                self.connection.execute(statement)
 
     def close(self) -> None:
         self.connection.close()
@@ -441,8 +535,15 @@ class SQLiteGitHubStore:
                     """INSERT OR IGNORE INTO source_events(
                        event_key, repo_id, repo_full_name, source_kind, source_id,
                        source_updated_at, subject_kind, subject_number, author_login,
-                       body, html_url, thread_id, discovered_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       body, html_url, thread_id, discovered_at, origin_surface,
+                       path, line, start_line, side, start_side, diff_hunk,
+                       commit_id, original_commit_id, in_reply_to_id,
+                       pull_request_review_id, review_thread_root_id)
+                       VALUES (?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?)""",
                     (
                         event.event_key,
                         event.repo_id,
@@ -457,6 +558,18 @@ class SQLiteGitHubStore:
                         event.html_url,
                         thread_id,
                         polled_at,
+                        event.origin_surface.value,
+                        event.path,
+                        event.line,
+                        event.start_line,
+                        event.side,
+                        event.start_side,
+                        event.diff_hunk,
+                        event.commit_id,
+                        event.original_commit_id,
+                        event.in_reply_to_id,
+                        event.pull_request_review_id,
+                        event.review_thread_root_id,
                     ),
                 )
                 result.events_persisted += 1
@@ -557,6 +670,10 @@ class SQLiteGitHubStore:
             row = db.execute(
                 """SELECT se.event_key, se.thread_id, se.repo_id,
                           se.repo_full_name, thread.issue_number, se.body,
+                          se.origin_surface, se.path, se.line, se.start_line,
+                          se.side, se.start_side, se.diff_hunk, se.commit_id,
+                          se.original_commit_id, se.in_reply_to_id,
+                          se.pull_request_review_id, se.review_thread_root_id,
                           ee.status AS execution_status
                    FROM source_events AS se
                    JOIN issue_threads AS thread
@@ -635,6 +752,18 @@ class SQLiteGitHubStore:
                 body=row["body"],
                 workspace_path=None,
                 retrying=retrying,
+                origin_surface=row["origin_surface"],
+                path=row["path"],
+                line=row["line"],
+                start_line=row["start_line"],
+                side=row["side"],
+                start_side=row["start_side"],
+                diff_hunk=row["diff_hunk"],
+                commit_id=row["commit_id"],
+                original_commit_id=row["original_commit_id"],
+                in_reply_to_id=row["in_reply_to_id"],
+                pull_request_review_id=row["pull_request_review_id"],
+                review_thread_root_id=row["review_thread_root_id"],
             )
 
     def release_execution_claim(self, event_key: str, *, retrying: bool) -> None:
@@ -1083,11 +1212,18 @@ class SQLiteGitHubStore:
                 """INSERT INTO issue_workflow_state(
                    thread_id, repo_id, repo_full_name, issue_number, phase,
                    cycle_id, root_event_key, current_plan_id, mode, created_at,
-                   updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   updated_at, response_surface, response_subject_number,
+                   response_comment_id, response_url, review_thread_root_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(thread_id) DO UPDATE SET phase=excluded.phase,
                    cycle_id=excluded.cycle_id, root_event_key=excluded.root_event_key,
                    current_plan_id=excluded.current_plan_id, mode=excluded.mode,
-                   updated_at=excluded.updated_at""",
+                   updated_at=excluded.updated_at,
+                   response_surface=excluded.response_surface,
+                   response_subject_number=excluded.response_subject_number,
+                   response_comment_id=excluded.response_comment_id,
+                   response_url=excluded.response_url,
+                   review_thread_root_id=excluded.review_thread_root_id""",
                 (
                     record.thread_id,
                     record.repo_id,
@@ -1100,6 +1236,11 @@ class SQLiteGitHubStore:
                     record.mode.value,
                     record.created_at,
                     record.updated_at,
+                    record.response_surface,
+                    record.response_subject_number,
+                    record.response_comment_id,
+                    record.response_url,
+                    record.review_thread_root_id,
                 ),
             )
         return self.workflow_state(record.thread_id)  # type: ignore[return-value]

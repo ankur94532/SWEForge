@@ -158,6 +158,47 @@ def test_comments_require_leading_agent_invocation(tmp_path):
     store.close()
 
 
+def test_inline_review_context_is_persisted(tmp_path):
+    repo = RepositoryRef(123, "example/repo")
+    fake = FakeGitHub(
+        {repo.full_name: repo},
+        {
+            (123, "review_comments"): PollResponse(
+                (
+                    {
+                        "id": 44,
+                        "updated_at": "2026-01-01T00:00:00Z",
+                        "body": "@agent fix this race",
+                        "pull_request_url": "https://api.github.com/repos/example/repo/pulls/12",
+                        "path": "src/Foo.java",
+                        "line": 15,
+                        "start_line": 10,
+                        "side": "RIGHT",
+                        "start_side": "RIGHT",
+                        "diff_hunk": "@@ -10,6 +10,11 @@",
+                        "commit_id": "newsha",
+                        "original_commit_id": "oldsha",
+                        "in_reply_to_id": 40,
+                        "pull_request_review_id": 9,
+                    },
+                )
+            )
+        },
+    )
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    poller(fake, store).poll([repo.full_name])
+    event = store.events()[0]
+    assert event["origin_surface"] == "PR_INLINE_REVIEW"
+    assert event["path"] == "src/Foo.java"
+    assert (event["line"], event["start_line"]) == (15, 10)
+    assert (event["side"], event["start_side"]) == ("RIGHT", "RIGHT")
+    assert event["diff_hunk"] == "@@ -10,6 +10,11 @@"
+    assert event["commit_id"] == "newsha"
+    assert event["original_commit_id"] == "oldsha"
+    assert event["review_thread_root_id"] == "40"
+    store.close()
+
+
 def test_result_counts_new_threads_routing_and_duplicates_precisely(tmp_path):
     repo = RepositoryRef(123, "example/repo")
     fake = FakeGitHub(

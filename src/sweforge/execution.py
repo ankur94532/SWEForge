@@ -17,6 +17,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.base import BaseStore
 
 from .agent import run_task
+from .github_models import format_source_context
 from .github_store import (
     ClaimedEvent,
     ExecutionStatus,
@@ -72,6 +73,23 @@ def utc_timestamp(value: datetime | None = None) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("execution clock must return an aware datetime")
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _review_context(worktree: Path, event: ClaimedEvent) -> str | None:
+    """Return bounded current code context for an inline review anchor."""
+    path = getattr(event, "path", None)
+    line = getattr(event, "line", None) or getattr(event, "start_line", None)
+    if not path or not line or Path(path).is_absolute() or ".." in Path(path).parts:
+        return None
+    target = (worktree / path).resolve()
+    try:
+        target.relative_to(worktree.resolve())
+        lines = target.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError, ValueError):
+        return None
+    start = max(0, int(line) - 6)
+    end = min(len(lines), int(line) + 5)
+    return "\n".join(f"{index + 1}: {lines[index]}" for index in range(start, end))
 
 
 @contextmanager
@@ -268,6 +286,12 @@ def _execute_claim(
                 "existing workspace is dirty before a new IssueThread event"
             )
         start_head_sha = workspace.head_sha()
+        if event.path:
+            task = format_source_context(
+                event, task, _review_context(workspace.path, event)
+            )
+        else:
+            task = format_source_context(event, task)
         memory_namespace = repo_memory_namespace(event.repo_id)
         if memory_store is not None:
             ensure_repo_memory(memory_store, memory_namespace)

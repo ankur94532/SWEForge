@@ -2,7 +2,14 @@ from dataclasses import replace
 
 import pytest
 
-from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
+from sweforge.github_models import (
+    OriginSurface,
+    RepositoryRef,
+    SourceEvent,
+    SourceKind,
+    SubjectKind,
+    format_source_context,
+)
 from sweforge.github_store import (
     PlanStatus,
     SQLiteGitHubStore,
@@ -55,6 +62,30 @@ def test_exact_approval_is_deterministic():
     assert invocation_text("FYI @agent revise") is None
     assert issue_has_auto_label({"labels": [{"name": "auto"}]})
     assert not issue_has_auto_label({"labels": [{"name": "manual"}]})
+
+
+def test_inline_source_context_contains_bounded_review_provenance():
+    context = format_source_context(
+        {
+            "origin_surface": "PR_INLINE_REVIEW",
+            "author_login": "alice",
+            "subject_number": 42,
+            "path": "src/Foo.java",
+            "line": 15,
+            "start_line": 10,
+            "side": "RIGHT",
+            "diff_hunk": "@@ -10,6 +10,11 @@",
+            "commit_id": "newsha",
+            "original_commit_id": "oldsha",
+        },
+        "fix this race",
+    )
+    assert "GitHub PR #42 inline review" in context
+    assert "src/Foo.java" in context
+    assert "10-15" in context
+    assert "@@ -10,6 +10,11 @@" in context
+    assert "newsha" in context and "oldsha" in context
+    assert "outdated" in context
 
 
 def test_plan_feedback_approval_and_permit_bind_current_plan(tmp_path):
@@ -112,6 +143,14 @@ class WorkflowGitHub:
         self.created.append(item)
         return item
 
+    def review_comments_for_pull_request(self, repo, number):
+        return self.created
+
+    def create_review_comment_reply(self, repo, comment_id, body):
+        item = {"id": len(self.created) + 1, "body": body, "reply_to": comment_id}
+        self.created.append(item)
+        return item
+
 
 def test_auto_posts_plan_and_creates_application_permit(tmp_path):
     store = SQLiteGitHubStore(tmp_path / "state.db")
@@ -130,4 +169,29 @@ def test_auto_posts_plan_and_creates_application_permit(tmp_path):
     assert permit is not None
     assert permit.source.value == "AUTO"
     assert "AUTO" in client.created[0]["body"]
+    store.close()
+
+
+def test_pr_conversation_plan_and_summary_use_pr_surface(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(123, "example/repo")
+    root = make_event(repo, source_id="1", body="@agent add a test")
+    root = replace(
+        root,
+        subject_number=42,
+        origin_surface=OriginSurface.PR_CONVERSATION,
+        html_url="https://github.com/example/repo/pull/42#issuecomment-1",
+    )
+    seed(store, [root])
+    client = WorkflowGitHub()
+    engine = WorkflowEngine(store=store, client=client, clock=lambda: "now")
+    plan = engine.start_cycle(event_key=root.event_key, plan_text="v1")
+    engine.publish_plan(plan.plan_id)
+    assert client.created[0]["body"].startswith("<!-- sweforge:plan:")
+    assert client.created[0]["id"] == 1
+    engine.complete_publication(
+        thread_id="github:123:issue:42",
+        publication_status="NO_CHANGES",
+    )
+    assert "execution-summary" in client.created[1]["body"]
     store.close()

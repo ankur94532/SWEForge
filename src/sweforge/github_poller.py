@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 
 from .github_client import GitHubClient
 from .github_models import (
+    OriginSurface,
     PollResponse,
     RepositoryRef,
     SourceEvent,
@@ -147,6 +148,7 @@ class GitHubPoller:
                     SubjectKind.ISSUE,
                     item["number"],
                     body,
+                    origin_surface=OriginSurface.ISSUE,
                 )
             elif stream == "issue_comments":
                 number = self._number_from_url(item.get("issue_url"))
@@ -162,6 +164,11 @@ class GitHubPoller:
                     subject,
                     number,
                     body,
+                    origin_surface=(
+                        OriginSurface.PR_CONVERSATION
+                        if subject == SubjectKind.PULL_REQUEST
+                        else OriginSurface.ISSUE
+                    ),
                 )
             else:
                 number = self._number_from_url(item.get("pull_request_url"))
@@ -172,6 +179,7 @@ class GitHubPoller:
                     SubjectKind.PULL_REQUEST,
                     number,
                     body,
+                    origin_surface=OriginSurface.PR_INLINE_REVIEW,
                 )
 
     @staticmethod
@@ -189,7 +197,10 @@ class GitHubPoller:
         subject_kind: SubjectKind,
         subject_number: int,
         body: str,
+        *,
+        origin_surface: OriginSurface,
     ) -> SourceEvent:
+        in_reply_to_id = item.get("in_reply_to_id")
         return SourceEvent(
             repo_id=repo.repo_id,
             repo_full_name=repo.full_name,
@@ -201,6 +212,26 @@ class GitHubPoller:
             author_login=(item.get("user") or {}).get("login"),
             body=body,
             html_url=item.get("html_url"),
+            origin_surface=origin_surface,
+            path=item.get("path"),
+            line=item.get("line"),
+            start_line=item.get("start_line"),
+            side=item.get("side"),
+            start_side=item.get("start_side"),
+            diff_hunk=item.get("diff_hunk"),
+            commit_id=item.get("commit_id"),
+            original_commit_id=item.get("original_commit_id"),
+            in_reply_to_id=(
+                str(in_reply_to_id) if in_reply_to_id is not None else None
+            ),
+            pull_request_review_id=(
+                str(item["pull_request_review_id"])
+                if item.get("pull_request_review_id") is not None
+                else None
+            ),
+            review_thread_root_id=(
+                str(in_reply_to_id) if in_reply_to_id is not None else str(item["id"])
+            ),
         )
 
     @staticmethod

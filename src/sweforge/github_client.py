@@ -45,6 +45,14 @@ class GitHubClient(Protocol):
 
     def create_comment(self, repo: RepositoryRef, number: int, body: str) -> dict: ...
 
+    def review_comments_for_pull_request(
+        self, repo: RepositoryRef, number: int
+    ) -> list[dict]: ...
+
+    def create_review_comment_reply(
+        self, repo: RepositoryRef, comment_id: int, body: str
+    ) -> dict: ...
+
 
 class HttpxGitHubClient:
     def __init__(
@@ -144,6 +152,29 @@ class HttpxGitHubClient:
             token_scope=repo.full_name,
             profile=REPO_WRITE,
             json={"body": body},
+        ).json()
+
+    def review_comments_for_pull_request(
+        self, repo: RepositoryRef, number: int
+    ) -> list[dict]:
+        response = self._request(
+            "GET",
+            f"/repos/{repo.full_name}/pulls/{number}/comments",
+            params={"per_page": "100"},
+            token_scope=repo.full_name,
+            profile=REPO_WRITE,
+        )
+        return list(self._pages(response, repo.full_name, REPO_WRITE))
+
+    def create_review_comment_reply(
+        self, repo: RepositoryRef, comment_id: int, body: str
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/repos/{repo.full_name}/pulls/comments",
+            token_scope=repo.full_name,
+            profile=REPO_WRITE,
+            json={"body": body, "in_reply_to": comment_id},
         ).json()
 
     def _poll(

@@ -17,6 +17,12 @@ class SubjectKind(StrEnum):
     PULL_REQUEST = "pull_request"
 
 
+class OriginSurface(StrEnum):
+    ISSUE = "ISSUE"
+    PR_CONVERSATION = "PR_CONVERSATION"
+    PR_INLINE_REVIEW = "PR_INLINE_REVIEW"
+
+
 @dataclass(frozen=True)
 class RepositoryRef:
     repo_id: int
@@ -37,6 +43,18 @@ class SourceEvent:
     body: str
     html_url: str | None
     thread_id: str | None = None
+    origin_surface: OriginSurface = OriginSurface.ISSUE
+    path: str | None = None
+    line: int | None = None
+    start_line: int | None = None
+    side: str | None = None
+    start_side: str | None = None
+    diff_hunk: str | None = None
+    commit_id: str | None = None
+    original_commit_id: str | None = None
+    in_reply_to_id: str | None = None
+    pull_request_review_id: str | None = None
+    review_thread_root_id: str | None = None
 
     @property
     def event_key(self) -> str:
@@ -86,6 +104,48 @@ def starts_with_agent_invocation(body: str | None, token: str = "@agent") -> boo
         return False
     escaped = re.escape(token)
     return re.match(rf"^\s*{escaped}(?![A-Za-z0-9_])", body, re.IGNORECASE) is not None
+
+
+def format_source_context(
+    event: SourceEvent | dict, task: str, current_context: str | None = None
+) -> str:
+    """Create bounded provenance for every model-facing GitHub input."""
+    get = (
+        event.get
+        if isinstance(event, dict)
+        else lambda key, default=None: getattr(event, key, default)
+    )
+    surface = str(get("origin_surface", OriginSurface.ISSUE))
+    author = get("author_login") or "unknown"
+    number = get("subject_number")
+    if surface == OriginSurface.PR_INLINE_REVIEW.value:
+        lines = [
+            f"[GitHub PR #{number} inline review comment by {author}]",
+            f"File: {get('path') or '(unknown)'}",
+            f"Lines: {get('start_line') or get('line') or '(unknown)'}-"
+            f"{get('line') or get('start_line') or '(unknown)'}",
+            f"Side: {get('start_side') or get('side') or '(unknown)'}",
+            f"Review anchor commit: {get('commit_id') or '(unknown)'}",
+            f"Original anchor commit: {get('original_commit_id') or '(unknown)'}",
+            "Immutable diff context:",
+            (get("diff_hunk") or "(not provided)")[:6_000],
+            "User request:",
+            task[:4_000],
+        ]
+        if current_context:
+            lines.extend(
+                ["Current repository context (supplemental):", current_context[:6_000]]
+            )
+        if get("original_commit_id") and get("commit_id") != get("original_commit_id"):
+            lines.insert(
+                6,
+                "The review anchor may be outdated; do not assume the current "
+                "line number is authoritative.",
+            )
+        return "\n".join(lines)
+    label = "ISSUE" if surface == OriginSurface.ISSUE.value else "PR"
+    kind = "issue" if label == "ISSUE" else "PR conversation"
+    return f"[GitHub {kind} #{number} comment by {author}]\n{task[:4_000]}"
 
 
 def classify_subject(issue_payload: dict) -> SubjectKind:
