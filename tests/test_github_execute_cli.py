@@ -29,6 +29,8 @@ def args(tmp_path):
         str(tmp_path / "state.db"),
         "--checkpoints",
         str(tmp_path / "checkpoints.sqlite"),
+        "--memory-db",
+        str(tmp_path / "memory.sqlite"),
         "--repo-path",
         f"owner/repo={tmp_path}",
         "--model",

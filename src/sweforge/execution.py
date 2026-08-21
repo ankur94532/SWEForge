@@ -14,6 +14,7 @@ from typing import Protocol
 
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.store.base import BaseStore
 
 from .agent import run_task
 from .github_store import (
@@ -22,6 +23,7 @@ from .github_store import (
     SQLiteGitHubStore,
     ThreadWorkspaceRecord,
 )
+from .repo_memory import ensure_repo_memory, repo_memory_namespace
 from .workspace import ThreadWorkspace, WorkspaceError
 
 _MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@agent(?![A-Za-z0-9_])", re.IGNORECASE)
@@ -38,6 +40,8 @@ class TaskRunner(Protocol):
         checkpointer: object,
         message_id: str,
         resume_if_present: bool,
+        memory_store: BaseStore | None,
+        memory_namespace: tuple[str, ...] | None,
     ) -> str: ...
 
 
@@ -169,6 +173,7 @@ def execute_one(
     lock_root: str | Path,
     checkpointer: object,
     runner: TaskRunner = run_task,
+    memory_store: BaseStore | None = None,
     now: Callable[[], datetime] | None = None,
 ) -> ExecutionResult:
     clock = now or (lambda: datetime.now(UTC))
@@ -186,6 +191,7 @@ def execute_one(
                 workspace_root=workspace_root,
                 checkpointer=checkpointer,
                 runner=runner,
+                memory_store=memory_store,
                 now=clock,
             )
     except ThreadLockUnavailable:
@@ -213,6 +219,7 @@ def _execute_claim(
     workspace_root: str | Path,
     checkpointer: object,
     runner: TaskRunner,
+    memory_store: BaseStore | None,
     now: Callable[[], datetime],
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
@@ -257,6 +264,9 @@ def _execute_claim(
                 "existing workspace is dirty before a new IssueThread event"
             )
         start_head_sha = workspace.head_sha()
+        memory_namespace = repo_memory_namespace(event.repo_id)
+        if memory_store is not None:
+            ensure_repo_memory(memory_store, memory_namespace)
         response = runner(
             model=model,
             worktree=str(workspace.path),
@@ -265,6 +275,8 @@ def _execute_claim(
             checkpointer=checkpointer,
             message_id=event_message_id(event.event_key),
             resume_if_present=True,
+            memory_store=memory_store,
+            memory_namespace=memory_namespace if memory_store is not None else None,
         )
         changed = tuple(workspace.changed_files())
         diff = workspace.diff()

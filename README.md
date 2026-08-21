@@ -44,7 +44,7 @@ untrusted tasks or repositories.
 - SWEFORGE owns the SWE-specific lifecycle and composition.
 
 Future work may add per-thread sandboxes/workspaces,
-repository-scoped memory/skills/tools, and multi-repository execution. Those
+repository-scoped skills/tools, and multi-repository execution. Those
 are planned boundaries, not V0 features.
 
 ## GitHub ingestion foundation
@@ -92,6 +92,53 @@ the two authentication modes are never combined.
 The boundary is: GitHub → poller → durable `SourceEvent`/`IssueThread`;
 execution comes later.
 
+## Repository-scoped long-term memory
+
+IssueThread conversation state and repository memory have separate lifetimes:
+
+- Short-term/thread memory is the LangGraph checkpoint in
+  `~/.sweforge/checkpoints.sqlite` and belongs to one IssueThread.
+- Long-term/repository memory is the LangGraph SQLite Store in
+  `~/.sweforge/memory.sqlite` and is shared by all IssueThreads for one
+  repository.
+
+Memory is keyed by the stable GitHub `repo_id`, not by an issue number, thread
+ID, workspace path, or repository display name. IssueThreads in one repository
+share `("sweforge", "repo", repo_id)`; another repository receives a separate
+namespace.
+
+The canonical file is `/memories/AGENTS.md`. It is initialized with a minimal
+header when a repository first executes. Task agents can read it through
+Deep Agents' native `memory=["/memories/AGENTS.md"]` loading, but native
+filesystem permissions deny agent writes to `/memories/**`. Repository memory
+is currently operator-managed; SWEForge does not automatically extract task
+summaries or let untrusted issue text update shared memory.
+
+Use the trusted operator CLI to inspect or seed memory. The repository must
+already have been observed by the GitHub poller so its stable ID can be
+resolved from `state.db`:
+
+```bash
+uv run sweforge-repo-memory \
+  --state-db ~/.sweforge/state.db \
+  --memory-db ~/.sweforge/memory.sqlite \
+  --repo owner/repository show
+
+uv run sweforge-repo-memory \
+  --state-db ~/.sweforge/state.db \
+  --repo owner/repository replace --file /tmp/repository-memory.md
+
+uv run sweforge-repo-memory \
+  --state-db ~/.sweforge/state.db \
+  --repo owner/repository append --text "Run tests with mvn test."
+```
+
+The memory database is separate from `state.db` and the checkpoint database,
+is never placed in a worktree, and is not exposed through the task shell
+environment. Operator writes are trusted inputs and should not contain
+credentials, secrets, conversation history, chain-of-thought, or temporary
+debug output.
+
 ## Development-stage IssueThread execution
 
 The one-shot executor extends that boundary to:
@@ -103,6 +150,7 @@ Deep Agent + LangGraph thread checkpoint.
 uv run sweforge-github-execute \
   --db ~/.sweforge/state.db \
   --checkpoints ~/.sweforge/checkpoints.sqlite \
+  --memory-db ~/.sweforge/memory.sqlite \
   --workspace-root ~/.sweforge/workspaces \
   --lock-root ~/.sweforge/locks \
   --repo-path owner/repository=/Users/me/repository \

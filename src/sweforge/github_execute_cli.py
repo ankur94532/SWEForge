@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .execution import SQLiteCheckpointer, execute_one
 from .github_store import SQLiteGitHubStore
+from .repo_memory import SQLiteMemoryStore
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -19,6 +20,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoints",
         type=Path,
         default=Path("~/.sweforge/checkpoints.sqlite").expanduser(),
+    )
+    parser.add_argument(
+        "--memory-db",
+        type=Path,
+        default=Path("~/.sweforge/memory.sqlite").expanduser(),
     )
     parser.add_argument(
         "--workspace-root",
@@ -53,10 +59,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     store = None
     checkpoints = None
+    memory = None
     try:
         mappings = _repo_paths(args.repo_path)
         store = SQLiteGitHubStore(args.db)
         checkpoints = SQLiteCheckpointer(args.checkpoints)
+        memory = SQLiteMemoryStore(args.memory_db)
         result = execute_one(
             store=store,
             model=args.model,
@@ -64,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
             workspace_root=args.workspace_root,
             lock_root=args.lock_root,
             checkpointer=checkpoints.saver,
+            memory_store=memory.store,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"sweforge-github-execute: {exc}", file=sys.stderr)
@@ -71,6 +80,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if checkpoints is not None:
             checkpoints.close()
+        if memory is not None:
+            memory.close()
         if store is not None:
             store.close()
 

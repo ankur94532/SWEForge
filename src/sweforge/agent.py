@@ -5,8 +5,15 @@ from collections.abc import Mapping
 from typing import Any
 
 from deepagents import create_deep_agent
-from deepagents.backends import CompositeBackend, LocalShellBackend, StateBackend
+from deepagents.backends import (
+    CompositeBackend,
+    LocalShellBackend,
+    StateBackend,
+    StoreBackend,
+)
+from deepagents.middleware.permissions import FilesystemPermission
 from langchain_core.messages import HumanMessage
+from langgraph.store.base import BaseStore
 
 
 def _normalize_response_text(message: Any) -> str:
@@ -33,17 +40,28 @@ def _normalize_response_text(message: Any) -> str:
     return "\n".join(text_blocks)
 
 
-def _build_backend(worktree: str) -> CompositeBackend:
+def _build_backend(
+    worktree: str,
+    *,
+    memory_store: BaseStore | None = None,
+    memory_namespace: tuple[str, ...] | None = None,
+) -> CompositeBackend:
     local = LocalShellBackend(
         root_dir=worktree,
         virtual_mode=True,
         env={"PATH": os.environ.get("PATH", "")},
         inherit_env=False,
     )
+    routes = {"/sweforge_internal/": StateBackend()}
+    if (memory_store is None) != (memory_namespace is None):
+        raise ValueError("memory_store and memory_namespace must be supplied together")
+    if memory_store is not None and memory_namespace is not None:
+        routes["/memories/"] = StoreBackend(
+            namespace=lambda _runtime: memory_namespace,
+            store=memory_store,
+        )
     return CompositeBackend(
-        default=local,
-        routes={"/sweforge_internal/": StateBackend()},
-        artifacts_root="/sweforge_internal/",
+        default=local, routes=routes, artifacts_root="/sweforge_internal/"
     )
 
 
@@ -56,11 +74,25 @@ def run_task(
     checkpointer: object | None = None,
     message_id: str | None = None,
     resume_if_present: bool = False,
+    memory_store: BaseStore | None = None,
+    memory_namespace: tuple[str, ...] | None = None,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
         raise ValueError("thread_id is required when a checkpointer is supplied")
-    backend = _build_backend(worktree)
+    backend = _build_backend(
+        worktree, memory_store=memory_store, memory_namespace=memory_namespace
+    )
+    memory = ["/memories/AGENTS.md"] if memory_store is not None else None
+    permissions = (
+        [
+            FilesystemPermission(
+                operations=["write"], paths=["/memories/**"], mode="deny"
+            )
+        ]
+        if memory_store is not None
+        else None
+    )
     agent = create_deep_agent(
         model=model,
         backend=backend,
@@ -73,6 +105,9 @@ def run_task(
             "rather than virtual absolute paths. "
             "Summarize what you changed and any validation results."
         ),
+        memory=memory,
+        permissions=permissions,
+        store=memory_store,
         checkpointer=checkpointer,
     )
     input_state: dict[str, Any] | None = {

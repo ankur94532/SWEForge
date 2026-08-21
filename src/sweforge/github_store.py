@@ -250,6 +250,13 @@ class SQLiteGitHubStore:
                 (repo_id, full_name, observed_at),
             )
 
+    def repository_id_for_full_name(self, full_name: str) -> int | None:
+        """Resolve an observed repository name to its stable GitHub ID."""
+        row = self.connection.execute(
+            "SELECT repo_id FROM repositories WHERE full_name = ?", (full_name,)
+        ).fetchone()
+        return int(row["repo_id"]) if row is not None else None
+
     def cursor(self, repo_id: int, stream: str):
         return self.connection.execute(
             "SELECT since, etag, last_successful_poll_at FROM poll_cursors "
