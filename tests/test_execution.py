@@ -1,6 +1,8 @@
 import subprocess
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TypedDict
 
 import pytest
@@ -10,8 +12,10 @@ from sweforge.agent import run_task
 from sweforge.execution import (
     SQLiteCheckpointer,
     ThreadLockUnavailable,
+    event_message_id,
     execute_one,
     normalize_task,
+    recover_stale,
     thread_lock,
 )
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
@@ -105,6 +109,85 @@ def test_normalize_task_removes_only_invocation_token():
     assert normalize_task("Please @AGENT investigate this") == "Please investigate this"
     with pytest.raises(ValueError, match="did not contain a task"):
         normalize_task("@agent")
+
+
+def test_run_task_resumes_checkpointed_event_without_new_message(monkeypatch):
+    calls = []
+
+    class FakeAgent:
+        def get_state(self, config):
+            return SimpleNamespace(
+                values={"messages": [SimpleNamespace(id="event-id")]}
+            )
+
+        def invoke(self, state, config=None, durability=None):
+            calls.append((state, config, durability))
+            return {"messages": [SimpleNamespace(content="resumed")]}
+
+    monkeypatch.setattr(
+        "sweforge.agent.create_deep_agent", lambda **kwargs: FakeAgent()
+    )
+    assert (
+        run_task(
+            model="provider:model",
+            worktree="/tmp/worktree",
+            task="continue",
+            thread_id="github:1:issue:7",
+            checkpointer=object(),
+            message_id="event-id",
+            resume_if_present=True,
+        )
+        == "resumed"
+    )
+    assert calls == [
+        (None, {"configurable": {"thread_id": "github:1:issue:7"}}, "sync")
+    ]
+
+
+def test_run_task_delivers_missing_event_with_stable_human_message(monkeypatch):
+    calls = []
+
+    class FakeAgent:
+        def get_state(self, config):
+            return SimpleNamespace(values={"messages": []})
+
+        def invoke(self, state, config=None, durability=None):
+            calls.append((state, config, durability))
+            return {"messages": [SimpleNamespace(content="new")]}
+
+    monkeypatch.setattr(
+        "sweforge.agent.create_deep_agent", lambda **kwargs: FakeAgent()
+    )
+    run_task(
+        model="provider:model",
+        worktree="/tmp/worktree",
+        task="new task",
+        thread_id="github:1:issue:7",
+        checkpointer=object(),
+        message_id="event-id",
+    )
+    message = calls[0][0]["messages"][0]
+    assert message.id == "event-id"
+    assert message.content == "new task"
+    assert calls[0][2] == "sync"
+
+
+def test_deep_agents_message_reducer_replaces_duplicate_ids():
+    from deepagents.graph import _messages_delta_reducer
+    from langchain_core.messages import HumanMessage
+
+    result = _messages_delta_reducer(
+        [HumanMessage(content="first", id="same")],
+        [[HumanMessage(content="replacement", id="same")]],
+    )
+    assert [(message.id, message.content) for message in result] == [
+        ("same", "replacement")
+    ]
+
+
+def test_event_message_ids_are_stable_and_distinct():
+    assert event_message_id("one") == event_message_id("one")
+    assert event_message_id("one") != event_message_id("two")
 
 
 def test_first_event_creates_persistent_workspace_and_is_idempotent(tmp_path):
@@ -427,3 +510,136 @@ def test_store_and_checkpoint_reopen_persist_state(tmp_path):
         graph.add_edge("node", END)
         compiled = graph.compile(checkpointer=saver)
         assert compiled.get_state(config).values == {"value": "persisted"}
+
+
+def test_stale_running_recovery_uses_free_lock_and_age(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(1, "owner/repo")
+    event = source_event(
+        repo, source_id="1", updated="2026-01-01T00:00:00Z", body="@agent run"
+    )
+    persist(store, event)
+    store.claim_next_event(now="2026-01-01T00:00:00Z")
+    recovered = recover_stale(
+        store=store,
+        lock_root=tmp_path / "locks",
+        older_than_seconds=60,
+        now=datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+    )
+    assert recovered == [event.event_key]
+    assert store.execution_for_event(event.event_key)["status"] == "INTERRUPTED"
+    assert store.claim_next_event(now="2026-01-01T00:03:00Z") is None
+    assert store.retry_execution(event.event_key).value == "RETRY_PENDING"
+    assert (
+        store.claim_next_event(now="2026-01-01T00:04:00Z").event_key == event.event_key
+    )
+    assert store.execution_for_event(event.event_key)["attempt_count"] == 2
+    store.mark_execution_failed(
+        event.event_key,
+        completed_at="2026-01-01T00:05:00Z",
+        error_message="retry failed",
+        workspace_path=None,
+    )
+    store.skip_execution(
+        event.event_key,
+        completed_at="2026-01-01T00:06:00Z",
+        reason="operator skip",
+    )
+    assert store.execution_for_event(event.event_key)["status"] == "SKIPPED"
+    store.close()
+
+
+def test_live_or_recent_running_execution_is_not_recovered(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(1, "owner/repo")
+    event = source_event(
+        repo, source_id="1", updated="2026-01-01T00:00:00Z", body="@agent run"
+    )
+    persist(store, event)
+    store.claim_next_event(now="2026-01-01T00:00:00Z")
+    current = datetime(2026, 1, 1, 0, 1, tzinfo=UTC)
+    assert (
+        recover_stale(
+            store=store,
+            lock_root=tmp_path / "locks",
+            older_than_seconds=60,
+            now=current,
+        )
+        == []
+    )
+    with thread_lock(tmp_path / "held-locks", "github:1:issue:7"):
+        assert (
+            recover_stale(
+                store=store,
+                lock_root=tmp_path / "held-locks",
+                older_than_seconds=0,
+                now=current,
+            )
+            == []
+        )
+    assert store.execution_for_event(event.event_key)["status"] == "RUNNING"
+    store.close()
+
+
+def test_failure_blocks_later_until_explicit_retry_or_skip(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(1, "owner/repo")
+    first = source_event(
+        repo, source_id="1", updated="2026-01-01T00:00:00Z", body="@agent first"
+    )
+    second = source_event(
+        repo, source_id="2", updated="2026-01-01T00:01:00Z", body="@agent second"
+    )
+    persist(store, first)
+    persist(store, second)
+    store.claim_next_event(now="2026-01-01T00:02:00Z")
+    store.mark_execution_failed(
+        first.event_key,
+        completed_at="2026-01-01T00:03:00Z",
+        error_message="failed",
+        workspace_path=None,
+    )
+    assert store.claim_next_event(now="2026-01-01T00:04:00Z") is None
+    assert store.retry_execution(first.event_key).value == "RETRY_PENDING"
+    retry = store.claim_next_event(now="2026-01-01T00:05:00Z")
+    assert retry.event_key == first.event_key
+    assert store.execution_for_event(first.event_key)["attempt_count"] == 2
+    store.mark_execution_failed(
+        first.event_key,
+        completed_at="2026-01-01T00:06:00Z",
+        error_message="failed again",
+        workspace_path=None,
+    )
+    store.skip_execution(
+        first.event_key, completed_at="2026-01-01T00:07:00Z", reason="operator skip"
+    )
+    assert (
+        store.claim_next_event(now="2026-01-01T00:08:00Z").event_key == second.event_key
+    )
+    store.close()
+
+
+def test_retry_and_skip_status_transitions_are_safe(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(1, "owner/repo")
+    event = source_event(
+        repo, source_id="1", updated="2026-01-01T00:00:00Z", body="@agent run"
+    )
+    persist(store, event)
+    store.claim_next_event(now="now")
+    with pytest.raises(ValueError):
+        store.skip_execution(event.event_key, completed_at="now", reason="no")
+    store.mark_execution_failed(
+        event.event_key, completed_at="now", error_message="bad", workspace_path=None
+    )
+    assert store.retry_execution(event.event_key).value == "RETRY_PENDING"
+    assert store.retry_execution(event.event_key).value == "RETRY_PENDING"
+    store.claim_next_event(now="now")
+    store.mark_execution_succeeded(
+        event.event_key, completed_at="now", response_text="ok", workspace_path="/w"
+    )
+    with pytest.raises(ValueError):
+        store.retry_execution(event.event_key)
+    with pytest.raises(ValueError):
+        store.skip_execution(event.event_key, completed_at="now", reason="no")
+    store.close()

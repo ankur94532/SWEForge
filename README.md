@@ -93,3 +93,22 @@ checkpoints live in their separate SQLite file. The same deterministic
 both the worktree and checkpointed conversation. Per-thread locks allow
 different issues to execute independently; this SQLite checkpointer is for the
 local milestone, not final production scale.
+
+### Crash recovery
+
+If a process dies after claiming an event, its `RUNNING` row can be recovered
+only after the configured age threshold and only when the same host-local
+`fcntl` lock is free. `recover-stale` marks it `INTERRUPTED`; it never retries
+automatically. Operators may explicitly `retry` or `skip` failed/interrupted
+events. Retries preserve the worktree and LangGraph thread/checkpoint, while
+skipped events are resolved for per-thread ordering. LangGraph owns graph state;
+the outer SQLite database owns SourceEvents and execution status. Tool side
+effects remain potentially ambiguous if a process dies mid-operation, so
+distributed workers require a different lease/lock mechanism.
+
+```bash
+uv run sweforge-github-execution --db ~/.sweforge/state.db status
+uv run sweforge-github-execution --db ~/.sweforge/state.db recover-stale
+uv run sweforge-github-execution --db ~/.sweforge/state.db retry EVENT_KEY
+uv run sweforge-github-execution --db ~/.sweforge/state.db skip EVENT_KEY
+```

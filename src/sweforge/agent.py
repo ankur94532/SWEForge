@@ -5,6 +5,7 @@ from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, LocalShellBackend, StateBackend
+from langchain_core.messages import HumanMessage
 
 
 def _build_backend(worktree: str) -> CompositeBackend:
@@ -28,6 +29,8 @@ def run_task(
     task: str,
     thread_id: str | None = None,
     checkpointer: object | None = None,
+    message_id: str | None = None,
+    resume_if_present: bool = False,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
@@ -47,12 +50,31 @@ def run_task(
         ),
         checkpointer=checkpointer,
     )
-    input_state = {"messages": [{"role": "user", "content": task}]}
+    input_state: dict[str, Any] | None = {
+        "messages": [{"role": "user", "content": task}]
+    }
     if thread_id:
-        result: dict[str, Any] = agent.invoke(
-            input_state,
-            config={"configurable": {"thread_id": thread_id}},
-        )
+        config = {"configurable": {"thread_id": thread_id}}
+        if message_id:
+            snapshot = agent.get_state(config)
+            has_message = any(
+                getattr(message, "id", None) == message_id
+                for message in snapshot.values.get("messages", [])
+            )
+            if has_message and resume_if_present:
+                input_state = None
+            else:
+                input_state = {
+                    "messages": [
+                        HumanMessage(content=task, id=message_id),
+                    ]
+                }
+        if message_id:
+            result: dict[str, Any] = agent.invoke(
+                input_state, config=config, durability="sync"
+            )
+        else:
+            result = agent.invoke(input_state, config=config)
     else:
         result = agent.invoke(input_state)
     messages = result.get("messages", [])

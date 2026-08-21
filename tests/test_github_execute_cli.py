@@ -1,6 +1,8 @@
 from sweforge.execution import ExecutionResult
 from sweforge.github_execute_cli import main
-from sweforge.github_store import ClaimedEvent, ExecutionStatus
+from sweforge.github_execution_cli import main as manage_main
+from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
+from sweforge.github_store import ClaimedEvent, ExecutionStatus, SQLiteGitHubStore
 
 
 class FakeStore:
@@ -71,3 +73,75 @@ def test_failed_execution_is_nonzero_and_safe(monkeypatch, tmp_path, capsys):
     )
     assert main(args(tmp_path)) == 1
     assert "safe failure" in capsys.readouterr().err
+
+
+def _event_store(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(1, "owner/repo")
+    event = SourceEvent(
+        repo_id=repo.repo_id,
+        repo_full_name=repo.full_name,
+        source_kind=SourceKind.ISSUE,
+        source_id="1",
+        source_updated_at="2026-01-01T00:00:00Z",
+        subject_kind=SubjectKind.ISSUE,
+        subject_number=7,
+        author_login="octocat",
+        body="@agent run",
+        html_url=None,
+    )
+    store.upsert_repository(repo.repo_id, repo.full_name, "now")
+    store.record_batch(
+        repo.repo_id,
+        "issues",
+        [event],
+        since="now",
+        etag=None,
+        polled_at="now",
+    )
+    store.claim_next_event(now="now")
+    store.mark_execution_failed(
+        event.event_key,
+        completed_at="now",
+        error_message="failure",
+        workspace_path=None,
+    )
+    store.close()
+    return event.event_key
+
+
+def test_execution_management_cli_retry_skip_and_status(tmp_path, capsys):
+    event_key = _event_store(tmp_path)
+    common = [
+        "--db",
+        str(tmp_path / "state.db"),
+        "--lock-root",
+        str(tmp_path / "locks"),
+    ]
+    assert manage_main([*common, "status"]) == 0
+    assert event_key in capsys.readouterr().out
+    assert manage_main([*common, "retry", event_key]) == 0
+    assert "RETRY_PENDING" in capsys.readouterr().out
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    store.claim_next_event(now="now")
+    store.mark_execution_failed(
+        event_key, completed_at="now", error_message="failure", workspace_path=None
+    )
+    store.close()
+    assert manage_main([*common, "skip", event_key]) == 0
+    assert "SKIPPED" in capsys.readouterr().out
+
+
+def test_execution_management_cli_rejects_bad_event_key(tmp_path, capsys):
+    assert (
+        manage_main(
+            [
+                "--db",
+                str(tmp_path / "state.db"),
+                "retry",
+                "missing-event",
+            ]
+        )
+        == 2
+    )
+    assert "unknown event key" in capsys.readouterr().err

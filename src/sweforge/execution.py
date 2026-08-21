@@ -8,7 +8,7 @@ import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -36,6 +36,8 @@ class TaskRunner(Protocol):
         task: str,
         thread_id: str,
         checkpointer: object,
+        message_id: str,
+        resume_if_present: bool,
     ) -> str: ...
 
 
@@ -53,6 +55,11 @@ def normalize_task(body: str) -> str:
     if not task:
         raise EmptyTaskError("@agent mention did not contain a task")
     return task
+
+
+def event_message_id(event_key: str) -> str:
+    """Return the stable LangGraph message ID for one SourceEvent."""
+    return f"sweforge:event:{hashlib.sha256(event_key.encode()).hexdigest()}"
 
 
 def utc_timestamp(value: datetime | None = None) -> str:
@@ -127,6 +134,32 @@ class ExecutionResult:
         return self.event is not None
 
 
+def recover_stale(
+    *,
+    store: SQLiteGitHubStore,
+    lock_root: str | Path,
+    older_than_seconds: int,
+    now: datetime | None = None,
+) -> list[str]:
+    """Mark old RUNNING rows interrupted only when their local lock is free."""
+    current = now or datetime.now(UTC)
+    current = datetime.fromisoformat(utc_timestamp(current).replace("Z", "+00:00"))
+    cutoff_text = utc_timestamp(current - timedelta(seconds=older_than_seconds))
+    recovered: list[str] = []
+    for record in store.running_executions_before(cutoff_text):
+        try:
+            with thread_lock(lock_root, record.thread_id):
+                store.mark_execution_interrupted(
+                    record.event_key,
+                    completed_at=utc_timestamp(current),
+                    error_message="executor lock was free after stale RUNNING claim",
+                )
+                recovered.append(record.event_key)
+        except ThreadLockUnavailable:
+            continue
+    return recovered
+
+
 def execute_one(
     *,
     store: SQLiteGitHubStore,
@@ -156,7 +189,7 @@ def execute_one(
                 now=clock,
             )
     except ThreadLockUnavailable:
-        store.release_execution_claim(event.event_key)
+        store.release_execution_claim(event.event_key, retrying=event.retrying)
         return ExecutionResult(status="BUSY", event=event)
     except Exception as exc:
         error = _safe_error(exc)
@@ -225,6 +258,8 @@ def _execute_claim(
             task=task,
             thread_id=event.thread_id,
             checkpointer=checkpointer,
+            message_id=event_message_id(event.event_key),
+            resume_if_present=True,
         )
         changed = tuple(workspace.changed_files())
         diff = workspace.diff()

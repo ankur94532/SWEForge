@@ -92,6 +92,9 @@ class ExecutionStatus(StrEnum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    INTERRUPTED = "INTERRUPTED"
+    RETRY_PENDING = "RETRY_PENDING"
+    SKIPPED = "SKIPPED"
 
 
 @dataclass(frozen=True)
@@ -103,6 +106,18 @@ class ClaimedEvent:
     issue_number: int
     body: str
     workspace_path: str | None
+    retrying: bool = False
+
+
+@dataclass(frozen=True)
+class ExecutionRecord:
+    event_key: str
+    thread_id: str
+    status: ExecutionStatus
+    attempt_count: int
+    started_at: str
+    completed_at: str | None
+    error_message: str | None
 
 
 @dataclass(frozen=True)
@@ -218,13 +233,13 @@ class SQLiteGitHubStore:
         with self.transaction(immediate=True) as db:
             row = db.execute(
                 """SELECT se.event_key, se.thread_id, se.repo_id,
-                          se.repo_full_name, se.subject_number, se.body
+                          se.repo_full_name, se.subject_number, se.body,
+                          ee.status AS execution_status
                    FROM source_events AS se
+                   LEFT JOIN event_executions AS ee
+                     ON ee.event_key = se.event_key
                    WHERE se.thread_id IS NOT NULL
-                     AND NOT EXISTS (
-                         SELECT 1 FROM event_executions AS ee
-                         WHERE ee.event_key = se.event_key
-                     )
+                     AND (ee.event_key IS NULL OR ee.status = ?)
                      AND NOT EXISTS (
                          SELECT 1
                          FROM source_events AS earlier
@@ -244,25 +259,38 @@ class SQLiteGitHubStore:
                                )
                            )
                            AND (prior.event_key IS NULL OR
-                                prior.status != ?)
+                                prior.status NOT IN (?, ?))
                      )
                    ORDER BY se.source_updated_at, se.discovered_at, se.event_key
                    LIMIT 1""",
-                (ExecutionStatus.SUCCEEDED.value,),
+                (
+                    ExecutionStatus.RETRY_PENDING.value,
+                    ExecutionStatus.SUCCEEDED.value,
+                    ExecutionStatus.SKIPPED.value,
+                ),
             ).fetchone()
             if row is None:
                 return None
-            db.execute(
-                """INSERT INTO event_executions(
-                   event_key, thread_id, status, attempt_count, started_at)
-                   VALUES (?, ?, ?, 1, ?)""",
-                (
-                    row["event_key"],
-                    row["thread_id"],
-                    ExecutionStatus.RUNNING.value,
-                    now,
-                ),
-            )
+            retrying = row["execution_status"] == ExecutionStatus.RETRY_PENDING.value
+            if retrying:
+                db.execute(
+                    """UPDATE event_executions SET status = ?, attempt_count =
+                       attempt_count + 1, started_at = ?, completed_at = NULL,
+                       error_message = NULL WHERE event_key = ?""",
+                    (ExecutionStatus.RUNNING.value, now, row["event_key"]),
+                )
+            else:
+                db.execute(
+                    """INSERT INTO event_executions(
+                       event_key, thread_id, status, attempt_count, started_at)
+                       VALUES (?, ?, ?, 1, ?)""",
+                    (
+                        row["event_key"],
+                        row["thread_id"],
+                        ExecutionStatus.RUNNING.value,
+                        now,
+                    ),
+                )
             return ClaimedEvent(
                 event_key=row["event_key"],
                 thread_id=row["thread_id"],
@@ -271,14 +299,113 @@ class SQLiteGitHubStore:
                 issue_number=row["subject_number"],
                 body=row["body"],
                 workspace_path=None,
+                retrying=retrying,
             )
 
-    def release_execution_claim(self, event_key: str) -> None:
+    def release_execution_claim(self, event_key: str, *, retrying: bool) -> None:
         with self.transaction() as db:
-            db.execute(
-                "DELETE FROM event_executions WHERE event_key = ? AND status = ?",
-                (event_key, ExecutionStatus.RUNNING.value),
+            if retrying:
+                db.execute(
+                    "UPDATE event_executions SET status = ? WHERE event_key = ? "
+                    "AND status = ?",
+                    (
+                        ExecutionStatus.RETRY_PENDING.value,
+                        event_key,
+                        ExecutionStatus.RUNNING.value,
+                    ),
+                )
+            else:
+                db.execute(
+                    "DELETE FROM event_executions WHERE event_key = ? AND status = ?",
+                    (event_key, ExecutionStatus.RUNNING.value),
+                )
+
+    def running_executions_before(self, started_before: str) -> list[ExecutionRecord]:
+        rows = self.connection.execute(
+            """SELECT event_key, thread_id, status, attempt_count, started_at,
+                      completed_at, error_message
+               FROM event_executions WHERE status = ? AND started_at < ?
+               ORDER BY started_at, event_key""",
+            (ExecutionStatus.RUNNING.value, started_before),
+        ).fetchall()
+        return [self._execution_record(row) for row in rows]
+
+    def mark_execution_interrupted(
+        self, event_key: str, *, completed_at: str, error_message: str
+    ) -> None:
+        with self.transaction() as db:
+            cursor = db.execute(
+                """UPDATE event_executions SET status = ?, completed_at = ?,
+                   error_message = ? WHERE event_key = ? AND status = ?""",
+                (
+                    ExecutionStatus.INTERRUPTED.value,
+                    completed_at,
+                    error_message,
+                    event_key,
+                    ExecutionStatus.RUNNING.value,
+                ),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("event execution is no longer running")
+
+    def retry_execution(self, event_key: str) -> ExecutionStatus:
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT status FROM event_executions WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown event key")
+            status = ExecutionStatus(row["status"])
+            if status == ExecutionStatus.RETRY_PENDING:
+                return status
+            if status not in (ExecutionStatus.FAILED, ExecutionStatus.INTERRUPTED):
+                raise ValueError(f"cannot retry execution in {status.value} status")
+            db.execute(
+                "UPDATE event_executions SET status = ?, completed_at = NULL "
+                "WHERE event_key = ?",
+                (ExecutionStatus.RETRY_PENDING.value, event_key),
+            )
+            return ExecutionStatus.RETRY_PENDING
+
+    def skip_execution(self, event_key: str, *, completed_at: str, reason: str) -> None:
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT status FROM event_executions WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown event key")
+            status = ExecutionStatus(row["status"])
+            if status == ExecutionStatus.SKIPPED:
+                return
+            if status not in (ExecutionStatus.FAILED, ExecutionStatus.INTERRUPTED):
+                raise ValueError(f"cannot skip execution in {status.value} status")
+            db.execute(
+                "UPDATE event_executions SET status = ?, completed_at = ?, "
+                "error_message = ? WHERE event_key = ?",
+                (ExecutionStatus.SKIPPED.value, completed_at, reason, event_key),
+            )
+
+    def execution_records(self) -> list[ExecutionRecord]:
+        rows = self.connection.execute(
+            """SELECT event_key, thread_id, status, attempt_count, started_at,
+                      completed_at, error_message FROM event_executions
+               ORDER BY started_at, event_key"""
+        ).fetchall()
+        return [self._execution_record(row) for row in rows]
+
+    @staticmethod
+    def _execution_record(row: sqlite3.Row) -> ExecutionRecord:
+        return ExecutionRecord(
+            event_key=row["event_key"],
+            thread_id=row["thread_id"],
+            status=ExecutionStatus(row["status"]),
+            attempt_count=row["attempt_count"],
+            started_at=row["started_at"],
+            completed_at=row["completed_at"],
+            error_message=row["error_message"],
+        )
 
     def mark_execution_succeeded(
         self,
