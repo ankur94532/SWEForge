@@ -19,7 +19,12 @@ from sweforge.execution import (
     thread_lock,
 )
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
-from sweforge.github_store import ExecutionStatus, SQLiteGitHubStore
+from sweforge.github_store import (
+    ExecutionStatus,
+    PublicationStatus,
+    SQLiteGitHubStore,
+    ThreadWorkspaceRecord,
+)
 
 
 def git(*args: str, cwd: Path) -> str:
@@ -265,6 +270,24 @@ def test_follow_up_reuses_workspace_and_checkpoint_thread(tmp_path):
         runner=runner,
     )
     assert execute_one(**common).status == "SUCCEEDED"
+    workspace = tmp_path / "workspaces/123/issue-7"
+    git("add", "first.txt", cwd=workspace)
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "publish first",
+        cwd=workspace,
+    )
+    store.ensure_publication(first.event_key, now="2026-01-01T00:00:30Z")
+    store.update_publication(
+        first.event_key,
+        status=PublicationStatus.COMPLETED,
+        now="2026-01-01T00:00:31Z",
+    )
     second = replace(
         first,
         source_id="2",
@@ -387,8 +410,29 @@ def test_claim_order_and_concurrency_idempotency(tmp_path):
         response_text="ok",
         workspace_path="/tmp/workspace",
     )
+    store.save_thread_workspace(
+        ThreadWorkspaceRecord(
+            "github:1:issue:7",
+            1,
+            repo.full_name,
+            7,
+            "/tmp/repository",
+            "/tmp/workspace",
+            "sweforge/issue-7",
+            "base",
+            "now",
+            "now",
+        )
+    )
+    store.ensure_publication(first.event_key, now="2026-01-01T00:03:00Z")
+    assert store.claim_next_event(now="2026-01-01T00:04:00Z") is None
+    store.update_publication(
+        first.event_key,
+        status=PublicationStatus.COMPLETED,
+        now="2026-01-01T00:04:30Z",
+    )
     assert (
-        store.claim_next_event(now="2026-01-01T00:04:00Z").event_key == second.event_key
+        store.claim_next_event(now="2026-01-01T00:05:00Z").event_key == second.event_key
     )
     store.close()
 

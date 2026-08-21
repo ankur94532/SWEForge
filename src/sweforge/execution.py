@@ -252,6 +252,11 @@ def _execute_claim(
                     updated_at=timestamp,
                 )
             )
+        elif not event.retrying and not workspace.is_clean():
+            raise WorkspaceError(
+                "existing workspace is dirty before a new IssueThread event"
+            )
+        start_head_sha = workspace.head_sha()
         response = runner(
             model=model,
             worktree=str(workspace.path),
@@ -263,11 +268,16 @@ def _execute_claim(
         )
         changed = tuple(workspace.changed_files())
         diff = workspace.diff()
+        end_head_sha = workspace.head_sha()
+        end_dirty = not workspace.is_clean()
         store.mark_execution_succeeded(
             event.event_key,
             completed_at=utc_timestamp(now()),
             response_text=response,
             workspace_path=str(workspace.path),
+            start_head_sha=start_head_sha,
+            end_head_sha=end_head_sha,
+            end_dirty=end_dirty,
         )
         return ExecutionResult(
             status=ExecutionStatus.SUCCEEDED.value,

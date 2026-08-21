@@ -80,6 +80,18 @@ class ThreadWorkspace:
     def diff(self) -> str:
         return Workspace(self.repository, self.path, self.base_commit).diff()
 
+    def head_sha(self) -> str:
+        return _git(self.path, "rev-parse", "HEAD")
+
+    def is_clean(self) -> bool:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=self.path,
+            check=True,
+            capture_output=True,
+        )
+        return not result.stdout
+
 
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(

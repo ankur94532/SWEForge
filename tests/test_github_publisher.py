@@ -2,7 +2,11 @@ import subprocess
 
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_publisher import GitHubPublisher
-from sweforge.github_store import SQLiteGitHubStore, ThreadWorkspaceRecord
+from sweforge.github_store import (
+    PublicationStatus,
+    SQLiteGitHubStore,
+    ThreadWorkspaceRecord,
+)
 
 
 class TokenProvider:
@@ -13,15 +17,18 @@ class TokenProvider:
 class Client:
     def __init__(self):
         self.comments_created = []
+        self.pull_requests_created = []
 
     def repository(self, full_name):
         return RepositoryRef(1, full_name, "main")
 
     def pull_requests(self, repo, *, head, base):
-        return []
+        return list(self.pull_requests_created)
 
     def create_pull_request(self, repo, *, head, base, title, body):
-        return {"number": 41, "html_url": "https://github.com/example/repo/pull/41"}
+        item = {"number": 41, "html_url": "https://github.com/example/repo/pull/41"}
+        self.pull_requests_created.append(item)
+        return item
 
     def comments(self, repo, number):
         return list(self.comments_created)
@@ -99,6 +106,9 @@ def setup_publication(tmp_path):
         completed_at="now",
         response_text="done",
         workspace_path=str(workspace),
+        start_head_sha=base,
+        end_head_sha=base,
+        end_dirty=True,
     )
     return store, event.event_key, remote
 
@@ -130,3 +140,65 @@ def test_publication_state_survives_reopen(tmp_path):
     publication = reopened.next_publication()
     assert publication and publication.event_key == event_key
     reopened.close()
+
+
+def test_failed_publication_requires_explicit_retry(tmp_path):
+    store, event_key, _ = setup_publication(tmp_path)
+    publication = store.next_publication()
+    assert publication
+    store.update_publication(
+        event_key,
+        status=PublicationStatus.FAILED,
+        now="failed",
+        error_message="ambiguous remote state",
+    )
+    assert store.next_publication() is None
+    assert (
+        store.retry_publication(event_key, now="retry").status
+        == PublicationStatus.PENDING
+    )
+    assert store.next_publication().event_key == event_key
+    store.close()
+
+
+def test_follow_up_without_changes_does_not_republish_old_commit(tmp_path):
+    store, first_key, remote = setup_publication(tmp_path)
+    client = Client()
+    publisher = GitHubPublisher(
+        store=store,
+        client=client,
+        token_provider=TokenProvider(),
+        lock_root=tmp_path / "locks",
+        remote_url_factory=lambda _: f"file://{remote}",
+    )
+    assert publisher.publish_one().status == "COMPLETED"
+    workspace = tmp_path / "workspace"
+    published_sha = git(workspace, "rev-parse", "HEAD")
+    second = SourceEvent(
+        1,
+        "example/repo",
+        SourceKind.ISSUE,
+        "2",
+        "2026-01-01T00:01:00Z",
+        SubjectKind.ISSUE,
+        7,
+        "user",
+        "@agent follow up",
+        None,
+    )
+    store.record_batch(1, "issues", [second], since="now", etag=None, polled_at="later")
+    claim = store.claim_next_event(now="later")
+    assert claim and claim.event_key != first_key
+    store.mark_execution_succeeded(
+        claim.event_key,
+        completed_at="later",
+        response_text="no changes",
+        workspace_path=str(workspace),
+        start_head_sha=published_sha,
+        end_head_sha=published_sha,
+        end_dirty=False,
+    )
+    assert publisher.publish_one().status == "NO_CHANGES"
+    assert git(workspace, "rev-parse", "HEAD") == published_sha
+    assert len(client.pull_requests_created) == 1
+    store.close()

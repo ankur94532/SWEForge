@@ -76,7 +76,10 @@ CREATE TABLE IF NOT EXISTS event_executions (
     completed_at TEXT,
     response_text TEXT,
     error_message TEXT,
-    workspace_path TEXT
+    workspace_path TEXT,
+    start_head_sha TEXT,
+    end_head_sha TEXT,
+    end_dirty INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS event_publications (
     event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
@@ -124,6 +127,15 @@ class PublicationStatus(StrEnum):
     COMPLETED = "COMPLETED"
     NO_CHANGES = "NO_CHANGES"
     FAILED = "FAILED"
+
+
+RESUMABLE_PUBLICATION_STATUSES = (
+    PublicationStatus.PENDING,
+    PublicationStatus.COMMITTED,
+    PublicationStatus.PUSHED,
+    PublicationStatus.PR_CREATED,
+    PublicationStatus.COMMENTED,
+)
 
 
 @dataclass(frozen=True)
@@ -191,7 +203,29 @@ class SQLiteGitHubStore:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(SCHEMA)
+        self._migrate_execution_baselines()
         self.connection.commit()
+
+    def _migrate_execution_baselines(self) -> None:
+        columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(event_executions)")
+        }
+        migrations = {
+            "start_head_sha": (
+                "ALTER TABLE event_executions ADD COLUMN start_head_sha TEXT"
+            ),
+            "end_head_sha": (
+                "ALTER TABLE event_executions ADD COLUMN end_head_sha TEXT"
+            ),
+            "end_dirty": (
+                "ALTER TABLE event_executions ADD COLUMN "
+                "end_dirty INTEGER NOT NULL DEFAULT 0"
+            ),
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                self.connection.execute(statement)
 
     def close(self) -> None:
         self.connection.close()
@@ -293,6 +327,8 @@ class SQLiteGitHubStore:
                          FROM source_events AS earlier
                          LEFT JOIN event_executions AS prior
                            ON prior.event_key = earlier.event_key
+                         LEFT JOIN event_publications AS prior_publication
+                           ON prior_publication.event_key = prior.event_key
                          WHERE earlier.thread_id = se.thread_id
                            AND (
                                earlier.source_updated_at < se.source_updated_at
@@ -306,15 +342,23 @@ class SQLiteGitHubStore:
                                    AND earlier.event_key < se.event_key
                                )
                            )
-                           AND (prior.event_key IS NULL OR
-                                prior.status NOT IN (?, ?))
+                           AND (
+                               prior.event_key IS NULL OR NOT (
+                                   prior.status = ? OR (
+                                       prior.status = ? AND
+                                       prior_publication.status IN (?, ?)
+                                   )
+                               )
+                           )
                      )
                    ORDER BY se.source_updated_at, se.discovered_at, se.event_key
                    LIMIT 1""",
                 (
                     ExecutionStatus.RETRY_PENDING.value,
-                    ExecutionStatus.SUCCEEDED.value,
                     ExecutionStatus.SKIPPED.value,
+                    ExecutionStatus.SUCCEEDED.value,
+                    PublicationStatus.COMPLETED.value,
+                    PublicationStatus.NO_CHANGES.value,
                 ),
             ).fetchone()
             if row is None:
@@ -462,6 +506,9 @@ class SQLiteGitHubStore:
         completed_at: str,
         response_text: str,
         workspace_path: str,
+        start_head_sha: str | None = None,
+        end_head_sha: str | None = None,
+        end_dirty: bool = False,
     ) -> None:
         with self.transaction() as db:
             self._update_execution(
@@ -472,6 +519,9 @@ class SQLiteGitHubStore:
                 response_text=response_text,
                 error_message=None,
                 workspace_path=workspace_path,
+                start_head_sha=start_head_sha,
+                end_head_sha=end_head_sha,
+                end_dirty=end_dirty,
             )
 
     def mark_execution_failed(
@@ -503,10 +553,14 @@ class SQLiteGitHubStore:
         response_text: str | None,
         error_message: str | None,
         workspace_path: str | None,
+        start_head_sha: str | None = None,
+        end_head_sha: str | None = None,
+        end_dirty: bool = False,
     ) -> None:
         cursor = db.execute(
             """UPDATE event_executions SET status = ?, completed_at = ?,
-               response_text = ?, error_message = ?, workspace_path = ?
+               response_text = ?, error_message = ?, workspace_path = ?,
+               start_head_sha = ?, end_head_sha = ?, end_dirty = ?
                WHERE event_key = ? AND status = ?""",
             (
                 status.value,
@@ -514,6 +568,9 @@ class SQLiteGitHubStore:
                 response_text,
                 error_message,
                 workspace_path,
+                start_head_sha,
+                end_head_sha,
+                int(end_dirty),
                 event_key,
                 ExecutionStatus.RUNNING.value,
             ),
@@ -539,12 +596,9 @@ class SQLiteGitHubStore:
                    JOIN source_events se ON se.event_key = ee.event_key
                    LEFT JOIN event_publications ep ON ep.event_key = ee.event_key
                    WHERE ee.status = ? AND (ep.event_key IS NULL OR
-                         ep.status NOT IN (?, ?))"""
-        args: list[object] = [
-            ExecutionStatus.SUCCEEDED.value,
-            PublicationStatus.COMPLETED.value,
-            PublicationStatus.NO_CHANGES.value,
-        ]
+                         ep.status IN (?, ?, ?, ?, ?))"""
+        args: list[object] = [ExecutionStatus.SUCCEEDED.value]
+        args.extend(status.value for status in RESUMABLE_PUBLICATION_STATUSES)
         if event_key is not None:
             query += " AND ep.event_key = ?"
             args.append(event_key)

@@ -86,7 +86,25 @@ class GitHubPublisher:
             raise WorkspaceError("persisted workspace directory is missing")
         self._verify_workspace(path, workspace.branch_name, workspace.base_commit)
 
-        changed = self._changed_files(path, workspace.base_commit)
+        start_head_sha = execution["start_head_sha"]
+        end_head_sha = execution["end_head_sha"]
+        if not start_head_sha or not end_head_sha:
+            raise WorkspaceError("execution is missing its Git baseline")
+        current_head_sha = self._git(path, "rev-parse", "HEAD")
+        current_dirty = bool(self._git(path, "status", "--porcelain"))
+        if (
+            end_head_sha == start_head_sha
+            and not execution["end_dirty"]
+            and current_head_sha == start_head_sha
+        ):
+            if current_dirty:
+                raise WorkspaceError("workspace became dirty after execution")
+            self.store.update_publication(
+                publication.event_key, status=PublicationStatus.NO_CHANGES, now=_now()
+            )
+            return PublicationResult("NO_CHANGES", publication.event_key)
+
+        changed = self._changed_files(path, start_head_sha)
         if not changed:
             self.store.update_publication(
                 publication.event_key, status=PublicationStatus.NO_CHANGES, now=_now()
@@ -125,6 +143,8 @@ class GitHubPublisher:
         remote_sha = self._push(
             path, remote, publication.branch_name, commit_sha, token
         )
+        if self._git(path, "status", "--porcelain"):
+            raise WorkspaceError("workspace is dirty after publication commit")
         publication = self.store.update_publication(
             publication.event_key,
             status=PublicationStatus.PUSHED,

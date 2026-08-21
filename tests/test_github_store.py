@@ -1,3 +1,4 @@
+import sqlite3
 from dataclasses import replace
 
 import pytest
@@ -197,3 +198,34 @@ def test_pr_mapping_requires_same_repo_and_rejects_conflicts(tmp_path):
     with pytest.raises(ValueError, match="belong to the repository"):
         store.register_pr_mapping(1, 14, "github:2:issue:7")
     store.close()
+
+
+def test_existing_state_db_migrates_execution_baselines(tmp_path):
+    path = tmp_path / "state.db"
+    initial = SQLiteGitHubStore(path)
+    initial.close()
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TABLE event_executions")
+    connection.execute(
+        """CREATE TABLE event_executions (
+           event_key TEXT PRIMARY KEY,
+           thread_id TEXT NOT NULL,
+           status TEXT NOT NULL,
+           attempt_count INTEGER NOT NULL,
+           started_at TEXT NOT NULL,
+           completed_at TEXT,
+           response_text TEXT,
+           error_message TEXT,
+           workspace_path TEXT
+        )"""
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = SQLiteGitHubStore(path)
+    columns = {
+        row[1]
+        for row in migrated.connection.execute("PRAGMA table_info(event_executions)")
+    }
+    assert {"start_head_sha", "end_head_sha", "end_dirty"} <= columns
+    migrated.close()
