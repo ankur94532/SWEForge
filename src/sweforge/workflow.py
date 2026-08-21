@@ -18,7 +18,12 @@ from .execution import (
     utc_timestamp,
 )
 from .github_client import GitHubClient
-from .github_models import format_source_context, starts_with_agent_invocation
+from .github_models import (
+    format_source_context,
+    is_exact_agent_approval,
+    parse_timestamp,
+    starts_with_agent_invocation,
+)
 from .github_store import (
     ExecutionPermit,
     InputPurpose,
@@ -37,13 +42,12 @@ from .repo_memory import repo_memory_namespace
 from .workspace import ThreadWorkspace, WorkspaceError
 
 _PREFIX_RE = re.compile(r"^\s*@agent\b", re.IGNORECASE)
-_APPROVE_RE = re.compile(r"^\s*@agent\s+approve\s*$", re.IGNORECASE)
 MAX_COMMENT_CHARS = 12_000
 
 
 def is_exact_approval(body: str) -> bool:
     """Only the complete ``@agent approve`` command authorizes a plan."""
-    return _APPROVE_RE.fullmatch(body) is not None
+    return is_exact_agent_approval(body)
 
 
 def invocation_text(body: str) -> str | None:
@@ -73,10 +77,13 @@ def matches_current_conversation_target(event: dict, state) -> bool:
 def _is_approval_eligible(event: dict, plan: PlanRecord) -> bool:
     if not plan.posted_at:
         return False
-    # Older durable rows lack created_at.  The immutable updated_at snapshot is
-    # the only safe fallback; never treat a missing timestamp as eligible.
-    created = event["source_created_at"] or event["source_updated_at"]
-    return created > plan.posted_at
+    created = event["source_created_at"]
+    if not created:
+        return False
+    try:
+        return parse_timestamp(created) > parse_timestamp(plan.posted_at)
+    except (TypeError, ValueError):
+        return False
 
 
 def _is_actionable_feedback(event: dict) -> bool:
@@ -358,9 +365,29 @@ class WorkflowEngine:
         ):
             raise ValueError("event is not an exact approval")
         state = self.store.workflow_state(event["thread_id"])
-        if state is None or state.phase != WorkflowPhase.WAITING_FOR_PLAN_APPROVAL:
+        if state is None:
+            self._acknowledge_delivered(
+                event_key,
+                thread_id=event["thread_id"],
+                cycle_id=0,
+                purpose=InputPurpose.STALE_PLAN_APPROVAL,
+            )
+            raise ValueError("approval is not currently actionable")
+        if state.phase != WorkflowPhase.WAITING_FOR_PLAN_APPROVAL:
+            self._acknowledge_delivered(
+                event_key,
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                purpose=InputPurpose.STALE_PLAN_APPROVAL,
+            )
             raise ValueError("approval is only valid while waiting for a posted plan")
         if not matches_current_conversation_target(event, state):
+            self._acknowledge_delivered(
+                event_key,
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                purpose=InputPurpose.STALE_PLAN_APPROVAL,
+            )
             raise ValueError("approval came from a different conversation target")
         plan = self.store.current_plan(state.thread_id)
         if plan is None or plan.status != PlanStatus.POSTED:
@@ -700,8 +727,41 @@ class WorkflowEngine:
         )
         return comment_id
 
+    def _drain_approval_controls(self, thread_id: str, state=None) -> None:
+        state = state or self.store.workflow_state(thread_id)
+        after = state.root_event_key if state else None
+        plan = self.store.current_plan(thread_id) if state else None
+        for row in self.store.unconsumed_inputs(thread_id, after_event_key=after):
+            if not is_exact_agent_approval(row["body"]):
+                continue
+            eligible = bool(
+                state
+                and state.phase == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL
+                and plan is not None
+                and matches_current_conversation_target(row, state)
+                and _is_approval_eligible(row, plan)
+            )
+            if eligible:
+                continue
+            purpose = InputPurpose.STALE_PLAN_APPROVAL
+            if state and state.phase == WorkflowPhase.PLANNING:
+                purpose = InputPurpose.EARLY_PLAN_APPROVAL
+            elif (
+                state
+                and state.phase == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL
+                and matches_current_conversation_target(row, state)
+            ):
+                purpose = InputPurpose.EARLY_PLAN_APPROVAL
+            self._acknowledge_delivered(
+                row["event_key"],
+                thread_id=thread_id,
+                cycle_id=state.cycle_id if state else 0,
+                purpose=purpose,
+            )
+
     def next_root(self, thread_id: str) -> str | None:
         state = self.store.workflow_state(thread_id)
+        self._drain_approval_controls(thread_id, state)
         after = state.root_event_key if state else None
         candidates = self.store.unconsumed_inputs(thread_id, after_event_key=after)
         for row in candidates:
@@ -713,6 +773,7 @@ class WorkflowEngine:
         state = self.store.workflow_state(thread_id)
         if state and state.phase != WorkflowPhase.IDLE:
             return None
+        self._drain_approval_controls(thread_id, state)
         candidates = self.store.unconsumed_inputs(
             thread_id, after_event_key=state.root_event_key if state else None
         )
@@ -738,6 +799,7 @@ class WorkflowEngine:
         safely recover after a process crash.
         """
         state = self.store.workflow_state(thread_id)
+        self._drain_approval_controls(thread_id, state)
         if state and state.phase == WorkflowPhase.AWAITING_PUBLICATION:
             publication = self.store.publication_for_event(state.root_event_key)
             if publication is None or publication.status.value not in {
@@ -824,18 +886,6 @@ class WorkflowEngine:
         all_pending = list(pending)
         plan = self.store.current_plan(thread_id)
         if state.phase == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL and plan is not None:
-            for row in pending:
-                if (
-                    is_exact_approval(row["body"])
-                    and matches_current_conversation_target(row, state)
-                    and not _is_approval_eligible(row, plan)
-                ):
-                    self._acknowledge_delivered(
-                        row["event_key"],
-                        thread_id=thread_id,
-                        cycle_id=state.cycle_id,
-                        purpose=InputPurpose.EARLY_PLAN_APPROVAL,
-                    )
             pending = self.store.unconsumed_inputs(
                 thread_id, after_event_key=state.root_event_key
             )

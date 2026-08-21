@@ -33,6 +33,7 @@ def make_event(repo: RepositoryRef, *, source_id: str, body: str) -> SourceEvent
         source_kind=SourceKind.ISSUE_COMMENT,
         source_id=source_id,
         source_updated_at=f"2026-01-01T00:0{source_id}Z",
+        source_created_at=f"2026-01-01T00:0{source_id}Z",
         subject_kind=SubjectKind.ISSUE,
         subject_number=7,
         author_login="octocat",
@@ -58,6 +59,7 @@ def seed(store, events):
 def test_exact_approval_is_deterministic():
     assert is_exact_approval("@agent approve")
     assert is_exact_approval("  @AGENT APPROVE  ")
+    assert is_exact_approval("@agent     approve")
     assert not is_exact_approval("@agent approve please")
     assert not is_exact_approval("@agent yes")
     assert invocation_text("  @AGENT revise step 2") == "revise step 2"
@@ -164,6 +166,7 @@ class WorkflowGitHub:
             "body": body,
             "reply_to": comment_id,
             "pull_number": pull_number,
+            "created_at": "2026-01-01T00:10:00Z",
         }
         self.created.append(item)
         return item
@@ -425,3 +428,123 @@ def test_existing_permit_root_is_backfilled_on_reopen(tmp_path):
     reopened = SQLiteGitHubStore(path)
     assert reopened.permit(permit.permit_id).root_event_key == root.event_key
     reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("created", "updated"),
+    [
+        (None, "2026-01-01T00:20Z"),
+        ("2026-01-01T00:01Z", "2026-01-01T00:20Z"),
+        ("2026-01-01T00:10Z", "2026-01-01T00:10Z"),
+        ("not-a-timestamp", "2026-01-01T00:20Z"),
+    ],
+)
+def test_approval_timestamp_fail_closed(tmp_path, created, updated):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(123, "example/repo")
+    root = make_event(repo, source_id="1", body="@agent implement X")
+    approval = replace(
+        make_event(repo, source_id="2", body="@agent approve"),
+        source_created_at=created,
+        source_updated_at=updated,
+    )
+    seed(store, [root, approval])
+    client = WorkflowGitHub()
+    engine = WorkflowEngine(
+        store=store, client=client, clock=lambda: "2026-01-01T00:11Z"
+    )
+    plan = engine.start_cycle(event_key=root.event_key, plan_text="v1")
+    engine.publish_plan(plan.plan_id)
+    with pytest.raises(ValueError, match="predates"):
+        engine.approve(event_key=approval.event_key)
+    assert store.permit_for_plan(plan.plan_id) is None
+    assert (
+        store.execution_for_event(approval.event_key)["status"]
+        == ExecutionStatus.SKIPPED
+    )
+    store.close()
+
+
+def test_auto_authorization_recovers_on_advance(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(123, "example/repo")
+    root = make_event(repo, source_id="1", body="@agent implement X")
+    seed(store, [root])
+    client = WorkflowGitHub(labels=["AUTO"])
+    engine = WorkflowEngine(
+        store=store, client=client, clock=lambda: "2026-01-01T00:11Z"
+    )
+    plan = engine.start_cycle(
+        event_key=root.event_key, plan_text="v1", mode=WorkflowMode.AUTO
+    )
+    engine.publish_plan(plan.plan_id)
+    result = engine.advance(
+        thread_id=plan.thread_id,
+        model="unused",
+        repo_paths={},
+        workspace_root=tmp_path,
+    )
+    assert result.phase is WorkflowPhase.EXECUTION_READY
+    assert result.permit_id is not None
+    assert len(client.created) == 1
+    store.close()
+
+
+def test_wrong_surface_approval_is_skipped_and_inline_target_can_approve(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(123, "example/repo")
+    issue = make_event(repo, source_id="1", body="@agent implement X")
+    seed(store, [issue])
+    store.register_pr_mapping(repo.repo_id, 42, "github:123:issue:7")
+    root = replace(
+        issue,
+        source_id="2",
+        source_updated_at="2026-01-01T00:02Z",
+        source_created_at="2026-01-01T00:02Z",
+        subject_kind=SubjectKind.PULL_REQUEST,
+        subject_number=42,
+        origin_surface=OriginSurface.PR_INLINE_REVIEW,
+        review_thread_root_id="500",
+        body="@agent fix this line",
+    )
+    wrong = replace(
+        root,
+        source_id="3",
+        source_updated_at="2026-01-01T00:05Z",
+        source_created_at="2026-01-01T00:05Z",
+        origin_surface=OriginSurface.PR_CONVERSATION,
+        review_thread_root_id=None,
+        body="@AGENT    APPROVE",
+    )
+    correct = replace(
+        root,
+        source_id="4",
+        source_updated_at="2026-01-01T00:20Z",
+        source_created_at="2026-01-01T00:20Z",
+        body="@agent approve",
+    )
+    store.record_batch(
+        repo.repo_id,
+        "review_comments",
+        [root, wrong, correct],
+        since="now",
+        etag=None,
+        polled_at="now",
+    )
+    client = WorkflowGitHub()
+    engine = WorkflowEngine(
+        store=store, client=client, clock=lambda: "2026-01-01T00:21Z"
+    )
+    plan = engine.start_cycle(event_key=root.event_key, plan_text="v1")
+    engine.publish_plan(plan.plan_id)
+    result = engine.advance(
+        thread_id=plan.thread_id,
+        model="unused",
+        repo_paths={},
+        workspace_root=tmp_path,
+    )
+    assert result.phase is WorkflowPhase.EXECUTION_READY
+    assert (
+        store.input_consumption(wrong.event_key).purpose.value == "STALE_PLAN_APPROVAL"
+    )
+    store.close()

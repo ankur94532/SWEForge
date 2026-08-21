@@ -23,6 +23,14 @@ class OriginSurface(StrEnum):
     PR_INLINE_REVIEW = "PR_INLINE_REVIEW"
 
 
+_EXACT_APPROVAL_RE = re.compile(r"^\s*@agent\s+approve\s*$", re.IGNORECASE)
+
+
+def is_exact_agent_approval(body: str | None) -> bool:
+    """Recognize the one exact, deterministic approval control command."""
+    return bool(body and _EXACT_APPROVAL_RE.fullmatch(body))
+
+
 @dataclass(frozen=True)
 class RepositoryRef:
     repo_id: int

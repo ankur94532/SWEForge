@@ -8,7 +8,12 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
-from .github_models import SourceEvent, SubjectKind, starts_with_agent_invocation
+from .github_models import (
+    SourceEvent,
+    SubjectKind,
+    is_exact_agent_approval,
+    starts_with_agent_invocation,
+)
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -237,6 +242,7 @@ class InputPurpose(StrEnum):
     LIVE_EXECUTION_INPUT = "LIVE_EXECUTION_INPUT"
     PLAN_APPROVAL = "PLAN_APPROVAL"
     EARLY_PLAN_APPROVAL = "EARLY_PLAN_APPROVAL"
+    STALE_PLAN_APPROVAL = "STALE_PLAN_APPROVAL"
 
 
 class PendingWorkflowInputError(ValueError):
@@ -2013,10 +2019,30 @@ class SQLiteGitHubStore:
                 (expected_thread_id, permit["root_event_key"]),
             ).fetchall()
             for candidate in pending:
-                normalized = candidate["body"].strip().lower()
-                if starts_with_agent_invocation(candidate["body"]) and normalized != (
-                    "@agent approve"
-                ):
+                if is_exact_agent_approval(candidate["body"]):
+                    db.execute(
+                        """INSERT INTO thread_input_consumptions(
+                           event_key, thread_id, cycle_id, purpose, status,
+                           claimed_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            candidate["event_key"],
+                            expected_thread_id,
+                            state["cycle_id"],
+                            InputPurpose.STALE_PLAN_APPROVAL.value,
+                            "CONSUMED",
+                            now,
+                            now,
+                        ),
+                    )
+                    self._resolve_workflow_control(
+                        db,
+                        event_key=candidate["event_key"],
+                        thread_id=expected_thread_id,
+                        claimed_at=now,
+                        purpose=InputPurpose.STALE_PLAN_APPROVAL,
+                    )
+                    continue
+                if starts_with_agent_invocation(candidate["body"]):
                     raise PendingWorkflowInputError(candidate["event_key"])
             if row["execution_status"] not in (
                 None,
