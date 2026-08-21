@@ -1,11 +1,36 @@
 """Deep Agent construction and invocation."""
 
 import os
+from collections.abc import Mapping
 from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import CompositeBackend, LocalShellBackend, StateBackend
 from langchain_core.messages import HumanMessage
+
+
+def _normalize_response_text(message: Any) -> str:
+    """Return user-facing text without serializing structured message content."""
+    content = getattr(message, "content", "")
+    if isinstance(content, str):
+        return content
+
+    # LangChain exposes normalized blocks through this stable accessor.  Fall
+    # back to raw content for lightweight test doubles and other message types.
+    blocks = getattr(message, "content_blocks", content)
+    if not isinstance(blocks, (list, tuple)):
+        return ""
+
+    text_blocks: list[str] = []
+    for block in blocks:
+        if isinstance(block, Mapping):
+            if block.get("type") == "text" and isinstance(block.get("text"), str):
+                text_blocks.append(block["text"])
+        elif getattr(block, "type", None) == "text":
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                text_blocks.append(text)
+    return "\n".join(text_blocks)
 
 
 def _build_backend(worktree: str) -> CompositeBackend:
@@ -80,7 +105,4 @@ def run_task(
     messages = result.get("messages", [])
     if not messages:
         return ""
-    content = messages[-1].content
-    if isinstance(content, str):
-        return content
-    return str(content)
+    return _normalize_response_text(messages[-1])
