@@ -59,10 +59,11 @@ def main(argv: list[str] | None = None) -> int:
         client.close()
 
     print(f"repositories polled: {result.repositories}")
-    print(f"events discovered: {result.discovered}")
-    print(f"events newly persisted: {result.persisted}")
-    print(f"issue threads resolved: {result.issue_threads}")
-    print(f"unrouted PR events: {result.unrouted_pr_events}")
+    print(f"events discovered: {result.events_discovered}")
+    print(f"events newly persisted: {result.events_persisted}")
+    print(f"threads newly created: {result.threads_created}")
+    print(f"events routed: {result.events_routed}")
+    print(f"PR events unrouted: {result.pr_events_unrouted}")
     print("secrets: not logged")
     return 0
 

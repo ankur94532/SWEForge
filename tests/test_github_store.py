@@ -1,3 +1,7 @@
+from dataclasses import replace
+
+import pytest
+
 from sweforge.github_models import (
     RepositoryRef,
     SourceEvent,
@@ -35,7 +39,7 @@ def test_thread_identity_and_event_idempotency_survive_reopen(tmp_path):
             since="2025-12-31T23:00:00Z",
             etag="one",
             polled_at="2026-01-01T00:00:01Z",
-        )
+        ).events_persisted
         == 1
     )
     assert (
@@ -46,7 +50,7 @@ def test_thread_identity_and_event_idempotency_survive_reopen(tmp_path):
             since="2025-12-31T23:00:00Z",
             etag="one",
             polled_at="2026-01-01T00:00:02Z",
-        )
+        ).events_persisted
         == 0
     )
     store.close()
@@ -81,7 +85,7 @@ def test_pr_mapping_routes_existing_unrouted_events(tmp_path):
             since="now",
             etag=None,
             polled_at="now",
-        )
+        ).events_persisted
         == 1
     )
     assert store.events()[0]["thread_id"] is None
@@ -97,4 +101,99 @@ def test_pr_mapping_routes_existing_unrouted_events(tmp_path):
     )
     store.register_pr_mapping(repo.repo_id, 12, issue_thread)
     assert store.events()[0]["thread_id"] == issue_thread
+    store.close()
+
+
+def test_duplicate_event_does_not_update_thread_activity(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(12345, "example/repo")
+    store.upsert_repository(repo.repo_id, repo.full_name, "now")
+    store.record_batch(
+        repo.repo_id,
+        "issues",
+        [event(repo)],
+        since="now",
+        etag=None,
+        polled_at="2026-01-01T00:00:01Z",
+    )
+    store.record_batch(
+        repo.repo_id,
+        "issues",
+        [event(repo)],
+        since="now",
+        etag=None,
+        polled_at="2026-01-01T00:00:02Z",
+    )
+    assert store.threads()[0]["updated_at"] == "2026-01-01T00:00:01Z"
+    edited = event(repo, source_id="1", number=7)
+    edited = replace(edited, source_updated_at="2026-01-01T00:01:00Z")
+    store.record_batch(
+        repo.repo_id,
+        "issues",
+        [edited],
+        since="now",
+        etag=None,
+        polled_at="2026-01-01T00:01:01Z",
+    )
+    assert store.threads()[0]["updated_at"] == "2026-01-01T00:01:01Z"
+    store.close()
+
+
+def test_cursor_failure_rolls_back_inserted_event(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(12345, "example/repo")
+    store.upsert_repository(repo.repo_id, repo.full_name, "now")
+    store.connection.execute(
+        """CREATE TRIGGER fail_cursor BEFORE INSERT ON poll_cursors
+           BEGIN SELECT RAISE(ABORT, 'cursor failure'); END"""
+    )
+    try:
+        store.record_batch(
+            repo.repo_id,
+            "issues",
+            [event(repo)],
+            since="now",
+            etag=None,
+            polled_at="now",
+        )
+    except Exception as exc:
+        assert "cursor failure" in str(exc)
+    else:
+        raise AssertionError("record_batch unexpectedly succeeded")
+    assert not store.events()
+    assert store.cursor(repo.repo_id, "issues") is None
+    assert not store.threads()
+    store.close()
+
+
+def test_pr_mapping_requires_same_repo_and_rejects_conflicts(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    first = RepositoryRef(1, "example/one")
+    second = RepositoryRef(2, "example/two")
+    for repo in (first, second):
+        store.upsert_repository(repo.repo_id, repo.full_name, "now")
+        store.record_batch(
+            repo.repo_id,
+            "issues",
+            [event(repo, number=7)],
+            since="now",
+            etag=None,
+            polled_at="now",
+        )
+    store.record_batch(
+        first.repo_id,
+        "issues",
+        [event(first, source_id="2", number=8)],
+        since="now",
+        etag=None,
+        polled_at="now",
+    )
+    first_thread = "github:1:issue:7"
+    conflicting_thread = "github:1:issue:8"
+    store.register_pr_mapping(1, 12, first_thread)
+    store.register_pr_mapping(1, 12, first_thread)
+    with pytest.raises(ValueError, match="another thread"):
+        store.register_pr_mapping(1, 12, conflicting_thread)
+    with pytest.raises(ValueError, match="belong to the repository"):
+        store.register_pr_mapping(1, 14, "github:2:issue:7")
     store.close()

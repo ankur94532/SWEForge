@@ -3,10 +3,10 @@
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from dataclasses import dataclass
 from pathlib import Path
 
-from .github_models import SourceEvent
+from .github_models import SourceEvent, SubjectKind
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -56,8 +56,12 @@ CREATE TABLE IF NOT EXISTS pr_thread_mappings (
 """
 
 
-def utc_now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+@dataclass
+class RecordBatchResult:
+    events_persisted: int = 0
+    threads_created: int = 0
+    events_routed: int = 0
+    pr_events_unrouted: int = 0
 
 
 class SQLiteGitHubStore:
@@ -109,12 +113,19 @@ class SQLiteGitHubStore:
         since: str,
         etag: str | None,
         polled_at: str,
-    ) -> int:
-        inserted = 0
+    ) -> RecordBatchResult:
+        result = RecordBatchResult()
         with self.transaction() as db:
             for event in events:
-                thread_id = self._resolve_thread(db, event, polled_at)
-                cursor = db.execute(
+                if event.repo_id != repo_id:
+                    raise ValueError("event repository does not match the batch")
+                if db.execute(
+                    "SELECT 1 FROM source_events WHERE event_key = ?",
+                    (event.event_key,),
+                ).fetchone():
+                    continue
+                thread_id = self._resolve_thread(db, event, polled_at, result)
+                db.execute(
                     """INSERT OR IGNORE INTO source_events(
                        event_key, repo_id, repo_full_name, source_kind, source_id,
                        source_updated_at, subject_kind, subject_number, author_login,
@@ -136,7 +147,7 @@ class SQLiteGitHubStore:
                         polled_at,
                     ),
                 )
-                inserted += cursor.rowcount
+                result.events_persisted += 1
             db.execute(
                 """INSERT INTO poll_cursors(repo_id, stream, since, etag,
                    last_successful_poll_at) VALUES (?, ?, ?, ?, ?)
@@ -145,40 +156,72 @@ class SQLiteGitHubStore:
                    last_successful_poll_at=excluded.last_successful_poll_at""",
                 (repo_id, stream, since, etag, polled_at),
             )
-        return inserted
+        return result
 
-    def _resolve_thread(self, db: sqlite3.Connection, event: SourceEvent, now: str):
-        if event.subject_kind.value == "pull_request":
+    def _resolve_thread(
+        self,
+        db: sqlite3.Connection,
+        event: SourceEvent,
+        now: str,
+        result: RecordBatchResult,
+    ) -> str | None:
+        if event.subject_kind == SubjectKind.PULL_REQUEST:
             row = db.execute(
                 "SELECT thread_id FROM pr_thread_mappings "
                 "WHERE repo_id = ? AND pr_number = ?",
                 (event.repo_id, event.subject_number),
             ).fetchone()
-            return row[0] if row else None
+            if row:
+                result.events_routed += 1
+                return row[0]
+            result.pr_events_unrouted += 1
+            return None
         thread_id = f"github:{event.repo_id}:issue:{event.subject_number}"
-        db.execute(
-            """INSERT INTO issue_threads(thread_id, repo_id, repo_full_name,
-               issue_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-               ON CONFLICT(repo_id, issue_number) DO UPDATE SET
-               updated_at=excluded.updated_at""",
-            (
-                thread_id,
-                event.repo_id,
-                event.repo_full_name,
-                event.subject_number,
-                now,
-                now,
-            ),
-        )
+        existing = db.execute(
+            "SELECT 1 FROM issue_threads WHERE repo_id = ? AND issue_number = ?",
+            (event.repo_id, event.subject_number),
+        ).fetchone()
+        if existing:
+            db.execute(
+                "UPDATE issue_threads SET updated_at = ? WHERE thread_id = ?",
+                (now, thread_id),
+            )
+        else:
+            db.execute(
+                """INSERT INTO issue_threads(thread_id, repo_id, repo_full_name,
+                   issue_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    thread_id,
+                    event.repo_id,
+                    event.repo_full_name,
+                    event.subject_number,
+                    now,
+                    now,
+                ),
+            )
+            result.threads_created += 1
+        result.events_routed += 1
         return thread_id
 
     def register_pr_mapping(self, repo_id: int, pr_number: int, thread_id: str) -> None:
         with self.transaction() as db:
+            thread = db.execute(
+                "SELECT repo_id FROM issue_threads WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if thread is None or thread[0] != repo_id:
+                raise ValueError("PR mapping thread must belong to the repository")
+            existing = db.execute(
+                "SELECT thread_id FROM pr_thread_mappings "
+                "WHERE repo_id = ? AND pr_number = ?",
+                (repo_id, pr_number),
+            ).fetchone()
+            if existing and existing[0] != thread_id:
+                raise ValueError("PR mapping already points to another thread")
             db.execute(
                 "INSERT INTO pr_thread_mappings(repo_id, pr_number, thread_id) "
                 "VALUES (?, ?, ?) "
-                "ON CONFLICT(repo_id, pr_number) DO UPDATE SET "
-                "thread_id=excluded.thread_id",
+                "ON CONFLICT(repo_id, pr_number) DO NOTHING",
                 (repo_id, pr_number, thread_id),
             )
             db.execute(

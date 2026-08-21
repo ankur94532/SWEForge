@@ -16,7 +16,7 @@ from .github_models import (
     contains_agent_mention,
     parse_timestamp,
 )
-from .github_store import SQLiteGitHubStore, utc_now
+from .github_store import RecordBatchResult, SQLiteGitHubStore
 
 STREAMS = ("issues", "issue_comments", "review_comments")
 _NUMBER_RE = re.compile(r"/(?:issues|pulls)/(\d+)(?:$|/)")
@@ -25,10 +25,19 @@ _NUMBER_RE = re.compile(r"/(?:issues|pulls)/(\d+)(?:$|/)")
 @dataclass(frozen=True)
 class PollResult:
     repositories: int = 0
-    discovered: int = 0
-    persisted: int = 0
-    issue_threads: int = 0
-    unrouted_pr_events: int = 0
+    events_discovered: int = 0
+    events_persisted: int = 0
+    threads_created: int = 0
+    events_routed: int = 0
+    pr_events_unrouted: int = 0
+
+    @property
+    def discovered(self) -> int:
+        return self.events_discovered
+
+    @property
+    def persisted(self) -> int:
+        return self.events_persisted
 
 
 class GitHubPoller:
@@ -55,13 +64,16 @@ class GitHubPoller:
 
     def _poll_repository(self, full_name: str) -> PollResult:
         repo = self.client.repository(full_name)
-        observed = utc_now()
+        observed = self._timestamp(self.now())
         self.store.upsert_repository(repo.repo_id, repo.full_name, observed)
         result = PollResult(repositories=1)
+        classifications: dict[int, SubjectKind] = {}
         for stream in STREAMS:
-            response, since = self._fetch(repo, stream)
-            events = list(self._normalize(repo, stream, response.items))
-            persisted = self.store.record_batch(
+            response, since = self._fetch(repo, stream, observed)
+            events = list(
+                self._normalize(repo, stream, response.items, classifications)
+            )
+            batch = self.store.record_batch(
                 repo.repo_id,
                 stream,
                 events,
@@ -69,31 +81,24 @@ class GitHubPoller:
                 etag=response.etag,
                 polled_at=observed,
             )
-            result = self._add(
-                result,
-                PollResult(
-                    discovered=len(events),
-                    persisted=persisted,
-                    issue_threads=sum(
-                        1 for event in events if event.subject_kind == SubjectKind.ISSUE
-                    ),
-                    unrouted_pr_events=sum(
-                        1
-                        for event in events
-                        if event.subject_kind == SubjectKind.PULL_REQUEST
-                    ),
-                ),
-            )
+            result = self._add(result, self._result_for_batch(events, batch))
         return result
 
-    def _fetch(self, repo: RepositoryRef, stream: str) -> tuple[PollResponse, str]:
+    def _fetch(
+        self, repo: RepositoryRef, stream: str, observed: str
+    ) -> tuple[PollResponse, str]:
         cursor = self.store.cursor(repo.repo_id, stream)
         if cursor:
             since = cursor["since"]
             etag = cursor["etag"]
         else:
             since = (
-                (self.now() - self.initial_lookback).isoformat().replace("+00:00", "Z")
+                (
+                    datetime.fromisoformat(observed.replace("Z", "+00:00"))
+                    - self.initial_lookback
+                )
+                .isoformat()
+                .replace("+00:00", "Z")
             )
             etag = None
         method = getattr(self.client, stream)
@@ -108,10 +113,19 @@ class GitHubPoller:
         if not timestamps:
             return response, since
         latest = max(timestamps) - self.overlap
-        return response, latest.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        # The next cursor represents a different query, so the current page's
+        # ETag is deliberately discarded. ETags remain useful for unchanged
+        # queries (304), while overlap and event keys provide correctness.
+        return PollResponse(items=response.items), latest.astimezone(
+            UTC
+        ).isoformat().replace("+00:00", "Z")
 
     def _normalize(
-        self, repo: RepositoryRef, stream: str, items: Iterable[dict]
+        self,
+        repo: RepositoryRef,
+        stream: str,
+        items: Iterable[dict],
+        classifications: dict[int, SubjectKind],
     ) -> Iterable[SourceEvent]:
         for item in items:
             body = item.get("body")
@@ -130,7 +144,11 @@ class GitHubPoller:
                 )
             elif stream == "issue_comments":
                 number = self._number_from_url(item.get("issue_url"))
-                subject = classify_subject(self.client.issue(repo, number))
+                if number not in classifications:
+                    classifications[number] = classify_subject(
+                        self.client.issue(repo, number)
+                    )
+                subject = classifications[number]
                 yield self._event(
                     repo,
                     SourceKind.ISSUE_COMMENT,
@@ -180,11 +198,30 @@ class GitHubPoller:
         )
 
     @staticmethod
+    def _timestamp(value: datetime) -> str:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("poller clock must return an aware datetime")
+        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _result_for_batch(
+        events: list[SourceEvent], batch: RecordBatchResult
+    ) -> PollResult:
+        return PollResult(
+            events_discovered=len(events),
+            events_persisted=batch.events_persisted,
+            threads_created=batch.threads_created,
+            events_routed=batch.events_routed,
+            pr_events_unrouted=batch.pr_events_unrouted,
+        )
+
+    @staticmethod
     def _add(left: PollResult, right: PollResult) -> PollResult:
         return PollResult(
             repositories=left.repositories + right.repositories,
-            discovered=left.discovered + right.discovered,
-            persisted=left.persisted + right.persisted,
-            issue_threads=left.issue_threads + right.issue_threads,
-            unrouted_pr_events=left.unrouted_pr_events + right.unrouted_pr_events,
+            events_discovered=left.events_discovered + right.events_discovered,
+            events_persisted=left.events_persisted + right.events_persisted,
+            threads_created=left.threads_created + right.threads_created,
+            events_routed=left.events_routed + right.events_routed,
+            pr_events_unrouted=left.pr_events_unrouted + right.pr_events_unrouted,
         )

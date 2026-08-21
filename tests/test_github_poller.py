@@ -41,20 +41,26 @@ class FakeGitHub:
         self.repositories = repositories
         self.responses = responses or {}
         self.issue_payloads = issue_payloads or {}
+        self.issue_calls = []
+        self.stream_calls = []
 
     def repository(self, full_name):
         return self.repositories[full_name]
 
     def issues(self, repo, since, etag):
+        self.stream_calls.append(("issues", since, etag))
         return self.responses.get((repo.repo_id, "issues"), PollResponse())
 
     def issue_comments(self, repo, since, etag):
+        self.stream_calls.append(("issue_comments", since, etag))
         return self.responses.get((repo.repo_id, "issue_comments"), PollResponse())
 
     def review_comments(self, repo, since, etag):
+        self.stream_calls.append(("review_comments", since, etag))
         return self.responses.get((repo.repo_id, "review_comments"), PollResponse())
 
     def issue(self, repo, number):
+        self.issue_calls.append((repo.repo_id, number))
         return self.issue_payloads.get((repo.repo_id, number), {})
 
 
@@ -77,8 +83,20 @@ def test_issue_event_is_persisted_once_and_thread_is_deterministic(tmp_path):
     first = poller(fake, store).poll([repo.full_name])
     second = poller(fake, store).poll([repo.full_name])
 
-    assert first.persisted == 1
-    assert second.persisted == 0
+    assert first.events_persisted == 1
+    assert first.threads_created == 1
+    assert second.events_persisted == 0
+    assert second.threads_created == 0
+    assert (
+        store.connection.execute(
+            "SELECT observed_at FROM repositories WHERE repo_id = 123"
+        ).fetchone()[0]
+        == "2026-01-01T00:00:00Z"
+    )
+    assert store.events()[0]["discovered_at"] == "2026-01-01T00:00:00Z"
+    assert store.cursor(123, "issues")["last_successful_poll_at"] == (
+        "2026-01-01T00:00:00Z"
+    )
     assert [row["thread_id"] for row in store.events()] == ["github:123:issue:7"]
     store.close()
 
@@ -98,6 +116,46 @@ def test_edited_comment_creates_one_new_event(tmp_path):
     assert poller(fake, store).poll([repo.full_name]).persisted == 1
     assert poller(fake, store).poll([repo.full_name]).persisted == 0
     assert len(store.events()) == 1
+    store.close()
+
+
+def test_issue_comment_classification_is_cached_per_poll(tmp_path):
+    repo = RepositoryRef(123, "example/repo")
+    fake = FakeGitHub(
+        {repo.full_name: repo},
+        {
+            (123, "issue_comments"): PollResponse(
+                (comment_item(comment_id=9), comment_item(comment_id=10))
+            )
+        },
+        {(123, 7): {}},
+    )
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    poller(fake, store).poll([repo.full_name])
+    assert fake.issue_calls == [(123, 7)]
+    store.close()
+
+
+def test_result_counts_new_threads_routing_and_duplicates_precisely(tmp_path):
+    repo = RepositoryRef(123, "example/repo")
+    fake = FakeGitHub(
+        {repo.full_name: repo},
+        {
+            (123, "issues"): PollResponse((issue_item(),)),
+            (123, "issue_comments"): PollResponse(
+                (comment_item(comment_id=9), comment_item(comment_id=10))
+            ),
+        },
+        {(123, 7): {}},
+    )
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    first = poller(fake, store).poll([repo.full_name])
+    second = poller(fake, store).poll([repo.full_name])
+    assert (first.events_discovered, first.events_persisted) == (3, 3)
+    assert (first.threads_created, first.events_routed) == (1, 3)
+    assert first.pr_events_unrouted == 0
+    assert (second.events_persisted, second.threads_created) == (0, 0)
+    assert second.events_routed == 0
     store.close()
 
 
@@ -124,7 +182,8 @@ def test_pr_comments_are_unrouted_without_mapping(tmp_path):
     store = SQLiteGitHubStore(tmp_path / "state.db")
     result = poller(fake, store).poll([repo.full_name])
 
-    assert result.persisted == 2
+    assert result.events_persisted == 2
+    assert result.pr_events_unrouted == 2
     assert not store.threads()
     assert all(row["thread_id"] is None for row in store.events())
     store.close()
@@ -159,6 +218,19 @@ def test_pr_mapping_routes_future_events_and_repo_namespaces_are_isolated(tmp_pa
         if event["repo_id"] == 123 and event["subject_kind"] == "pull_request"
     )
     assert routed["thread_id"] == "github:123:issue:7"
+    fake.responses[(123, "review_comments")] = PollResponse(
+        (
+            {
+                "id": 12,
+                "updated_at": "2026-01-01T00:01:00Z",
+                "body": "@agent another review",
+                "pull_request_url": "https://api.github.com/repos/example/one/pulls/12",
+            },
+        )
+    )
+    routed_result = poller(fake, store).poll([first.full_name])
+    assert routed_result.events_routed == 1
+    assert routed_result.pr_events_unrouted == 0
     assert {row["thread_id"] for row in store.threads()} == {
         "github:123:issue:7",
         "github:456:issue:7",
@@ -191,4 +263,19 @@ def test_304_is_successful_noop(tmp_path):
     result = poller(fake, store).poll([repo.full_name])
     assert result.persisted == 0
     assert store.cursor(123, "issues")["last_successful_poll_at"]
+    store.close()
+
+
+def test_etag_is_not_reused_after_cursor_query_changes(tmp_path):
+    repo = RepositoryRef(123, "example/repo")
+    fake = FakeGitHub(
+        {repo.full_name: repo},
+        {(123, "issues"): PollResponse((issue_item(),), etag="etag-1")},
+    )
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    poller(fake, store).poll([repo.full_name])
+    poller(fake, store).poll([repo.full_name])
+    issue_calls = [call for call in fake.stream_calls if call[0] == "issues"]
+    assert issue_calls[0][2] is None
+    assert issue_calls[1][2] is None
     store.close()

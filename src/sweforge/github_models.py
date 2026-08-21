@@ -1,5 +1,6 @@
 """Typed data exchanged by the GitHub ingestion boundary."""
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -68,18 +69,14 @@ def parse_timestamp(value: str) -> datetime:
 
 
 def contains_agent_mention(body: str | None, token: str = "@agent") -> bool:
-    """Return whether body contains the standalone, case-insensitive token."""
+    """Return whether body contains a standalone, case-insensitive mention."""
     if not body:
         return False
-    lowered = body.casefold()
-    token_lower = token.casefold()
-    start = 0
-    while (index := lowered.find(token_lower, start)) >= 0:
-        end = index + len(token_lower)
-        if end == len(lowered) or not (lowered[end].isalnum() or lowered[end] == "_"):
-            return True
-        start = end
-    return False
+    escaped = re.escape(token)
+    return (
+        re.search(rf"(?<![A-Za-z0-9_]){escaped}(?![A-Za-z0-9_])", body, re.IGNORECASE)
+        is not None
+    )
 
 
 def classify_subject(issue_payload: dict) -> SubjectKind:

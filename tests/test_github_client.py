@@ -38,6 +38,8 @@ def test_http_client_headers_pagination_and_304():
     assert response.etag == "etag-1"
     assert requests[0].headers["authorization"] == "Bearer token-value"
     assert requests[1].url.params["per_page"] == "100"
+    assert requests[2].headers["authorization"] == "Bearer token-value"
+    assert "per_page" not in requests[2].url.params
 
     unchanged = client.issues(repo, "2026-01-01T00:00:00Z", "etag-1")
     assert unchanged.not_modified

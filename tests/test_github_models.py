@@ -8,7 +8,9 @@ from sweforge.github_models import (
 def test_agent_mention_matching():
     assert contains_agent_mention("@agent")
     assert contains_agent_mention("Please @AGENT fix this")
+    assert contains_agent_mention("please @agent, fix")
     assert not contains_agent_mention("@agentic is a different account")
+    assert not contains_agent_mention("foo@agent")
     assert not contains_agent_mention(None)
 
 
