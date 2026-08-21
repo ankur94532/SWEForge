@@ -289,3 +289,86 @@ def test_resolved_issue_snapshot_is_not_a_new_task(tmp_path):
     assert store.execution_for_event(edited_snapshot.event_key)["status"] == "SKIPPED"
     assert store.claim_next_event(now="latest") is None
     store.close()
+
+
+def test_publication_uses_issue_thread_number_for_pr_event(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(12345, "example/repo")
+    store.upsert_repository(repo.repo_id, repo.full_name, "now")
+    issue = event(repo)
+    store.record_batch(
+        repo.repo_id, "issues", [issue], since="now", etag=None, polled_at="now"
+    )
+    pr_event = replace(
+        issue,
+        source_kind=SourceKind.ISSUE_COMMENT,
+        source_id="comment-1",
+        source_updated_at="2026-01-01T00:01:00Z",
+        subject_kind=SubjectKind.PULL_REQUEST,
+        subject_number=99,
+    )
+    store.register_pr_mapping(repo.repo_id, 99, "github:12345:issue:7")
+    store.record_batch(
+        repo.repo_id,
+        "issue_comments",
+        [pr_event],
+        since="now",
+        etag=None,
+        polled_at="later",
+    )
+    store.claim_next_event(now="now")
+    store.mark_execution_succeeded(
+        issue.event_key,
+        completed_at="later",
+        response_text="ok",
+        workspace_path="/workspace",
+        start_head_sha="base",
+        end_head_sha="base",
+        end_dirty=False,
+    )
+    store.save_thread_workspace(
+        ThreadWorkspaceRecord(
+            "github:12345:issue:7",
+            repo.repo_id,
+            repo.full_name,
+            7,
+            "/repository",
+            "/workspace",
+            "sweforge/issue-7",
+            "base",
+            "now",
+            "now",
+        )
+    )
+    store.ensure_publication(issue.event_key, now="later")
+    store.update_publication(
+        issue.event_key, status=PublicationStatus.COMPLETED, now="later"
+    )
+    claim = store.claim_next_event(now="later")
+    assert claim and claim.event_key == pr_event.event_key
+    store.mark_execution_succeeded(
+        pr_event.event_key,
+        completed_at="latest",
+        response_text="ok",
+        workspace_path="/workspace",
+        start_head_sha="base",
+        end_head_sha="base",
+        end_dirty=False,
+    )
+    store.save_thread_workspace(
+        ThreadWorkspaceRecord(
+            "github:12345:issue:7",
+            repo.repo_id,
+            repo.full_name,
+            7,
+            "/repository",
+            "/workspace",
+            "sweforge/issue-7",
+            "base",
+            "now",
+            "now",
+        )
+    )
+    publication = store.ensure_publication(pr_event.event_key, now="latest")
+    assert publication.issue_number == 7
+    store.close()

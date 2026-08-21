@@ -704,8 +704,9 @@ class SQLiteGitHubStore:
         with self.transaction() as db:
             row = db.execute(
                 """SELECT se.event_key, se.thread_id, se.repo_id, se.repo_full_name,
-                          se.subject_number, tw.branch_name
+                          thread.issue_number, tw.branch_name
                    FROM source_events se
+                   JOIN issue_threads thread ON thread.thread_id = se.thread_id
                    JOIN thread_workspaces tw ON tw.thread_id = se.thread_id
                    JOIN event_executions ee ON ee.event_key = se.event_key
                    WHERE se.event_key = ? AND ee.status = ?""",
@@ -723,7 +724,7 @@ class SQLiteGitHubStore:
                     row["thread_id"],
                     row["repo_id"],
                     row["repo_full_name"],
-                    row["subject_number"],
+                    row["issue_number"],
                     PublicationStatus.PENDING.value,
                     row["branch_name"],
                     now,
