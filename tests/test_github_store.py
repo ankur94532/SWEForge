@@ -10,7 +10,6 @@ from sweforge.github_models import (
     SubjectKind,
 )
 from sweforge.github_store import (
-    PublicationStatus,
     SQLiteGitHubStore,
     ThreadWorkspaceRecord,
 )
@@ -274,10 +273,6 @@ def test_resolved_issue_snapshot_is_not_a_new_task(tmp_path):
         end_head_sha="base",
         end_dirty=False,
     )
-    store.ensure_publication(first.event_key, now="later")
-    store.update_publication(
-        first.event_key, status=PublicationStatus.COMPLETED, now="later"
-    )
     store.record_batch(
         repo.repo_id,
         "issues",
@@ -286,8 +281,8 @@ def test_resolved_issue_snapshot_is_not_a_new_task(tmp_path):
         etag=None,
         polled_at="latest",
     )
-    assert store.execution_for_event(edited_snapshot.event_key)["status"] == "SKIPPED"
-    assert store.claim_next_event(now="latest") is None
+    assert store.execution_for_event(edited_snapshot.event_key) is None
+    assert store.claim_next_event(now="latest").event_key == edited_snapshot.event_key
     store.close()
 
 
@@ -340,10 +335,6 @@ def test_publication_uses_issue_thread_number_for_pr_event(tmp_path):
             "now",
         )
     )
-    store.ensure_publication(issue.event_key, now="later")
-    store.update_publication(
-        issue.event_key, status=PublicationStatus.COMPLETED, now="later"
-    )
     claim = store.claim_next_event(now="later")
     assert claim and claim.event_key == pr_event.event_key
     store.mark_execution_succeeded(
@@ -369,6 +360,6 @@ def test_publication_uses_issue_thread_number_for_pr_event(tmp_path):
             "now",
         )
     )
-    publication = store.ensure_publication(pr_event.event_key, now="latest")
-    assert publication.issue_number == 7
+    with pytest.raises(ValueError, match="ACCEPT review"):
+        store.ensure_publication(pr_event.event_key, now="latest")
     store.close()

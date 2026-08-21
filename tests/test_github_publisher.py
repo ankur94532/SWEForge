@@ -110,6 +110,95 @@ def setup_publication(tmp_path):
         end_head_sha=base,
         end_dirty=True,
     )
+    plan_id = "plan-reviewed"
+    store.connection.execute(
+        """INSERT INTO issue_plans(
+           plan_id,thread_id,repo_id,repo_full_name,issue_number,cycle_id,version,
+           root_event_key,plan_text,status,created_at,posted_at,approved_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            plan_id,
+            claim.thread_id,
+            1,
+            repo.full_name,
+            7,
+            1,
+            1,
+            claim.event_key,
+            "reviewed",
+            "APPROVED",
+            "now",
+            "now",
+            "now",
+        ),
+    )
+    store.connection.execute(
+        """INSERT INTO issue_workflow_state(
+           thread_id,repo_id,repo_full_name,issue_number,phase,cycle_id,root_event_key,
+           current_plan_id,mode,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            claim.thread_id,
+            1,
+            repo.full_name,
+            7,
+            "AWAITING_PUBLICATION",
+            1,
+            claim.event_key,
+            plan_id,
+            "INTERACTIVE",
+            "now",
+            "now",
+        ),
+    )
+    store.connection.execute(
+        """INSERT INTO execution_attempts(
+           attempt_id,thread_id,cycle_id,plan_id,plan_version,root_event_key,
+           attempt_number,kind,authorization_id,status,created_at,completed_at,
+           start_head_sha,end_head_sha,end_dirty)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "attempt-reviewed",
+            claim.thread_id,
+            1,
+            plan_id,
+            1,
+            claim.event_key,
+            1,
+            "INITIAL",
+            "permit-reviewed",
+            "SUCCEEDED",
+            "now",
+            "now",
+            base,
+            base,
+            1,
+        ),
+    )
+    store.connection.execute(
+        """INSERT INTO execution_reviews(
+           review_id,thread_id,cycle_id,plan_id,plan_version,root_event_key,attempt_id,
+           review_iteration,verdict,summary,findings_json,repair_instructions_json,
+           created_at,completed_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "review-reviewed",
+            claim.thread_id,
+            1,
+            plan_id,
+            1,
+            claim.event_key,
+            "attempt-reviewed",
+            1,
+            "ACCEPT",
+            "good",
+            "[]",
+            "[]",
+            "now",
+            "now",
+        ),
+    )
+    store.connection.commit()
     return store, event.event_key, remote
 
 
@@ -198,7 +287,7 @@ def test_follow_up_without_changes_does_not_republish_old_commit(tmp_path):
         end_head_sha=published_sha,
         end_dirty=False,
     )
-    assert publisher.publish_one().status == "NO_CHANGES"
+    assert publisher.publish_one().status == "NO_WORK"
     assert git(workspace, "rev-parse", "HEAD") == published_sha
     assert len(client.pull_requests_created) == 1
     store.close()

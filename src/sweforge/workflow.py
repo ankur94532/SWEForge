@@ -15,6 +15,7 @@ from .execution import (
     ThreadLockUnavailable,
     _execute_claim,
     normalize_task,
+    run_task,
     thread_lock,
     utc_timestamp,
 )
@@ -27,6 +28,7 @@ from .github_models import (
 )
 from .github_store import (
     AttemptStatus,
+    ClaimedEvent,
     ExecutionPermit,
     ExecutionReviewRecord,
     InputPurpose,
@@ -477,7 +479,13 @@ class WorkflowEngine:
 
     def validate_permit(self, permit_id: str) -> ExecutionPermit:
         permit = self.store.permit(permit_id)
-        if permit is None or permit.invalidated_at or permit.consumed_at:
+        if permit is None or permit.invalidated_at:
+            raise ValueError("execution permit is unavailable")
+        execution = self.store.execution_for_event(permit.root_event_key)
+        reusable_retry = bool(
+            permit.consumed_at and execution and execution["status"] == "RETRY_PENDING"
+        )
+        if permit.consumed_at and not reusable_retry:
             raise ValueError("execution permit is unavailable")
         state = self.store.workflow_state(permit.thread_id)
         plan = self.store.plan(permit.plan_id)
@@ -556,6 +564,7 @@ class WorkflowEngine:
         delivered: set[str] = set()
         lock_root = execute_kwargs.pop("lock_root")
         clock = execute_kwargs.pop("now", None) or (lambda: datetime.now(UTC))
+        execute_kwargs.setdefault("memory_store", None)
         try:
             with thread_lock(lock_root, permit.thread_id):
                 event = self.store.bind_authorized_execution(
@@ -632,6 +641,134 @@ class WorkflowEngine:
         except ThreadLockUnavailable:
             return ExecutionResult(status="BUSY")
 
+    def execute_repair_authorized(
+        self,
+        *,
+        permit_id: str,
+        model: str,
+        repo_paths: dict[str, str | Path],
+        workspace_root: str | Path,
+        lock_root: str | Path,
+        checkpointer: object,
+        runner: Callable[..., str] | None = None,
+        memory_store: BaseStore | None = None,
+        live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> ExecutionResult:
+        """Run a review-authorized repair in the existing cumulative workspace."""
+        permit = self.store.repair_permit(permit_id)
+        if permit is None:
+            raise ValueError("repair permit is unavailable")
+        state = self.store.workflow_state(permit.thread_id)
+        plan = self.store.plan(permit.plan_id)
+        if state is None or plan is None or state.phase != WorkflowPhase.REPAIR_READY:
+            raise ValueError("repair workflow is not ready")
+        if any(
+            _is_actionable_feedback(row)
+            for row in self.store.unconsumed_inputs(
+                permit.thread_id, after_event_key=state.root_event_key
+            )
+        ):
+            self.store.invalidate_repair_permit(permit_id, now=self.clock())
+            self.store.save_workflow_state(
+                replace(
+                    state, phase=WorkflowPhase.REVIEW_BLOCKED, updated_at=self.clock()
+                )
+            )
+            raise ValueError("repair invalidated by new user feedback")
+        source = self.store.source_event(permit.root_event_key)
+        workspace = self.store.thread_workspace(permit.thread_id)
+        if source is None or workspace is None:
+            raise ValueError("repair workspace or root event is unavailable")
+        event = ClaimedEvent(
+            event_key=source["event_key"],
+            thread_id=source["thread_id"],
+            repo_id=source["repo_id"],
+            repo_full_name=source["repo_full_name"],
+            issue_number=source["subject_number"],
+            body=source["body"],
+            workspace_path=workspace.workspace_path,
+            retrying=True,
+            origin_surface=source["origin_surface"],
+            path=source["path"],
+            line=source["line"],
+            start_line=source["start_line"],
+            side=source["side"],
+            start_side=source["start_side"],
+            diff_hunk=source["diff_hunk"],
+            commit_id=source["commit_id"],
+            original_commit_id=source["original_commit_id"],
+            in_reply_to_id=source["in_reply_to_id"],
+            pull_request_review_id=source["pull_request_review_id"],
+            review_thread_root_id=source["review_thread_root_id"],
+        )
+        attempt = self.store.begin_or_resume_repair_attempt(
+            permit_id, now=utc_timestamp((now or (lambda: datetime.now(UTC)))())
+        )
+        review_text = "No parent review available."
+        parent = self.store.execution_review(attempt.parent_review_id or "")
+        if parent:
+            review_text = (
+                f"Review {parent.review_id}: {parent.summary}\n"
+                f"{parent.findings_json}\n{parent.repair_instructions_json}"
+            )
+        task = (
+            f"[Approved SWEForge Plan v{plan.version}]\n{plan.plan_text}\n\n"
+            f"[Execution Review NEEDS_FIXES]\n{review_text}\n\n"
+            "[Authority]\nFix only the listed deficiencies within the approved plan. "
+            "Inspect the current cumulative workspace, make the smallest corrections, "
+            "and validate them before finishing. Do not expand scope."
+        )
+        clock = now or (lambda: datetime.now(UTC))
+        delivered: set[str] = set()
+        try:
+            with thread_lock(lock_root, permit.thread_id):
+                result = _execute_claim(
+                    store=self.store,
+                    event=event,
+                    model=model,
+                    repo_paths=repo_paths,
+                    workspace_root=workspace_root,
+                    checkpointer=checkpointer,
+                    runner=runner or run_task,
+                    memory_store=memory_store,
+                    live_input_provider=live_input_provider,
+                    live_delivered_event_keys=delivered,
+                    approved_plan_text=None,
+                    approved_plan_id=None,
+                    approved_plan_version=None,
+                    now=clock,
+                    persist_execution=False,
+                    allow_dirty_workspace=True,
+                    message_id="sweforge:review-repair:"
+                    + hashlib.sha256(permit_id.encode()).hexdigest(),
+                    task_override=task,
+                )
+                for event_key in delivered:
+                    self._acknowledge_delivered(
+                        event_key, thread_id=permit.thread_id, cycle_id=permit.cycle_id
+                    )
+                if result.status == "SUCCEEDED" and result.workspace:
+                    self.store.finish_repair_attempt_success(
+                        permit_id,
+                        attempt_id=attempt.attempt_id,
+                        now=utc_timestamp(clock()),
+                        response_text=result.response,
+                        end_head_sha=result.workspace.head_sha(),
+                        end_dirty=not result.workspace.is_clean(),
+                        workspace_path=str(result.workspace.path),
+                        start_head_sha=self.store.execution_for_event(
+                            permit.root_event_key
+                        )["start_head_sha"],
+                    )
+                else:
+                    self.store.mark_repair_attempt_failed(
+                        attempt.attempt_id, now=utc_timestamp(clock())
+                    )
+                return result
+        except ThreadLockUnavailable:
+            return ExecutionResult(status="BUSY", event=event)
+
     def _acknowledge_delivered(
         self,
         event_key: str,
@@ -701,6 +838,8 @@ class WorkflowEngine:
         state = self.store.workflow_state(thread_id)
         if state is None or self.client is None:
             raise ValueError("workflow and GitHub client are required")
+        if not self.store.publication_is_eligible(state.root_event_key):
+            raise ValueError("execution summary is blocked until review ACCEPT")
         marker = f"<!-- sweforge:execution-summary:{state.root_event_key} -->"
         repo = self.client.repository(state.repo_full_name)
         inline = state.response_surface == "PR_INLINE_REVIEW"
@@ -719,7 +858,7 @@ class WorkflowEngine:
         if matching:
             comment_id = str(matching[0]["id"])
         else:
-            body = [marker, "### SWEForge Execution", ""]
+            body = [marker, "### SWEForge Execution", "", "Execution review: accepted."]
             body.append(
                 "No repository changes were required."
                 if publication_status == "NO_CHANGES"
@@ -765,6 +904,42 @@ class WorkflowEngine:
         )
         return comment_id
 
+    def post_blocked_review_comment(
+        self, thread_id: str, *, summary: str
+    ) -> str | None:
+        state = self.store.workflow_state(thread_id)
+        if state is None or self.client is None:
+            return None
+        marker = (
+            "<!-- sweforge:execution-review-blocked:"
+            f"{state.cycle_id}:{state.current_plan_id} -->"
+        )
+        repo = self.client.repository(state.repo_full_name)
+        number = state.response_subject_number or state.issue_number
+        comments = (
+            self.client.review_comments_for_pull_request(repo, number)
+            if state.response_surface == "PR_INLINE_REVIEW"
+            else self.client.comments(repo, number)
+        )
+        if any(marker in (item.get("body") or "") for item in comments):
+            return None
+        body = (
+            f"{marker}\n### SWEForge execution review needs attention\n\n"
+            "The implementation was not published because execution review could "
+            "not confirm that the approved plan was satisfied.\n\n"
+            f"{summary[:4_000]}"
+        )
+        if state.response_surface == "PR_INLINE_REVIEW":
+            root = state.review_thread_root_id or state.response_comment_id
+            if not root:
+                raise WorkspaceError("inline review response target is missing")
+            return str(
+                self.client.create_review_comment_reply(repo, number, int(root), body)[
+                    "id"
+                ]
+            )
+        return str(self.client.create_comment(repo, number, body)["id"])
+
     def _drain_approval_controls(self, thread_id: str, state=None) -> None:
         state = state or self.store.workflow_state(thread_id)
         after = state.root_event_key if state else None
@@ -800,6 +975,42 @@ class WorkflowEngine:
     def next_root(self, thread_id: str) -> str | None:
         state = self.store.workflow_state(thread_id)
         self._drain_approval_controls(thread_id, state)
+        if state and state.phase == WorkflowPhase.EXECUTING:
+            execution = self.store.execution_for_event(state.root_event_key)
+            attempt = self.store.latest_attempt(thread_id, state.cycle_id)
+            plan = self.store.current_plan(thread_id)
+            if execution and execution["status"] == "SUCCEEDED" and plan:
+                if attempt is None:
+                    permit = self.store.permit_for_plan(plan.plan_id)
+                    if permit:
+                        attempt = self.store.ensure_execution_attempt(
+                            attempt_id=f"attempt-{permit.permit_id}",
+                            thread_id=thread_id,
+                            cycle_id=state.cycle_id,
+                            plan_id=plan.plan_id,
+                            plan_version=plan.version,
+                            root_event_key=state.root_event_key,
+                            authorization_id=permit.permit_id,
+                            created_at=self.clock(),
+                        )
+                if attempt and attempt.status != AttemptStatus.SUCCEEDED:
+                    self.store.finish_execution_attempt(
+                        attempt.attempt_id,
+                        status=AttemptStatus.SUCCEEDED,
+                        completed_at=execution["completed_at"] or self.clock(),
+                        response_text=execution["response_text"],
+                        start_head_sha=execution["start_head_sha"],
+                        end_head_sha=execution["end_head_sha"],
+                        end_dirty=bool(execution["end_dirty"]),
+                    )
+                self.store.save_workflow_state(
+                    replace(
+                        state,
+                        phase=WorkflowPhase.REVIEW_EXECUTION,
+                        updated_at=self.clock(),
+                    )
+                )
+                state = self.store.workflow_state(thread_id)
         after = state.root_event_key if state else None
         candidates = self.store.unconsumed_inputs(thread_id, after_event_key=after)
         for row in candidates:
@@ -891,6 +1102,16 @@ class WorkflowEngine:
                         )
                     except ValueError as exc:
                         if "maximum" in str(exc):
+                            self.store.save_workflow_state(
+                                replace(
+                                    state,
+                                    phase=WorkflowPhase.REVIEW_BLOCKED,
+                                    updated_at=self.clock(),
+                                )
+                            )
+                            self.post_blocked_review_comment(
+                                thread_id, summary=existing_review.summary
+                            )
                             return WorkflowAdvanceResult(
                                 WorkflowPhase.REVIEW_BLOCKED,
                                 thread_id,
@@ -931,15 +1152,30 @@ class WorkflowEngine:
             evidence["changed_files"] = inspection.changed_files()[:500]
             evidence["diff"] = inspection.diff()[:60_000]
             evidence["dirty"] = not inspection.is_clean()
+            source = self.store.source_event(state.root_event_key)
+            evidence["source"] = dict(source) if source else {}
+            if attempt.parent_review_id:
+                previous = self.store.execution_review(attempt.parent_review_id)
+                evidence["previous_review"] = previous.__dict__ if previous else {}
+            review_delivered: set[str] = set()
             result = self.reviewer(
                 context=ReviewerContext(
                     worktree=workspace.workspace_path,
                     memory_store=memory_store,
                     memory_namespace=repo_memory_namespace(state.repo_id),
+                    live_input_provider=lambda: self.pending_live_inputs(thread_id),
+                    live_delivered_event_keys=review_delivered,
                 ),
                 model=review_model or model,
                 evidence=evidence,
             )
+            for event_key in review_delivered:
+                self._acknowledge_delivered(
+                    event_key,
+                    thread_id=thread_id,
+                    cycle_id=state.cycle_id,
+                    purpose=InputPurpose.LIVE_REVIEW_INPUT,
+                )
             review_id = "review-" + _stable_id(
                 attempt.attempt_id, json.dumps(result.model_dump(), sort_keys=True)
             )
@@ -982,6 +1218,8 @@ class WorkflowEngine:
                     permit_id=repair.permit_id,
                     message="repair authorized by execution review",
                 )
+            self.store.block_execution_review(review.review_id, now=self.clock())
+            self.post_blocked_review_comment(thread_id, summary=review.summary)
             return WorkflowAdvanceResult(
                 WorkflowPhase.REVIEW_BLOCKED, thread_id, message=review.verdict
             )
@@ -1194,6 +1432,27 @@ class WorkflowEngine:
                 thread_id,
                 plan_id=permit.plan_id,
                 permit_id=permit.permit_id,
+                execution=result,
+            )
+        if state.phase == WorkflowPhase.REPAIR_READY:
+            repair = self.store.repair_permit_for_thread(thread_id)
+            if repair is None:
+                raise ValueError("repair-ready workflow has no repair permit")
+            kwargs = dict(execute_kwargs or {})
+            result = self.execute_repair_authorized(
+                permit_id=repair.permit_id,
+                model=kwargs.pop("model", model),
+                repo_paths=repo_paths,
+                workspace_root=workspace_root,
+                lock_root=kwargs.pop("lock_root"),
+                checkpointer=kwargs.pop("checkpointer"),
+                runner=kwargs.pop("runner", None),
+                memory_store=kwargs.pop("memory_store", memory_store),
+            )
+            return WorkflowAdvanceResult(
+                self.store.workflow_state(thread_id).phase,
+                thread_id,
+                permit_id=repair.permit_id,
                 execution=result,
             )
         return WorkflowAdvanceResult(state.phase, thread_id, message="waiting")

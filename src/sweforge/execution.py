@@ -256,10 +256,14 @@ def _execute_claim(
     approved_plan_id: str | None,
     approved_plan_version: int | None,
     now: Callable[[], datetime],
+    persist_execution: bool = True,
+    allow_dirty_workspace: bool = False,
+    message_id: str | None = None,
+    task_override: str | None = None,
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
     try:
-        task = normalize_task(event.body)
+        task = task_override or normalize_task(event.body)
         repository_path = repo_paths.get(event.repo_full_name)
         if repository_path is None:
             raise WorkspaceError(
@@ -294,7 +298,11 @@ def _execute_claim(
                     updated_at=timestamp,
                 )
             )
-        elif not event.retrying and not workspace.is_clean():
+        elif (
+            not event.retrying
+            and not allow_dirty_workspace
+            and not workspace.is_clean()
+        ):
             raise WorkspaceError(
                 "existing workspace is dirty before a new IssueThread event"
             )
@@ -321,7 +329,7 @@ def _execute_claim(
             "task": task,
             "thread_id": event.thread_id,
             "checkpointer": checkpointer,
-            "message_id": event_message_id(event.event_key),
+            "message_id": message_id or event_message_id(event.event_key),
             "resume_if_present": True,
             "memory_store": memory_store,
             "memory_namespace": memory_namespace if memory_store is not None else None,
@@ -335,15 +343,16 @@ def _execute_claim(
         diff = workspace.diff()
         end_head_sha = workspace.head_sha()
         end_dirty = not workspace.is_clean()
-        store.mark_execution_succeeded(
-            event.event_key,
-            completed_at=utc_timestamp(now()),
-            response_text=response,
-            workspace_path=str(workspace.path),
-            start_head_sha=start_head_sha,
-            end_head_sha=end_head_sha,
-            end_dirty=end_dirty,
-        )
+        if persist_execution:
+            store.mark_execution_succeeded(
+                event.event_key,
+                completed_at=utc_timestamp(now()),
+                response_text=response,
+                workspace_path=str(workspace.path),
+                start_head_sha=start_head_sha,
+                end_head_sha=end_head_sha,
+                end_dirty=end_dirty,
+            )
         return ExecutionResult(
             status=ExecutionStatus.SUCCEEDED.value,
             event=event,
@@ -355,12 +364,13 @@ def _execute_claim(
         )
     except Exception as exc:
         error = _safe_error(exc)
-        store.mark_execution_failed(
-            event.event_key,
-            completed_at=utc_timestamp(now()),
-            error_message=error,
-            workspace_path=str(workspace.path) if workspace else None,
-        )
+        if persist_execution:
+            store.mark_execution_failed(
+                event.event_key,
+                completed_at=utc_timestamp(now()),
+                error_message=error,
+                workspace_path=str(workspace.path) if workspace else None,
+            )
         return ExecutionResult(
             status=ExecutionStatus.FAILED.value,
             event=event,

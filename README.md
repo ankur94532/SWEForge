@@ -210,6 +210,19 @@ uv run sweforge-github-execution --db ~/.sweforge/state.db skip EVENT_KEY
 
 ### Crash-safe GitHub writeback
 
+### Execution review and repair
+
+Workflow execution is split into provider-neutral model roles:
+
+- `planning_model`: use a high-quality model for planning and replanning.
+- `execution_model`: a lower-cost model may perform the approved implementation.
+- `review_model`: use a high-quality model to inspect the cumulative workspace.
+
+The durable flow is `plan -> execute -> review -> repair/review loop -> ACCEPT -> publish`.
+Providers remain interchangeable. Reviewers are structurally read-only, and
+publication is unavailable until the latest successful attempt has an exact
+`ACCEPT` review.
+
 After a successful execution, publish one result with the App credentials:
 
 ```bash

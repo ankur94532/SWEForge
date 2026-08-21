@@ -21,7 +21,6 @@ from sweforge.execution import (
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import (
     ExecutionStatus,
-    PublicationStatus,
     SQLiteGitHubStore,
     ThreadWorkspaceRecord,
 )
@@ -282,12 +281,6 @@ def test_follow_up_reuses_workspace_and_checkpoint_thread(tmp_path):
         "publish first",
         cwd=workspace,
     )
-    store.ensure_publication(first.event_key, now="2026-01-01T00:00:30Z")
-    store.update_publication(
-        first.event_key,
-        status=PublicationStatus.COMPLETED,
-        now="2026-01-01T00:00:31Z",
-    )
     second = replace(
         first,
         source_id="2",
@@ -424,16 +417,10 @@ def test_claim_order_and_concurrency_idempotency(tmp_path):
             "now",
         )
     )
-    store.ensure_publication(first.event_key, now="2026-01-01T00:03:00Z")
-    assert store.claim_next_event(now="2026-01-01T00:04:00Z") is None
-    store.update_publication(
-        first.event_key,
-        status=PublicationStatus.COMPLETED,
-        now="2026-01-01T00:04:30Z",
-    )
     assert (
-        store.claim_next_event(now="2026-01-01T00:05:00Z").event_key == second.event_key
+        store.claim_next_event(now="2026-01-01T00:04:00Z").event_key == second.event_key
     )
+    assert store.claim_next_event(now="2026-01-01T00:05:00Z") is None
     store.close()
 
 
@@ -703,10 +690,6 @@ def test_pull_request_event_claim_uses_original_issue_workspace_number(tmp_path)
             "first",
             "first",
         )
-    )
-    store.ensure_publication(issue.event_key, now="first")
-    store.update_publication(
-        issue.event_key, status=PublicationStatus.COMPLETED, now="first"
     )
     claim = store.claim_next_event(now="second")
     assert claim and claim.event_key == pull_request.event_key

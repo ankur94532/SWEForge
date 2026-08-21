@@ -210,11 +210,11 @@ def test_pr_conversation_plan_and_summary_use_pr_surface(tmp_path):
     engine.publish_plan(plan.plan_id)
     assert client.created[0]["body"].startswith("<!-- sweforge:plan:")
     assert client.created[0]["id"] == 1
-    engine.complete_publication(
-        thread_id="github:123:issue:42",
-        publication_status="NO_CHANGES",
-    )
-    assert "execution-summary" in client.created[1]["body"]
+    with pytest.raises(ValueError, match="review ACCEPT"):
+        engine.complete_publication(
+            thread_id="github:123:issue:42",
+            publication_status="NO_CHANGES",
+        )
     store.close()
 
 
