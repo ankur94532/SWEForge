@@ -43,7 +43,7 @@ from .github_store import (
 from .planner import PlannerContext, generate_plan
 from .repo_memory import repo_memory_namespace
 from .reviewer import ExecutionReviewResult, ReviewerContext, review_execution
-from .workspace import ThreadWorkspace, WorkspaceError
+from .workspace import ThreadWorkspace, Workspace, WorkspaceError
 
 _PREFIX_RE = re.compile(r"^\s*@agent\b", re.IGNORECASE)
 MAX_COMMENT_CHARS = 12_000
@@ -653,6 +653,7 @@ class WorkflowEngine:
         if state is None or state.phase not in (
             WorkflowPhase.PLANNING,
             WorkflowPhase.EXECUTING,
+            WorkflowPhase.REVIEW_EXECUTION,
         ):
             return []
         return [
@@ -829,6 +830,7 @@ class WorkflowEngine:
         workspace_root: str | Path,
         memory_store: BaseStore | None = None,
         execute_kwargs: dict | None = None,
+        max_review_repairs: int = 5,
     ) -> WorkflowAdvanceResult:
         """Advance one durable worker tick for a single IssueThread.
 
@@ -880,8 +882,29 @@ class WorkflowEngine:
                         thread_id,
                         message="execution accepted",
                     )
+                if existing_review.verdict == "NEEDS_FIXES":
+                    try:
+                        repair = self.store.create_repair_permit(
+                            thread_id=thread_id,
+                            now=self.clock(),
+                            max_repairs=max_review_repairs,
+                        )
+                    except ValueError as exc:
+                        if "maximum" in str(exc):
+                            return WorkflowAdvanceResult(
+                                WorkflowPhase.REVIEW_BLOCKED,
+                                thread_id,
+                                message=str(exc),
+                            )
+                        raise
+                    return WorkflowAdvanceResult(
+                        WorkflowPhase.REPAIR_READY,
+                        thread_id,
+                        permit_id=repair.permit_id,
+                        message="repair authorized by execution review",
+                    )
                 return WorkflowAdvanceResult(
-                    WorkflowPhase.REVIEW_EXECUTION,
+                    WorkflowPhase.REVIEW_BLOCKED,
                     thread_id,
                     message=existing_review.verdict,
                 )
@@ -900,6 +923,14 @@ class WorkflowEngine:
                 "current_head": execution["end_head_sha"],
                 "base_head": workspace.base_commit,
             }
+            inspection = Workspace(
+                Path(workspace.workspace_path),
+                Path(workspace.workspace_path),
+                workspace.base_commit,
+            )
+            evidence["changed_files"] = inspection.changed_files()[:500]
+            evidence["diff"] = inspection.diff()[:60_000]
+            evidence["dirty"] = not inspection.is_clean()
             result = self.reviewer(
                 context=ReviewerContext(
                     worktree=workspace.workspace_path,
@@ -939,8 +970,20 @@ class WorkflowEngine:
                     thread_id,
                     message="execution accepted",
                 )
+            if review.verdict == "NEEDS_FIXES":
+                repair = self.store.create_repair_permit(
+                    thread_id=thread_id,
+                    now=self.clock(),
+                    max_repairs=max_review_repairs,
+                )
+                return WorkflowAdvanceResult(
+                    WorkflowPhase.REPAIR_READY,
+                    thread_id,
+                    permit_id=repair.permit_id,
+                    message="repair authorized by execution review",
+                )
             return WorkflowAdvanceResult(
-                WorkflowPhase.REVIEW_EXECUTION, thread_id, message=review.verdict
+                WorkflowPhase.REVIEW_BLOCKED, thread_id, message=review.verdict
             )
         if state is None or state.phase == WorkflowPhase.IDLE:
             plan = self.begin_next_cycle(

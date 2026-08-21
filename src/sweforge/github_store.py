@@ -209,6 +209,19 @@ CREATE TABLE IF NOT EXISTS execution_reviews (
     created_at TEXT NOT NULL,
     completed_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS review_repair_permits (
+    permit_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    plan_id TEXT NOT NULL REFERENCES issue_plans(plan_id),
+    plan_version INTEGER NOT NULL,
+    parent_review_id TEXT NOT NULL REFERENCES execution_reviews(review_id),
+    repair_round INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    consumed_at TEXT,
+    invalidated_at TEXT,
+    UNIQUE(thread_id, cycle_id, repair_round)
+);
 CREATE TABLE IF NOT EXISTS thread_input_consumptions (
     event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
     thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
@@ -493,6 +506,20 @@ class WorkflowInputRecord:
     status: str
     claimed_at: str
     consumed_at: str | None
+
+
+@dataclass(frozen=True)
+class ReviewRepairPermit:
+    permit_id: str
+    thread_id: str
+    cycle_id: int
+    plan_id: str
+    plan_version: int
+    parent_review_id: str
+    repair_round: int
+    created_at: str
+    consumed_at: str | None
+    invalidated_at: str | None
 
 
 class SQLiteGitHubStore:
@@ -1320,6 +1347,67 @@ class SQLiteGitHubStore:
                 "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
                 (WorkflowPhase.AWAITING_PUBLICATION.value, now, row["thread_id"]),
             )
+
+    def create_repair_permit(
+        self, *, thread_id: str, now: str, max_repairs: int = 5
+    ) -> ReviewRepairPermit:
+        state = self.workflow_state(thread_id)
+        plan = self.current_plan(thread_id)
+        attempt = self.latest_attempt(thread_id, state.cycle_id) if state else None
+        review = (
+            self.execution_review_for_attempt(attempt.attempt_id) if attempt else None
+        )
+        if not state or not plan or not review or review.verdict != "NEEDS_FIXES":
+            raise ValueError("repair requires a NEEDS_FIXES execution review")
+        round_number = review.review_iteration
+        if round_number >= max_repairs:
+            with self.transaction() as db:
+                db.execute(
+                    "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
+                    (WorkflowPhase.REVIEW_BLOCKED.value, now, thread_id),
+                )
+            raise ValueError("maximum review repair rounds reached")
+        permit_id = f"repair-{review.review_id}-{round_number}"
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT OR IGNORE INTO review_repair_permits(
+                   permit_id,thread_id,cycle_id,plan_id,plan_version,parent_review_id,
+                   repair_round,created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    permit_id,
+                    thread_id,
+                    state.cycle_id,
+                    plan.plan_id,
+                    plan.version,
+                    review.review_id,
+                    round_number,
+                    now,
+                ),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
+                (WorkflowPhase.REPAIR_READY.value, now, thread_id),
+            )
+        row = self.connection.execute(
+            "SELECT * FROM review_repair_permits WHERE permit_id=?", (permit_id,)
+        ).fetchone()
+        return ReviewRepairPermit(**dict(row))
+
+    def consume_repair_permit(self, permit_id: str, *, now: str) -> ReviewRepairPermit:
+        with self.transaction(immediate=True) as db:
+            if (
+                db.execute(
+                    "UPDATE review_repair_permits SET consumed_at=? WHERE permit_id=? "
+                    "AND consumed_at IS NULL AND invalidated_at IS NULL",
+                    (now, permit_id),
+                ).rowcount
+                != 1
+            ):
+                raise ValueError("repair permit is unavailable")
+        row = self.connection.execute(
+            "SELECT * FROM review_repair_permits WHERE permit_id=?", (permit_id,)
+        ).fetchone()
+        return ReviewRepairPermit(**dict(row))
 
     def publication_is_eligible(self, event_key: str) -> bool:
         row = self.connection.execute(
