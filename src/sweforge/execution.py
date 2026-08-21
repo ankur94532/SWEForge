@@ -1,0 +1,268 @@
+"""Durable one-shot execution for routed GitHub source events."""
+
+import fcntl
+import hashlib
+import os
+import re
+import sqlite3
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Protocol
+
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+from .agent import run_task
+from .github_store import (
+    ClaimedEvent,
+    ExecutionStatus,
+    SQLiteGitHubStore,
+    ThreadWorkspaceRecord,
+)
+from .workspace import ThreadWorkspace, WorkspaceError
+
+_MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@agent(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+class TaskRunner(Protocol):
+    def __call__(
+        self,
+        *,
+        model: str,
+        worktree: str,
+        task: str,
+        thread_id: str,
+        checkpointer: object,
+    ) -> str: ...
+
+
+class EmptyTaskError(ValueError):
+    """Raised when an @agent event has no task after mention removal."""
+
+
+class ThreadLockUnavailable(RuntimeError):
+    """Raised when another process currently owns a thread lock."""
+
+
+def normalize_task(body: str) -> str:
+    """Remove invocation mentions while preserving the user's remaining text."""
+    task = re.sub(r"[ \t]{2,}", " ", _MENTION_RE.sub("", body)).strip()
+    if not task:
+        raise EmptyTaskError("@agent mention did not contain a task")
+    return task
+
+
+def utc_timestamp(value: datetime | None = None) -> str:
+    value = value or datetime.now(UTC)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("execution clock must return an aware datetime")
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+@contextmanager
+def thread_lock(root: str | Path, thread_id: str) -> Iterator[None]:
+    """Acquire a non-blocking cross-process lock for exactly one thread."""
+    lock_root = Path(root).expanduser().resolve()
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_root / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.lock"
+    with lock_path.open("a+") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ThreadLockUnavailable(
+                "IssueThread is already being executed"
+            ) from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class SQLiteCheckpointer:
+    """Strictly serialized, file-backed LangGraph checkpoint lifecycle."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path).expanduser().resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = sqlite3.connect(self.path, check_same_thread=False)
+        self.saver = SqliteSaver(
+            self.connection,
+            serde=JsonPlusSerializer(
+                pickle_fallback=False,
+                allowed_msgpack_modules=None,
+            ),
+        )
+        try:
+            self.saver.setup()
+        except Exception:
+            self.connection.close()
+            raise
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def __enter__(self) -> SqliteSaver:
+        return self.saver
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    status: str
+    event: ClaimedEvent | None = None
+    workspace: ThreadWorkspace | None = None
+    response: str = ""
+    changed_files: tuple[str, ...] = ()
+    diff: str = ""
+    error: str | None = None
+    workspace_created: bool = False
+
+    @property
+    def has_work(self) -> bool:
+        return self.event is not None
+
+
+def execute_one(
+    *,
+    store: SQLiteGitHubStore,
+    model: str,
+    repo_paths: dict[str, str | Path],
+    workspace_root: str | Path,
+    lock_root: str | Path,
+    checkpointer: object,
+    runner: TaskRunner = run_task,
+    now: Callable[[], datetime] | None = None,
+) -> ExecutionResult:
+    clock = now or (lambda: datetime.now(UTC))
+    event = store.claim_next_event(now=utc_timestamp(clock()))
+    if event is None:
+        return ExecutionResult(status="NO_WORK")
+
+    try:
+        with thread_lock(lock_root, event.thread_id):
+            return _execute_claim(
+                store=store,
+                event=event,
+                model=model,
+                repo_paths=repo_paths,
+                workspace_root=workspace_root,
+                checkpointer=checkpointer,
+                runner=runner,
+                now=clock,
+            )
+    except ThreadLockUnavailable:
+        store.release_execution_claim(event.event_key)
+        return ExecutionResult(status="BUSY", event=event)
+    except Exception as exc:
+        error = _safe_error(exc)
+        store.mark_execution_failed(
+            event.event_key,
+            completed_at=utc_timestamp(clock()),
+            error_message=error,
+            workspace_path=None,
+        )
+        return ExecutionResult(
+            status=ExecutionStatus.FAILED.value, event=event, error=error
+        )
+
+
+def _execute_claim(
+    *,
+    store: SQLiteGitHubStore,
+    event: ClaimedEvent,
+    model: str,
+    repo_paths: dict[str, str | Path],
+    workspace_root: str | Path,
+    checkpointer: object,
+    runner: TaskRunner,
+    now: Callable[[], datetime],
+) -> ExecutionResult:
+    workspace: ThreadWorkspace | None = None
+    try:
+        task = normalize_task(event.body)
+        repository_path = repo_paths.get(event.repo_full_name)
+        if repository_path is None:
+            raise WorkspaceError(
+                f"no trusted local checkout configured for {event.repo_full_name}"
+            )
+        source_path = Path(repository_path).expanduser().resolve()
+        metadata = store.thread_workspace(event.thread_id)
+        if metadata and Path(metadata.source_repository_path).resolve() != source_path:
+            raise WorkspaceError("repository mapping conflicts with thread workspace")
+        workspace = ThreadWorkspace.create(
+            repository=source_path,
+            workspace_root=workspace_root,
+            repo_id=event.repo_id,
+            issue_number=event.issue_number,
+            existing_path=metadata.workspace_path if metadata else None,
+            expected_branch=metadata.branch_name if metadata else None,
+            expected_base=metadata.base_commit if metadata else None,
+        )
+        if metadata is None:
+            timestamp = utc_timestamp(now())
+            store.save_thread_workspace(
+                ThreadWorkspaceRecord(
+                    thread_id=event.thread_id,
+                    repo_id=event.repo_id,
+                    repo_full_name=event.repo_full_name,
+                    issue_number=event.issue_number,
+                    source_repository_path=str(source_path),
+                    workspace_path=str(workspace.path),
+                    branch_name=workspace.branch_name,
+                    base_commit=workspace.base_commit,
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                )
+            )
+        response = runner(
+            model=model,
+            worktree=str(workspace.path),
+            task=task,
+            thread_id=event.thread_id,
+            checkpointer=checkpointer,
+        )
+        changed = tuple(workspace.changed_files())
+        diff = workspace.diff()
+        store.mark_execution_succeeded(
+            event.event_key,
+            completed_at=utc_timestamp(now()),
+            response_text=response,
+            workspace_path=str(workspace.path),
+        )
+        return ExecutionResult(
+            status=ExecutionStatus.SUCCEEDED.value,
+            event=event,
+            workspace=workspace,
+            response=response,
+            changed_files=changed,
+            diff=diff,
+            workspace_created=workspace.created,
+        )
+    except Exception as exc:
+        error = _safe_error(exc)
+        store.mark_execution_failed(
+            event.event_key,
+            completed_at=utc_timestamp(now()),
+            error_message=error,
+            workspace_path=str(workspace.path) if workspace else None,
+        )
+        return ExecutionResult(
+            status=ExecutionStatus.FAILED.value,
+            event=event,
+            workspace=workspace,
+            error=error,
+            workspace_created=workspace.created if workspace else False,
+        )
+
+
+def _safe_error(exc: Exception) -> str:
+    message = f"{type(exc).__name__}: {exc}"
+    for value in os.environ.values():
+        if value and len(value) >= 4:
+            message = message.replace(value, "[REDACTED]")
+    return message

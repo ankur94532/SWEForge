@@ -66,3 +66,30 @@ path can be overridden with `--db`. Do not commit tokens or the state database.
 
 The boundary is: GitHub → poller → durable `SourceEvent`/`IssueThread`;
 execution comes later.
+
+## Development-stage IssueThread execution
+
+The one-shot executor extends that boundary to:
+
+GitHub poll → `SourceEvent` → `IssueThread` → persistent local worktree →
+Deep Agent + LangGraph thread checkpoint.
+
+```bash
+uv run sweforge-github-execute \
+  --db ~/.sweforge/state.db \
+  --checkpoints ~/.sweforge/checkpoints.sqlite \
+  --workspace-root ~/.sweforge/workspaces \
+  --lock-root ~/.sweforge/locks \
+  --repo-path owner/repository=/Users/me/repository \
+  --model provider:model
+```
+
+Execution is explicitly one-shot: one invocation claims at most one routed
+event. `--repo-path` mappings are trusted local checkouts; authenticated clone,
+GitHub writes, commits, pushes, and PR creation are not implemented. Worktrees
+remain under `~/.sweforge/workspaces/{repo_id}/issue-{number}/`, while
+checkpoints live in their separate SQLite file. The same deterministic
+`IssueThread.thread_id` is the LangGraph `thread_id`, so follow-up events reuse
+both the worktree and checkpointed conversation. Per-thread locks allow
+different issues to execute independently; this SQLite checkpointer is for the
+local milestone, not final production scale.

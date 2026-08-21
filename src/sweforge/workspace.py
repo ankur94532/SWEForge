@@ -16,6 +16,71 @@ class WorkspaceError(RuntimeError):
     """Raised when a repository cannot be prepared as a workspace."""
 
 
+@dataclass
+class ThreadWorkspace:
+    """A persistent, repository- and issue-scoped Git worktree."""
+
+    repository: Path
+    path: Path
+    base_commit: str
+    branch_name: str
+    created: bool
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        repository: str | Path,
+        workspace_root: str | Path,
+        repo_id: int,
+        issue_number: int,
+        existing_path: str | None = None,
+        expected_branch: str | None = None,
+        expected_base: str | None = None,
+    ) -> "ThreadWorkspace":
+        repo = _repository_root(repository)
+        root = Path(workspace_root).expanduser().resolve()
+        path = root / str(repo_id) / f"issue-{issue_number}"
+        branch = expected_branch or f"sweforge/issue-{issue_number}"
+        if existing_path is not None and Path(existing_path).resolve() != path:
+            raise WorkspaceError(
+                "persisted workspace path does not match expected path"
+            )
+        if expected_branch is not None and branch != f"sweforge/issue-{issue_number}":
+            raise WorkspaceError("persisted workspace branch does not match issue")
+
+        if path.exists():
+            if existing_path is None:
+                raise WorkspaceError("workspace path exists without persisted metadata")
+            if not path.is_dir():
+                raise WorkspaceError(f"Workspace path is not a directory: {path}")
+            actual_root = Path(_git(path, "rev-parse", "--show-toplevel")).resolve()
+            actual_branch = _git(path, "branch", "--show-current")
+            actual_base = _git(path, "rev-parse", "HEAD")
+            if actual_root != path or actual_branch != branch:
+                raise WorkspaceError(
+                    "existing workspace does not match persisted metadata"
+                )
+            return cls(repo, path, expected_base or actual_base, branch, False)
+
+        if existing_path is not None:
+            raise WorkspaceError("persisted workspace directory is missing")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        base = _git(repo, "rev-parse", "HEAD")
+        try:
+            _git(repo, "worktree", "add", "-b", branch, str(path), base)
+        except WorkspaceError:
+            shutil.rmtree(path, ignore_errors=True)
+            raise
+        return cls(repo, path, base, branch, True)
+
+    def changed_files(self) -> list[str]:
+        return Workspace(self.repository, self.path, self.base_commit).changed_files()
+
+    def diff(self) -> str:
+        return Workspace(self.repository, self.path, self.base_commit).diff()
+
+
 def _git(repo: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -28,6 +93,16 @@ def _git(repo: Path, *args: str) -> str:
         message = result.stderr.strip() or result.stdout.strip()
         raise WorkspaceError(f"git {' '.join(args)} failed: {message}")
     return result.stdout.strip()
+
+
+def _repository_root(repository: str | Path) -> Path:
+    repo = Path(repository).expanduser().resolve()
+    if not repo.is_dir():
+        raise WorkspaceError(f"Repository path is not a directory: {repo}")
+    try:
+        return Path(_git(repo, "rev-parse", "--show-toplevel")).resolve()
+    except WorkspaceError as exc:
+        raise WorkspaceError(f"Not a Git repository: {repo}") from exc
 
 
 @dataclass

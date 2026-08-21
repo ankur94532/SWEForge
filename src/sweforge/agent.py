@@ -21,8 +21,17 @@ def _build_backend(worktree: str) -> CompositeBackend:
     )
 
 
-def run_task(*, model: str, worktree: str, task: str) -> str:
+def run_task(
+    *,
+    model: str,
+    worktree: str,
+    task: str,
+    thread_id: str | None = None,
+    checkpointer: object | None = None,
+) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
+    if checkpointer is not None and not thread_id:
+        raise ValueError("thread_id is required when a checkpointer is supplied")
     backend = _build_backend(worktree)
     agent = create_deep_agent(
         model=model,
@@ -36,10 +45,16 @@ def run_task(*, model: str, worktree: str, task: str) -> str:
             "rather than virtual absolute paths. "
             "Summarize what you changed and any validation results."
         ),
+        checkpointer=checkpointer,
     )
-    result: dict[str, Any] = agent.invoke(
-        {"messages": [{"role": "user", "content": task}]}
-    )
+    input_state = {"messages": [{"role": "user", "content": task}]}
+    if thread_id:
+        result: dict[str, Any] = agent.invoke(
+            input_state,
+            config={"configurable": {"thread_id": thread_id}},
+        )
+    else:
+        result = agent.invoke(input_state)
     messages = result.get("messages", [])
     if not messages:
         return ""
