@@ -9,7 +9,11 @@ from sweforge.github_models import (
     SourceKind,
     SubjectKind,
 )
-from sweforge.github_store import SQLiteGitHubStore
+from sweforge.github_store import (
+    PublicationStatus,
+    SQLiteGitHubStore,
+    ThreadWorkspaceRecord,
+)
 
 
 def event(repo: RepositoryRef, source_id: str = "1", number: int = 7) -> SourceEvent:
@@ -229,3 +233,59 @@ def test_existing_state_db_migrates_execution_baselines(tmp_path):
     }
     assert {"start_head_sha", "end_head_sha", "end_dirty"} <= columns
     migrated.close()
+
+
+def test_resolved_issue_snapshot_is_not_a_new_task(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(12345, "example/repo")
+    store.upsert_repository(repo.repo_id, repo.full_name, "now")
+    first = event(repo)
+    edited_snapshot = replace(first, source_updated_at="2026-01-01T00:01:00Z")
+    store.record_batch(
+        repo.repo_id,
+        "issues",
+        [first, edited_snapshot],
+        since="now",
+        etag=None,
+        polled_at="now",
+    )
+    claim = store.claim_next_event(now="now")
+    assert claim and claim.event_key == first.event_key
+    store.save_thread_workspace(
+        ThreadWorkspaceRecord(
+            claim.thread_id,
+            repo.repo_id,
+            repo.full_name,
+            7,
+            "/tmp/repository",
+            "/tmp/workspace",
+            "sweforge/issue-7",
+            "base",
+            "now",
+            "now",
+        )
+    )
+    store.mark_execution_succeeded(
+        first.event_key,
+        completed_at="later",
+        response_text="ok",
+        workspace_path="/tmp/workspace",
+        start_head_sha="base",
+        end_head_sha="base",
+        end_dirty=False,
+    )
+    store.ensure_publication(first.event_key, now="later")
+    store.update_publication(
+        first.event_key, status=PublicationStatus.COMPLETED, now="later"
+    )
+    store.record_batch(
+        repo.repo_id,
+        "issues",
+        [edited_snapshot],
+        since="later",
+        etag=None,
+        polled_at="latest",
+    )
+    assert store.execution_for_event(edited_snapshot.event_key)["status"] == "SKIPPED"
+    assert store.claim_next_event(now="latest") is None
+    store.close()

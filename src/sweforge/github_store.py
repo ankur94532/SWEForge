@@ -269,6 +269,7 @@ class SQLiteGitHubStore:
     ) -> RecordBatchResult:
         result = RecordBatchResult()
         with self.transaction() as db:
+            self._repair_redundant_issue_events(db, now=polled_at)
             for event in events:
                 if event.repo_id != repo_id:
                     raise ValueError("event repository does not match the batch")
@@ -276,6 +277,8 @@ class SQLiteGitHubStore:
                     "SELECT 1 FROM source_events WHERE event_key = ?",
                     (event.event_key,),
                 ).fetchone():
+                    continue
+                if self._has_resolved_issue_snapshot(db, event):
                     continue
                 thread_id = self._resolve_thread(db, event, polled_at, result)
                 db.execute(
@@ -310,6 +313,88 @@ class SQLiteGitHubStore:
                 (repo_id, stream, since, etag, polled_at),
             )
         return result
+
+    @staticmethod
+    def _has_resolved_issue_snapshot(
+        db: sqlite3.Connection, event: SourceEvent
+    ) -> bool:
+        if event.source_kind.value != "issue":
+            return False
+        return (
+            db.execute(
+                """SELECT 1
+                   FROM source_events earlier
+                   JOIN event_executions execution
+                     ON execution.event_key = earlier.event_key
+                   LEFT JOIN event_publications publication
+                     ON publication.event_key = earlier.event_key
+                   WHERE earlier.repo_id = ?
+                     AND earlier.source_kind = 'issue'
+                     AND earlier.source_id = ?
+                     AND earlier.body = ?
+                     AND (
+                         execution.status = ? OR (
+                             execution.status = ? AND
+                             publication.status IN (?, ?)
+                         )
+                     )
+                   LIMIT 1""",
+                (
+                    event.repo_id,
+                    event.source_id,
+                    event.body,
+                    ExecutionStatus.SKIPPED.value,
+                    ExecutionStatus.SUCCEEDED.value,
+                    PublicationStatus.COMPLETED.value,
+                    PublicationStatus.NO_CHANGES.value,
+                ),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _repair_redundant_issue_events(db: sqlite3.Connection, *, now: str) -> None:
+        db.execute(
+            """INSERT INTO event_executions(
+                   event_key, thread_id, status, attempt_count, started_at,
+                   completed_at, response_text, error_message, workspace_path)
+               SELECT later.event_key, later.thread_id, ?, 0, later.discovered_at,
+                      ?, NULL, ?, NULL
+               FROM source_events later
+               JOIN source_events earlier
+                 ON earlier.repo_id = later.repo_id
+                AND earlier.source_kind = 'issue'
+                AND later.source_kind = 'issue'
+                AND earlier.source_id = later.source_id
+                AND earlier.body = later.body
+                AND (
+                    earlier.source_updated_at < later.source_updated_at OR
+                    (earlier.source_updated_at = later.source_updated_at AND
+                     earlier.event_key < later.event_key)
+                )
+               JOIN event_executions prior_execution
+                 ON prior_execution.event_key = earlier.event_key
+               LEFT JOIN event_publications prior_publication
+                 ON prior_publication.event_key = earlier.event_key
+               LEFT JOIN event_executions later_execution
+                 ON later_execution.event_key = later.event_key
+               WHERE later_execution.event_key IS NULL
+                 AND (
+                     prior_execution.status = ? OR (
+                         prior_execution.status = ? AND
+                         prior_publication.status IN (?, ?)
+                     )
+                 )""",
+            (
+                ExecutionStatus.SKIPPED.value,
+                now,
+                "duplicate unchanged issue snapshot after resolved event",
+                ExecutionStatus.SKIPPED.value,
+                ExecutionStatus.SUCCEEDED.value,
+                PublicationStatus.COMPLETED.value,
+                PublicationStatus.NO_CHANGES.value,
+            ),
+        )
 
     def claim_next_event(self, *, now: str) -> ClaimedEvent | None:
         with self.transaction(immediate=True) as db:
