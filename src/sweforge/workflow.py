@@ -1,6 +1,7 @@
 """Durable planning, approval, and execution gates for IssueThreads."""
 
 import hashlib
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -25,7 +26,9 @@ from .github_models import (
     starts_with_agent_invocation,
 )
 from .github_store import (
+    AttemptStatus,
     ExecutionPermit,
+    ExecutionReviewRecord,
     InputPurpose,
     PendingWorkflowInputError,
     PermitSource,
@@ -39,6 +42,7 @@ from .github_store import (
 )
 from .planner import PlannerContext, generate_plan
 from .repo_memory import repo_memory_namespace
+from .reviewer import ExecutionReviewResult, ReviewerContext, review_execution
 from .workspace import ThreadWorkspace, WorkspaceError
 
 _PREFIX_RE = re.compile(r"^\s*@agent\b", re.IGNORECASE)
@@ -124,11 +128,13 @@ class WorkflowEngine:
         store: SQLiteGitHubStore,
         client: GitHubClient | None = None,
         planner: Callable[..., str] | None = None,
+        reviewer: Callable[..., ExecutionReviewResult] | None = None,
         clock: Callable[[], str] = _now,
     ) -> None:
         self.store = store
         self.client = client
         self.planner = planner or generate_plan
+        self.reviewer = reviewer or review_execution
         self.clock = clock
 
     def start_cycle(
@@ -560,6 +566,17 @@ class WorkflowEngine:
                 plan = self.store.plan(permit.plan_id)
                 if plan is None:
                     raise ValueError("approved plan disappeared")
+                attempt_id = f"attempt-{permit.permit_id}"
+                attempt = self.store.ensure_execution_attempt(
+                    attempt_id=attempt_id,
+                    thread_id=permit.thread_id,
+                    cycle_id=permit.cycle_id,
+                    plan_id=plan.plan_id,
+                    plan_version=plan.version,
+                    root_event_key=plan.root_event_key,
+                    authorization_id=permit.permit_id,
+                    created_at=utc_timestamp(clock()),
+                )
                 result = _execute_claim(
                     store=self.store,
                     event=event,
@@ -576,9 +593,29 @@ class WorkflowEngine:
                         event_key, thread_id=permit.thread_id, cycle_id=permit.cycle_id
                     )
                 current = self.store.workflow_state(permit.thread_id)
+                if result.status == "SUCCEEDED":
+                    execution = self.store.execution_for_event(permit.root_event_key)
+                    self.store.finish_execution_attempt(
+                        attempt.attempt_id,
+                        status=AttemptStatus.SUCCEEDED,
+                        completed_at=utc_timestamp(clock()),
+                        response_text=execution["response_text"] if execution else None,
+                        start_head_sha=execution["start_head_sha"]
+                        if execution
+                        else None,
+                        end_head_sha=execution["end_head_sha"] if execution else None,
+                        end_dirty=bool(execution["end_dirty"]) if execution else False,
+                    )
+                else:
+                    self.store.finish_execution_attempt(
+                        attempt.attempt_id,
+                        status=AttemptStatus.FAILED,
+                        completed_at=utc_timestamp(clock()),
+                        response_text=result.error,
+                    )
                 if current:
                     phase = (
-                        WorkflowPhase.AWAITING_PUBLICATION
+                        WorkflowPhase.REVIEW_EXECUTION
                         if result.status == "SUCCEEDED"
                         else WorkflowPhase.EXECUTION_READY
                     )
@@ -787,6 +824,7 @@ class WorkflowEngine:
         *,
         thread_id: str,
         model: str,
+        review_model: str | None = None,
         repo_paths: dict[str, str | Path],
         workspace_root: str | Path,
         memory_store: BaseStore | None = None,
@@ -823,6 +861,86 @@ class WorkflowEngine:
             )
             return WorkflowAdvanceResult(
                 WorkflowPhase.IDLE, thread_id, message="finalized"
+            )
+        if state and state.phase == WorkflowPhase.REVIEW_EXECUTION:
+            attempt = self.store.latest_attempt(thread_id, state.cycle_id)
+            plan = self.store.current_plan(thread_id)
+            if attempt is None or plan is None:
+                raise ValueError("review workflow is missing its attempt or plan")
+            existing_review = self.store.execution_review_for_attempt(
+                attempt.attempt_id
+            )
+            if existing_review:
+                if existing_review.verdict == "ACCEPT":
+                    self.store.accept_execution_review(
+                        existing_review.review_id, now=self.clock()
+                    )
+                    return WorkflowAdvanceResult(
+                        WorkflowPhase.AWAITING_PUBLICATION,
+                        thread_id,
+                        message="execution accepted",
+                    )
+                return WorkflowAdvanceResult(
+                    WorkflowPhase.REVIEW_EXECUTION,
+                    thread_id,
+                    message=existing_review.verdict,
+                )
+            execution = self.store.execution_for_event(state.root_event_key)
+            workspace = self.store.thread_workspace(thread_id)
+            if execution is None or workspace is None:
+                raise ValueError("review evidence is unavailable")
+            evidence = {
+                "plan": {
+                    "id": plan.plan_id,
+                    "version": plan.version,
+                    "text": plan.plan_text,
+                },
+                "execution": dict(execution),
+                "attempt": attempt.__dict__,
+                "current_head": execution["end_head_sha"],
+                "base_head": workspace.base_commit,
+            }
+            result = self.reviewer(
+                context=ReviewerContext(
+                    worktree=workspace.workspace_path,
+                    memory_store=memory_store,
+                    memory_namespace=repo_memory_namespace(state.repo_id),
+                ),
+                model=review_model or model,
+                evidence=evidence,
+            )
+            review_id = "review-" + _stable_id(
+                attempt.attempt_id, json.dumps(result.model_dump(), sort_keys=True)
+            )
+            review = self.store.save_execution_review(
+                ExecutionReviewRecord(
+                    review_id=review_id,
+                    thread_id=thread_id,
+                    cycle_id=state.cycle_id,
+                    plan_id=plan.plan_id,
+                    plan_version=plan.version,
+                    root_event_key=state.root_event_key,
+                    attempt_id=attempt.attempt_id,
+                    review_iteration=attempt.attempt_number,
+                    verdict=result.verdict,
+                    summary=result.summary,
+                    findings_json=json.dumps(
+                        [item.model_dump() for item in result.findings]
+                    ),
+                    repair_instructions_json=json.dumps(result.repair_instructions),
+                    created_at=self.clock(),
+                    completed_at=self.clock(),
+                )
+            )
+            if review.verdict == "ACCEPT":
+                self.store.accept_execution_review(review.review_id, now=self.clock())
+                return WorkflowAdvanceResult(
+                    WorkflowPhase.AWAITING_PUBLICATION,
+                    thread_id,
+                    message="execution accepted",
+                )
+            return WorkflowAdvanceResult(
+                WorkflowPhase.REVIEW_EXECUTION, thread_id, message=review.verdict
             )
         if state is None or state.phase == WorkflowPhase.IDLE:
             plan = self.begin_next_cycle(

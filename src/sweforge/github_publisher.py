@@ -77,6 +77,10 @@ class GitHubPublisher:
             return PublicationResult("FAILED", publication.event_key, error)
 
     def _publish(self, publication: PublicationRecord) -> PublicationResult:
+        if not self.store.publication_is_eligible(publication.event_key):
+            raise WorkspaceError(
+                "publication is not authorized by an ACCEPT execution review"
+            )
         workspace = self.store.thread_workspace(publication.thread_id)
         execution = self.store.execution_for_event(publication.event_key)
         if workspace is None or execution is None or execution["status"] != "SUCCEEDED":

@@ -38,7 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-path", action="append", required=True, metavar="OWNER/REPO=PATH"
     )
     parser.add_argument("--thread-id", required=True)
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model", help="legacy fallback for all workflow roles")
+    parser.add_argument("--planning-model")
+    parser.add_argument("--execution-model")
+    parser.add_argument("--review-model")
     parser.add_argument(
         "--api-url",
         default=os.getenv("SWEFORGE_GITHUB_API_URL", "https://api.github.com"),
@@ -62,6 +65,16 @@ def _repo_paths(values: list[str]) -> dict[str, Path]:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    planning_model = args.planning_model or args.model
+    execution_model = args.execution_model or args.model
+    review_model = args.review_model or args.model
+    if not all((planning_model, execution_model, review_model)):
+        print(
+            "sweforge-github-workflow: planning, execution, and review "
+            "models are required",
+            file=sys.stderr,
+        )
+        return 2
     client_id = os.getenv("SWEFORGE_GITHUB_APP_CLIENT_ID") or os.getenv(
         "SWEFORGE_GITHUB_CLIENT_ID"
     )
@@ -93,12 +106,13 @@ def main(argv: list[str] | None = None) -> int:
         memory = SQLiteMemoryStore(args.memory_db)
         result = WorkflowEngine(store=store, client=client).advance(
             thread_id=args.thread_id,
-            model=args.model,
+            model=planning_model,
+            review_model=review_model,
             repo_paths=mappings,
             workspace_root=args.workspace_root,
             memory_store=memory.store,
             execute_kwargs={
-                "model": args.model,
+                "model": execution_model,
                 "repo_paths": mappings,
                 "workspace_root": args.workspace_root,
                 "lock_root": args.lock_root,

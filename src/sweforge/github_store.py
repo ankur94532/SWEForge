@@ -1,5 +1,8 @@
 """Durable SQLite persistence for GitHub ingestion."""
 
+# SQL statements are kept readable as complete statements.
+# ruff: noqa: E501
+
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -167,6 +170,45 @@ CREATE TABLE IF NOT EXISTS execution_permits (
     consumed_at TEXT,
     invalidated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS execution_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    plan_id TEXT NOT NULL REFERENCES issue_plans(plan_id),
+    plan_version INTEGER NOT NULL,
+    root_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    attempt_number INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    repair_round INTEGER NOT NULL DEFAULT 0,
+    parent_review_id TEXT,
+    authorization_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    response_text TEXT,
+    start_head_sha TEXT,
+    end_head_sha TEXT,
+    start_dirty INTEGER NOT NULL DEFAULT 0,
+    end_dirty INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(thread_id, cycle_id, attempt_number)
+);
+CREATE TABLE IF NOT EXISTS execution_reviews (
+    review_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    plan_id TEXT NOT NULL REFERENCES issue_plans(plan_id),
+    plan_version INTEGER NOT NULL,
+    root_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    attempt_id TEXT NOT NULL UNIQUE REFERENCES execution_attempts(attempt_id),
+    review_iteration INTEGER NOT NULL,
+    verdict TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    findings_json TEXT NOT NULL,
+    repair_instructions_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS thread_input_consumptions (
     event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
     thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
@@ -214,6 +256,9 @@ class WorkflowPhase(StrEnum):
     EXECUTION_READY = "EXECUTION_READY"
     EXECUTING = "EXECUTING"
     AWAITING_PUBLICATION = "AWAITING_PUBLICATION"
+    REVIEW_EXECUTION = "REVIEW_EXECUTION"
+    REPAIR_READY = "REPAIR_READY"
+    REVIEW_BLOCKED = "REVIEW_BLOCKED"
 
 
 class WorkflowMode(StrEnum):
@@ -243,6 +288,19 @@ class InputPurpose(StrEnum):
     PLAN_APPROVAL = "PLAN_APPROVAL"
     EARLY_PLAN_APPROVAL = "EARLY_PLAN_APPROVAL"
     STALE_PLAN_APPROVAL = "STALE_PLAN_APPROVAL"
+    LIVE_REVIEW_INPUT = "LIVE_REVIEW_INPUT"
+
+
+class AttemptKind(StrEnum):
+    INITIAL = "INITIAL"
+    REVIEW_REPAIR = "REVIEW_REPAIR"
+
+
+class AttemptStatus(StrEnum):
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    INTERRUPTED = "INTERRUPTED"
 
 
 class PendingWorkflowInputError(ValueError):
@@ -293,6 +351,48 @@ class ExecutionRecord:
     started_at: str
     completed_at: str | None
     error_message: str | None
+
+
+@dataclass(frozen=True)
+class ExecutionAttemptRecord:
+    attempt_id: str
+    thread_id: str
+    cycle_id: int
+    plan_id: str
+    plan_version: int
+    root_event_key: str
+    attempt_number: int
+    kind: AttemptKind
+    repair_round: int
+    parent_review_id: str | None
+    authorization_id: str
+    status: AttemptStatus
+    response_text: str | None
+    start_head_sha: str | None
+    end_head_sha: str | None
+    start_dirty: bool
+    end_dirty: bool
+    created_at: str
+    completed_at: str | None
+    retry_count: int
+
+
+@dataclass(frozen=True)
+class ExecutionReviewRecord:
+    review_id: str
+    thread_id: str
+    cycle_id: int
+    plan_id: str
+    plan_version: int
+    root_event_key: str
+    attempt_id: str
+    review_iteration: int
+    verdict: str
+    summary: str
+    findings_json: str
+    repair_instructions_json: str
+    created_at: str
+    completed_at: str
 
 
 @dataclass(frozen=True)
@@ -427,6 +527,19 @@ class SQLiteGitHubStore:
         for column, statement in migrations.items():
             if column not in columns:
                 self.connection.execute(statement)
+        # Successful executions created before the review gate must never be
+        # published implicitly after an upgrade.
+        self.connection.execute(
+            """UPDATE issue_workflow_state SET phase = ?
+               WHERE phase = ? AND NOT EXISTS (
+                 SELECT 1 FROM execution_reviews r
+                 WHERE r.thread_id = issue_workflow_state.thread_id
+                   AND r.verdict = 'ACCEPT')""",
+            (
+                WorkflowPhase.REVIEW_EXECUTION.value,
+                WorkflowPhase.AWAITING_PUBLICATION.value,
+            ),
+        )
         source_columns = {
             row[1]
             for row in self.connection.execute("PRAGMA table_info(source_events)")
@@ -1012,6 +1125,233 @@ class SQLiteGitHubStore:
             "SELECT * FROM event_executions WHERE event_key = ?", (event_key,)
         ).fetchone()
 
+    @staticmethod
+    def _attempt_record(row: sqlite3.Row) -> ExecutionAttemptRecord:
+        return ExecutionAttemptRecord(
+            attempt_id=row["attempt_id"],
+            thread_id=row["thread_id"],
+            cycle_id=row["cycle_id"],
+            plan_id=row["plan_id"],
+            plan_version=row["plan_version"],
+            root_event_key=row["root_event_key"],
+            attempt_number=row["attempt_number"],
+            kind=AttemptKind(row["kind"]),
+            repair_round=row["repair_round"],
+            parent_review_id=row["parent_review_id"],
+            authorization_id=row["authorization_id"],
+            status=AttemptStatus(row["status"]),
+            response_text=row["response_text"],
+            start_head_sha=row["start_head_sha"],
+            end_head_sha=row["end_head_sha"],
+            start_dirty=bool(row["start_dirty"]),
+            end_dirty=bool(row["end_dirty"]),
+            created_at=row["created_at"],
+            completed_at=row["completed_at"],
+            retry_count=row["retry_count"],
+        )
+
+    def execution_attempt(self, attempt_id: str) -> ExecutionAttemptRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM execution_attempts WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        return self._attempt_record(row) if row else None
+
+    def latest_attempt(
+        self, thread_id: str, cycle_id: int
+    ) -> ExecutionAttemptRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM execution_attempts WHERE thread_id = ? AND cycle_id = "
+            "? ORDER BY attempt_number DESC LIMIT 1",
+            (thread_id, cycle_id),
+        ).fetchone()
+        return self._attempt_record(row) if row else None
+
+    def ensure_execution_attempt(
+        self,
+        *,
+        attempt_id: str,
+        thread_id: str,
+        cycle_id: int,
+        plan_id: str,
+        plan_version: int,
+        root_event_key: str,
+        authorization_id: str,
+        created_at: str,
+        kind: AttemptKind = AttemptKind.INITIAL,
+        parent_review_id: str | None = None,
+        repair_round: int = 0,
+        attempt_number: int | None = None,
+    ) -> ExecutionAttemptRecord:
+        with self.transaction(immediate=True) as db:
+            existing = db.execute(
+                "SELECT * FROM execution_attempts WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if existing:
+                return self._attempt_record(existing)
+            number = (
+                attempt_number
+                or (
+                    db.execute(
+                        "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM execution_attempts "
+                        "WHERE thread_id = ? AND cycle_id = ?",
+                        (thread_id, cycle_id),
+                    ).fetchone()[0]
+                )
+            )
+            db.execute(
+                "INSERT INTO execution_attempts(attempt_id,thread_id,cycle_id,plan_id,plan_version,root_event_key,attempt_number,kind,repair_round,parent_review_id,authorization_id,status,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    attempt_id,
+                    thread_id,
+                    cycle_id,
+                    plan_id,
+                    plan_version,
+                    root_event_key,
+                    number,
+                    kind.value,
+                    repair_round,
+                    parent_review_id,
+                    authorization_id,
+                    AttemptStatus.RUNNING.value,
+                    created_at,
+                ),
+            )
+        return self.execution_attempt(attempt_id)  # type: ignore[return-value]
+
+    def finish_execution_attempt(
+        self,
+        attempt_id: str,
+        *,
+        status: AttemptStatus,
+        completed_at: str,
+        response_text: str | None = None,
+        start_head_sha: str | None = None,
+        end_head_sha: str | None = None,
+        end_dirty: bool = False,
+    ) -> ExecutionAttemptRecord:
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE execution_attempts SET status=?,completed_at=?,response_text=?,start_head_sha=COALESCE(?,start_head_sha),end_head_sha=?,end_dirty=? WHERE attempt_id=?",
+                (
+                    status.value,
+                    completed_at,
+                    response_text,
+                    start_head_sha,
+                    end_head_sha,
+                    int(end_dirty),
+                    attempt_id,
+                ),
+            )
+        return self.execution_attempt(attempt_id)  # type: ignore[return-value]
+
+    def execution_review_for_attempt(
+        self, attempt_id: str
+    ) -> ExecutionReviewRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM execution_reviews WHERE attempt_id = ?", (attempt_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return ExecutionReviewRecord(**dict(row))
+
+    def save_execution_review(
+        self, review: ExecutionReviewRecord
+    ) -> ExecutionReviewRecord:
+        with self.transaction() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO execution_reviews VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    review.review_id,
+                    review.thread_id,
+                    review.cycle_id,
+                    review.plan_id,
+                    review.plan_version,
+                    review.root_event_key,
+                    review.attempt_id,
+                    review.review_iteration,
+                    review.verdict,
+                    review.summary,
+                    review.findings_json,
+                    review.repair_instructions_json,
+                    review.created_at,
+                    review.completed_at,
+                ),
+            )
+        return self.execution_review_for_attempt(review.attempt_id)  # type: ignore[return-value]
+
+    def accept_execution_review(self, review_id: str, *, now: str) -> None:
+        with self.transaction(immediate=True) as db:
+            row = db.execute(
+                "SELECT * FROM execution_reviews WHERE review_id = ?", (review_id,)
+            ).fetchone()
+            state = (
+                db.execute(
+                    "SELECT * FROM issue_workflow_state WHERE thread_id = ?",
+                    (row["thread_id"],),
+                ).fetchone()
+                if row
+                else None
+            )
+            attempt = (
+                db.execute(
+                    "SELECT * FROM execution_attempts WHERE attempt_id = ?",
+                    (row["attempt_id"],),
+                ).fetchone()
+                if row
+                else None
+            )
+            if (
+                not row
+                or not state
+                or not attempt
+                or row["verdict"] != "ACCEPT"
+                or state["phase"] != WorkflowPhase.REVIEW_EXECUTION.value
+            ):
+                raise ValueError("execution review is stale or not acceptable")
+            if (
+                state["current_plan_id"] != row["plan_id"]
+                or attempt["status"] != AttemptStatus.SUCCEEDED.value
+            ):
+                raise ValueError(
+                    "execution review does not match current successful attempt"
+                )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
+                (WorkflowPhase.AWAITING_PUBLICATION.value, now, row["thread_id"]),
+            )
+
+    def publication_is_eligible(self, event_key: str) -> bool:
+        row = self.connection.execute(
+            "SELECT ee.status execution_status, s.thread_id, s.root_event_key, s.current_plan_id, s.phase, "
+            "a.attempt_id, a.status attempt_status, a.plan_id attempt_plan, r.verdict "
+            "FROM source_events e JOIN event_executions ee ON ee.event_key=e.event_key "
+            "LEFT JOIN issue_workflow_state s ON s.thread_id=e.thread_id "
+            "LEFT JOIN execution_attempts a ON a.thread_id=s.thread_id AND a.cycle_id=s.cycle_id "
+            "AND a.attempt_number=(SELECT MAX(a2.attempt_number) FROM execution_attempts a2 WHERE a2.thread_id=s.thread_id AND a2.cycle_id=s.cycle_id) "
+            "LEFT JOIN execution_reviews r ON r.attempt_id=a.attempt_id WHERE e.event_key=?",
+            (event_key,),
+        ).fetchone()
+        if row is None:
+            return False
+        # Preserve the pre-workflow store API used by older callers. Once a
+        # durable workflow state exists, publication is always review-gated.
+        state_exists = self.connection.execute(
+            "SELECT 1 FROM issue_workflow_state WHERE thread_id = (SELECT thread_id FROM source_events WHERE event_key = ?)",
+            (event_key,),
+        ).fetchone()
+        if not state_exists:
+            return row["execution_status"] == ExecutionStatus.SUCCEEDED.value
+        return bool(
+            row
+            and row["execution_status"] == ExecutionStatus.SUCCEEDED.value
+            and row["root_event_key"] == event_key
+            and row["phase"] == WorkflowPhase.AWAITING_PUBLICATION.value
+            and row["attempt_status"] == AttemptStatus.SUCCEEDED.value
+            and row["attempt_plan"] == row["current_plan_id"]
+            and row["verdict"] == "ACCEPT"
+        )
+
     def publication_for_event(self, event_key: str) -> PublicationRecord | None:
         row = self.connection.execute(
             "SELECT * FROM event_publications WHERE event_key = ?", (event_key,)
@@ -1023,10 +1363,17 @@ class SQLiteGitHubStore:
     ) -> PublicationRecord | None:
         query = """SELECT ee.event_key FROM event_executions ee
                    JOIN source_events se ON se.event_key = ee.event_key
+                   LEFT JOIN issue_workflow_state ws ON ws.thread_id = se.thread_id
                    LEFT JOIN event_publications ep ON ep.event_key = ee.event_key
-                   WHERE ee.status = ? AND (ep.event_key IS NULL OR
+                   LEFT JOIN execution_attempts ea ON ea.attempt_id = (
+                     SELECT attempt_id FROM execution_attempts a2 WHERE a2.thread_id=ws.thread_id AND a2.cycle_id=ws.cycle_id ORDER BY attempt_number DESC LIMIT 1)
+                   LEFT JOIN execution_reviews er ON er.attempt_id = ea.attempt_id
+                   WHERE ee.status = ? AND (ws.thread_id IS NULL OR (ws.phase = ? AND er.verdict = 'ACCEPT' AND ea.status = 'SUCCEEDED' AND ea.plan_id = ws.current_plan_id)) AND (ep.event_key IS NULL OR
                          ep.status IN (?, ?, ?, ?, ?))"""
-        args: list[object] = [ExecutionStatus.SUCCEEDED.value]
+        args: list[object] = [
+            ExecutionStatus.SUCCEEDED.value,
+            WorkflowPhase.AWAITING_PUBLICATION.value,
+        ]
         args.extend(status.value for status in RESUMABLE_PUBLICATION_STATUSES)
         if event_key is not None:
             query += " AND ep.event_key = ?"
@@ -1043,6 +1390,8 @@ class SQLiteGitHubStore:
         existing = self.publication_for_event(event_key)
         if existing:
             return existing
+        if not self.publication_is_eligible(event_key):
+            raise ValueError("publication is blocked until a matching ACCEPT review")
         with self.transaction() as db:
             row = db.execute(
                 """SELECT se.event_key, se.thread_id, se.repo_id, se.repo_full_name,
@@ -2080,6 +2429,27 @@ class SQLiteGitHubStore:
                 "UPDATE issue_workflow_state SET phase = ?, updated_at = ? "
                 "WHERE thread_id = ?",
                 (WorkflowPhase.EXECUTING.value, now, expected_thread_id),
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO execution_attempts(
+                   attempt_id, thread_id, cycle_id, plan_id, plan_version,
+                   root_event_key, attempt_number, kind, repair_round,
+                   authorization_id, status, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    f"attempt-{permit_id}",
+                    expected_thread_id,
+                    permit["cycle_id"],
+                    permit["plan_id"],
+                    permit["plan_version"],
+                    permit["root_event_key"],
+                    1,
+                    AttemptKind.INITIAL.value,
+                    0,
+                    permit_id,
+                    AttemptStatus.RUNNING.value,
+                    now,
+                ),
             )
             return self._claimed_event(row, retrying=retrying)
 
