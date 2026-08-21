@@ -15,6 +15,7 @@ from deepagents.middleware.permissions import FilesystemPermission
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
 
+from .agent import LiveInputMiddleware
 from .repo_memory import MEMORY_VIRTUAL_PATH
 
 MAX_PLAN_CHARS = 12_000
@@ -59,6 +60,8 @@ class PlannerContext:
     worktree: str
     memory_store: BaseStore | None = None
     memory_namespace: tuple[str, ...] | None = None
+    live_input_provider: Any = None
+    live_delivered_event_keys: set[str] | None = None
 
 
 def _planner_backend(context: PlannerContext) -> CompositeBackend:
@@ -82,6 +85,16 @@ def build_planner(context: PlannerContext, *, model: str):
     permissions = [
         FilesystemPermission(operations=["write"], paths=["/**"], mode="deny")
     ]
+    middleware = (
+        [
+            LiveInputMiddleware(
+                context.live_input_provider,
+                context.live_delivered_event_keys,
+            )
+        ]
+        if context.live_input_provider is not None
+        else []
+    )
     return create_deep_agent(
         model=model,
         backend=_planner_backend(context),
@@ -89,6 +102,7 @@ def build_planner(context: PlannerContext, *, model: str):
         permissions=permissions,
         store=context.memory_store,
         response_format=PlanResult,
+        middleware=middleware,
         system_prompt=(
             "You are a read-only repository planner. Inspect files and repository "
             "memory, then produce a concise implementation plan. Do not edit files, "

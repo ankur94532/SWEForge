@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS execution_permits (
     cycle_id INTEGER NOT NULL,
     plan_id TEXT NOT NULL REFERENCES issue_plans(plan_id),
     plan_version INTEGER NOT NULL,
+    root_event_key TEXT NOT NULL REFERENCES source_events(event_key),
     source TEXT NOT NULL,
     source_event_key TEXT,
     created_at TEXT NOT NULL,
@@ -359,6 +360,7 @@ class ExecutionPermit:
     cycle_id: int
     plan_id: str
     plan_version: int
+    root_event_key: str
     source: PermitSource
     source_event_key: str | None
     created_at: str
@@ -469,6 +471,14 @@ class SQLiteGitHubStore:
         for column, statement in workflow_migrations.items():
             if column not in workflow_columns:
                 self.connection.execute(statement)
+        permit_columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(execution_permits)")
+        }
+        if "root_event_key" not in permit_columns:
+            self.connection.execute(
+                "ALTER TABLE execution_permits ADD COLUMN root_event_key TEXT"
+            )
 
     def close(self) -> None:
         self.connection.close()
@@ -829,6 +839,22 @@ class SQLiteGitHubStore:
                 "UPDATE event_executions SET status = ?, completed_at = NULL "
                 "WHERE event_key = ?",
                 (ExecutionStatus.RETRY_PENDING.value, event_key),
+            )
+            db.execute(
+                "UPDATE execution_permits SET consumed_at = NULL "
+                "WHERE root_event_key = ? AND consumed_at IS NOT NULL "
+                "AND invalidated_at IS NULL",
+                (event_key,),
+            )
+            db.execute(
+                """UPDATE issue_workflow_state SET phase = ?, updated_at = ?
+                   WHERE root_event_key = ? AND phase = ?""",
+                (
+                    WorkflowPhase.EXECUTION_READY.value,
+                    datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                    event_key,
+                    WorkflowPhase.EXECUTING.value,
+                ),
             )
             return ExecutionStatus.RETRY_PENDING
 
@@ -1193,6 +1219,11 @@ class SQLiteGitHubStore:
             "SELECT * FROM source_events WHERE event_key = ?", (event_key,)
         ).fetchone()
 
+    def issue_thread(self, thread_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM issue_threads WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
+
     def source_events_for_thread(self, thread_id: str) -> list[sqlite3.Row]:
         return self.connection.execute(
             "SELECT * FROM source_events WHERE thread_id = ? "
@@ -1244,6 +1275,316 @@ class SQLiteGitHubStore:
                 ),
             )
         return self.workflow_state(record.thread_id)  # type: ignore[return-value]
+
+    def begin_workflow_cycle(
+        self, plan: PlanRecord, state: WorkflowStateRecord, *, claimed_at: str
+    ) -> PlanRecord:
+        """Atomically consume the root and create its plan/state."""
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO thread_input_consumptions(
+                   event_key, thread_id, cycle_id, purpose, status, claimed_at,
+                   consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(event_key) DO NOTHING""",
+                (
+                    plan.root_event_key,
+                    plan.thread_id,
+                    plan.cycle_id,
+                    InputPurpose.CYCLE_ROOT.value,
+                    "CONSUMED",
+                    claimed_at,
+                    claimed_at,
+                ),
+            )
+            db.execute(
+                """INSERT INTO issue_plans(
+                   plan_id, thread_id, repo_id, repo_full_name, issue_number,
+                   cycle_id, version, root_event_key, plan_text, status,
+                   created_at, posted_at, posted_comment_id, approved_at,
+                   approved_by, approval_event_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    plan.plan_id,
+                    plan.thread_id,
+                    plan.repo_id,
+                    plan.repo_full_name,
+                    plan.issue_number,
+                    plan.cycle_id,
+                    plan.version,
+                    plan.root_event_key,
+                    plan.plan_text,
+                    plan.status.value,
+                    plan.created_at,
+                    plan.posted_at,
+                    plan.posted_comment_id,
+                    plan.approved_at,
+                    plan.approved_by,
+                    plan.approval_event_key,
+                ),
+            )
+            db.execute(
+                """INSERT INTO issue_workflow_state(
+                   thread_id, repo_id, repo_full_name, issue_number, phase,
+                   cycle_id, root_event_key, current_plan_id, mode, created_at,
+                   updated_at, response_surface, response_subject_number,
+                   response_comment_id, response_url, review_thread_root_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    state.thread_id,
+                    state.repo_id,
+                    state.repo_full_name,
+                    state.issue_number,
+                    state.phase.value,
+                    state.cycle_id,
+                    state.root_event_key,
+                    state.current_plan_id,
+                    state.mode.value,
+                    state.created_at,
+                    state.updated_at,
+                    state.response_surface,
+                    state.response_subject_number,
+                    state.response_comment_id,
+                    state.response_url,
+                    state.review_thread_root_id,
+                ),
+            )
+        return self.plan(plan.plan_id)  # type: ignore[return-value]
+
+    def approve_current_plan(
+        self,
+        *,
+        event_key: str,
+        author_login: str | None,
+        permit: ExecutionPermit,
+        approved_at: str,
+    ) -> ExecutionPermit:
+        with self.transaction(immediate=True) as db:
+            state = db.execute(
+                "SELECT * FROM issue_workflow_state WHERE thread_id = ?",
+                (permit.thread_id,),
+            ).fetchone()
+            plan = db.execute(
+                "SELECT * FROM issue_plans WHERE plan_id = ?", (permit.plan_id,)
+            ).fetchone()
+            event = db.execute(
+                "SELECT thread_id FROM source_events WHERE event_key = ?", (event_key,)
+            ).fetchone()
+            if (
+                state is None
+                or plan is None
+                or event is None
+                or event["thread_id"] != permit.thread_id
+                or state["phase"] != WorkflowPhase.WAITING_FOR_PLAN_APPROVAL.value
+                or state["current_plan_id"] != permit.plan_id
+                or plan["status"] != PlanStatus.POSTED.value
+            ):
+                raise ValueError("current plan cannot be approved")
+            db.execute(
+                """INSERT INTO thread_input_consumptions(
+                   event_key, thread_id, cycle_id, purpose, status, claimed_at,
+                   consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_key,
+                    permit.thread_id,
+                    state["cycle_id"],
+                    InputPurpose.PLAN_APPROVAL.value,
+                    "CONSUMED",
+                    approved_at,
+                    approved_at,
+                ),
+            )
+            self._resolve_workflow_control(
+                db,
+                event_key=event_key,
+                thread_id=permit.thread_id,
+                claimed_at=approved_at,
+                purpose=InputPurpose.PLAN_APPROVAL,
+            )
+            db.execute(
+                """UPDATE issue_plans SET status = ?, approved_at = ?,
+                   approved_by = ?, approval_event_key = ? WHERE plan_id = ?""",
+                (
+                    PlanStatus.APPROVED.value,
+                    approved_at,
+                    author_login,
+                    event_key,
+                    permit.plan_id,
+                ),
+            )
+            db.execute(
+                """INSERT INTO execution_permits(
+                   permit_id, thread_id, cycle_id, plan_id, plan_version,
+                   root_event_key, source, source_event_key, created_at,
+                   consumed_at, invalidated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    permit.permit_id,
+                    permit.thread_id,
+                    permit.cycle_id,
+                    permit.plan_id,
+                    permit.plan_version,
+                    permit.root_event_key,
+                    permit.source.value,
+                    permit.source_event_key,
+                    permit.created_at,
+                    None,
+                    None,
+                ),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase = ?, updated_at = ? "
+                "WHERE thread_id = ?",
+                (WorkflowPhase.EXECUTION_READY.value, approved_at, permit.thread_id),
+            )
+        return self.permit(permit.permit_id)  # type: ignore[return-value]
+
+    def revise_current_plan(
+        self,
+        *,
+        event_key: str,
+        plan: PlanRecord,
+        revised_at: str,
+    ) -> PlanRecord:
+        with self.transaction(immediate=True) as db:
+            state = db.execute(
+                "SELECT * FROM issue_workflow_state WHERE thread_id = ?",
+                (plan.thread_id,),
+            ).fetchone()
+            current = db.execute(
+                "SELECT * FROM issue_plans WHERE plan_id = ?",
+                (state["current_plan_id"],) if state else (None,),
+            ).fetchone()
+            if (
+                state is None
+                or current is None
+                or state["phase"]
+                not in (
+                    WorkflowPhase.WAITING_FOR_PLAN_APPROVAL.value,
+                    WorkflowPhase.EXECUTION_READY.value,
+                )
+            ):
+                raise ValueError("current plan cannot be revised")
+            db.execute(
+                """INSERT INTO thread_input_consumptions(
+                   event_key, thread_id, cycle_id, purpose, status, claimed_at,
+                   consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_key,
+                    plan.thread_id,
+                    state["cycle_id"],
+                    InputPurpose.PLAN_FEEDBACK.value,
+                    "CONSUMED",
+                    revised_at,
+                    revised_at,
+                ),
+            )
+            self._resolve_workflow_control(
+                db,
+                event_key=event_key,
+                thread_id=plan.thread_id,
+                claimed_at=revised_at,
+                purpose=InputPurpose.PLAN_FEEDBACK,
+            )
+            db.execute(
+                "UPDATE issue_plans SET status = ? WHERE plan_id = ?",
+                (PlanStatus.SUPERSEDED.value, current["plan_id"]),
+            )
+            db.execute(
+                "UPDATE execution_permits SET invalidated_at = ? "
+                "WHERE thread_id = ? AND cycle_id = ? AND consumed_at IS NULL "
+                "AND invalidated_at IS NULL",
+                (revised_at, plan.thread_id, state["cycle_id"]),
+            )
+            db.execute(
+                """INSERT INTO issue_plans(
+                   plan_id, thread_id, repo_id, repo_full_name, issue_number,
+                   cycle_id, version, root_event_key, plan_text, status,
+                   created_at, posted_at, posted_comment_id, approved_at,
+                   approved_by, approval_event_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    plan.plan_id,
+                    plan.thread_id,
+                    plan.repo_id,
+                    plan.repo_full_name,
+                    plan.issue_number,
+                    plan.cycle_id,
+                    plan.version,
+                    plan.root_event_key,
+                    plan.plan_text,
+                    plan.status.value,
+                    plan.created_at,
+                    plan.posted_at,
+                    plan.posted_comment_id,
+                    plan.approved_at,
+                    plan.approved_by,
+                    plan.approval_event_key,
+                ),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase = ?, current_plan_id = ?, "
+                "updated_at = ? WHERE thread_id = ?",
+                (
+                    WorkflowPhase.PLANNING.value,
+                    plan.plan_id,
+                    revised_at,
+                    plan.thread_id,
+                ),
+            )
+        return self.plan(plan.plan_id)  # type: ignore[return-value]
+
+    def authorize_current_plan(
+        self,
+        *,
+        permit: ExecutionPermit,
+        authorized_at: str,
+    ) -> ExecutionPermit:
+        with self.transaction(immediate=True) as db:
+            state = db.execute(
+                "SELECT * FROM issue_workflow_state WHERE thread_id = ?",
+                (permit.thread_id,),
+            ).fetchone()
+            plan = db.execute(
+                "SELECT * FROM issue_plans WHERE plan_id = ?", (permit.plan_id,)
+            ).fetchone()
+            if (
+                state is None
+                or plan is None
+                or state["phase"] != WorkflowPhase.WAITING_FOR_PLAN_APPROVAL.value
+                or state["current_plan_id"] != permit.plan_id
+                or plan["status"] != PlanStatus.POSTED.value
+            ):
+                raise ValueError("current plan cannot be authorized")
+            db.execute(
+                "UPDATE issue_plans SET status = ?, approved_at = ? WHERE plan_id = ?",
+                (PlanStatus.AUTO_APPROVED.value, authorized_at, permit.plan_id),
+            )
+            db.execute(
+                """INSERT INTO execution_permits(
+                   permit_id, thread_id, cycle_id, plan_id, plan_version,
+                   root_event_key, source, source_event_key, created_at,
+                   consumed_at, invalidated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    permit.permit_id,
+                    permit.thread_id,
+                    permit.cycle_id,
+                    permit.plan_id,
+                    permit.plan_version,
+                    permit.root_event_key,
+                    permit.source.value,
+                    permit.source_event_key,
+                    permit.created_at,
+                    None,
+                    None,
+                ),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase = ?, updated_at = ? "
+                "WHERE thread_id = ?",
+                (WorkflowPhase.EXECUTION_READY.value, authorized_at, permit.thread_id),
+            )
+        return self.permit(permit.permit_id)  # type: ignore[return-value]
 
     @staticmethod
     def _workflow_state_record(row: sqlite3.Row) -> WorkflowStateRecord:
@@ -1305,6 +1646,7 @@ class SQLiteGitHubStore:
 
     def update_plan(self, plan_id: str, **fields: object) -> PlanRecord:
         allowed = {
+            "plan_text",
             "status",
             "posted_at",
             "posted_comment_id",
@@ -1352,15 +1694,17 @@ class SQLiteGitHubStore:
         with self.transaction(immediate=True) as db:
             db.execute(
                 """INSERT INTO execution_permits(
-                   permit_id, thread_id, cycle_id, plan_id, plan_version, source,
+                   permit_id, thread_id, cycle_id, plan_id, plan_version,
+                   root_event_key, source,
                    source_event_key, created_at, consumed_at, invalidated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record.permit_id,
                     record.thread_id,
                     record.cycle_id,
                     record.plan_id,
                     record.plan_version,
+                    record.root_event_key,
                     record.source.value,
                     record.source_event_key,
                     record.created_at,
@@ -1383,6 +1727,91 @@ class SQLiteGitHubStore:
             ):
                 raise ValueError("permit is missing, consumed, or invalidated")
         return self.permit(permit_id)  # type: ignore[return-value]
+
+    def bind_authorized_execution(
+        self,
+        permit_id: str,
+        *,
+        expected_thread_id: str,
+        now: str,
+    ) -> ClaimedEvent:
+        """Atomically validate a permit, claim its exact root, and enter EXECUTING."""
+        with self.transaction(immediate=True) as db:
+            permit = db.execute(
+                "SELECT * FROM execution_permits WHERE permit_id = ?", (permit_id,)
+            ).fetchone()
+            if permit is None or permit["invalidated_at"] or permit["consumed_at"]:
+                raise ValueError("execution permit is unavailable")
+            if permit["thread_id"] != expected_thread_id:
+                raise ValueError("execution permit belongs to another thread")
+            state = db.execute(
+                "SELECT * FROM issue_workflow_state WHERE thread_id = ?",
+                (expected_thread_id,),
+            ).fetchone()
+            plan = db.execute(
+                "SELECT * FROM issue_plans WHERE plan_id = ?", (permit["plan_id"],)
+            ).fetchone()
+            if state is None or plan is None:
+                raise ValueError("execution permit references missing workflow data")
+            if (
+                state["phase"] != WorkflowPhase.EXECUTION_READY.value
+                or state["cycle_id"] != permit["cycle_id"]
+                or state["current_plan_id"] != permit["plan_id"]
+                or plan["version"] != permit["plan_version"]
+                or plan["status"]
+                not in (PlanStatus.APPROVED.value, PlanStatus.AUTO_APPROVED.value)
+                or plan["root_event_key"] != permit["root_event_key"]
+            ):
+                raise ValueError("execution permit is stale")
+            row = db.execute(
+                """SELECT se.*, thread.issue_number,
+                          ee.status AS execution_status
+                   FROM source_events se
+                   JOIN issue_threads thread ON thread.thread_id = se.thread_id
+                   LEFT JOIN event_executions ee ON ee.event_key = se.event_key
+                   WHERE se.event_key = ?""",
+                (permit["root_event_key"],),
+            ).fetchone()
+            if row is None or row["thread_id"] != expected_thread_id:
+                raise ValueError("permit root event does not match the thread")
+            if row["execution_status"] not in (
+                None,
+                ExecutionStatus.RETRY_PENDING.value,
+            ):
+                raise ValueError("permit root event is not claimable")
+            self._assert_event_ordering(db, row)
+            retrying = row["execution_status"] == ExecutionStatus.RETRY_PENDING.value
+            if retrying:
+                db.execute(
+                    """UPDATE event_executions SET status = ?, attempt_count =
+                       attempt_count + 1, started_at = ?, completed_at = NULL,
+                       error_message = NULL WHERE event_key = ?""",
+                    (ExecutionStatus.RUNNING.value, now, row["event_key"]),
+                )
+            else:
+                db.execute(
+                    """INSERT INTO event_executions(
+                       event_key, thread_id, status, attempt_count, started_at)
+                       VALUES (?, ?, ?, 1, ?)""",
+                    (
+                        row["event_key"],
+                        expected_thread_id,
+                        ExecutionStatus.RUNNING.value,
+                        now,
+                    ),
+                )
+            db.execute(
+                "UPDATE execution_permits SET consumed_at = ? "
+                "WHERE permit_id = ? AND consumed_at IS NULL "
+                "AND invalidated_at IS NULL",
+                (now, permit_id),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase = ?, updated_at = ? "
+                "WHERE thread_id = ?",
+                (WorkflowPhase.EXECUTING.value, now, expected_thread_id),
+            )
+            return self._claimed_event(row, retrying=retrying)
 
     def invalidate_permits(self, thread_id: str, cycle_id: int, *, now: str) -> None:
         with self.transaction(immediate=True) as db:
@@ -1426,7 +1855,150 @@ class SQLiteGitHubStore:
                     claimed_at,
                 ),
             )
+            if purpose != InputPurpose.CYCLE_ROOT:
+                self._resolve_workflow_control(
+                    db,
+                    event_key=event_key,
+                    thread_id=thread_id,
+                    claimed_at=claimed_at,
+                    purpose=purpose,
+                )
         return self.input_consumption(event_key)  # type: ignore[return-value]
+
+    @staticmethod
+    def _resolve_workflow_control(
+        db: sqlite3.Connection,
+        *,
+        event_key: str,
+        thread_id: str,
+        claimed_at: str,
+        purpose: InputPurpose,
+    ) -> None:
+        existing = db.execute(
+            "SELECT status FROM event_executions WHERE event_key = ?", (event_key,)
+        ).fetchone()
+        if existing is not None and existing[0] not in (ExecutionStatus.SKIPPED.value,):
+            raise ValueError("workflow control input already has code execution state")
+        db.execute(
+            """INSERT INTO event_executions(
+               event_key, thread_id, status, attempt_count, started_at,
+               completed_at, error_message)
+               VALUES (?, ?, ?, 0, ?, ?, ?)
+               ON CONFLICT(event_key) DO UPDATE SET status = excluded.status,
+               completed_at = excluded.completed_at,
+               error_message = excluded.error_message""",
+            (
+                event_key,
+                thread_id,
+                ExecutionStatus.SKIPPED.value,
+                claimed_at,
+                claimed_at,
+                f"workflow control input: {purpose.value}",
+            ),
+        )
+
+    def claim_event_for_execution(
+        self,
+        event_key: str,
+        *,
+        expected_thread_id: str,
+        now: str,
+    ) -> ClaimedEvent:
+        with self.transaction(immediate=True) as db:
+            row = db.execute(
+                """SELECT se.*, thread.issue_number,
+                          ee.status AS execution_status
+                   FROM source_events se
+                   JOIN issue_threads thread ON thread.thread_id = se.thread_id
+                   LEFT JOIN event_executions ee ON ee.event_key = se.event_key
+                   WHERE se.event_key = ?""",
+                (event_key,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("target execution event does not exist")
+            if row["thread_id"] != expected_thread_id:
+                raise ValueError("target execution event belongs to another thread")
+            status = row["execution_status"]
+            if status not in (None, ExecutionStatus.RETRY_PENDING.value):
+                raise ValueError("target execution event is not claimable")
+            self._assert_event_ordering(db, row)
+            if status == ExecutionStatus.RETRY_PENDING.value:
+                db.execute(
+                    """UPDATE event_executions SET status = ?, attempt_count =
+                       attempt_count + 1, started_at = ?, completed_at = NULL,
+                       error_message = NULL WHERE event_key = ?""",
+                    (ExecutionStatus.RUNNING.value, now, event_key),
+                )
+                retrying = True
+            else:
+                db.execute(
+                    """INSERT INTO event_executions(
+                       event_key, thread_id, status, attempt_count, started_at)
+                       VALUES (?, ?, ?, 1, ?)""",
+                    (event_key, expected_thread_id, ExecutionStatus.RUNNING.value, now),
+                )
+                retrying = False
+            return self._claimed_event(row, retrying=retrying)
+
+    @staticmethod
+    def _assert_event_ordering(db: sqlite3.Connection, row: sqlite3.Row) -> None:
+        earlier = db.execute(
+            """SELECT se.event_key, ee.status, ep.status AS publication_status
+               FROM source_events se
+               LEFT JOIN event_executions ee ON ee.event_key = se.event_key
+               LEFT JOIN event_publications ep ON ep.event_key = se.event_key
+               WHERE se.thread_id = ? AND (
+                 se.source_updated_at < ? OR
+                 (se.source_updated_at = ? AND se.discovered_at < ?) OR
+                 (se.source_updated_at = ? AND se.discovered_at = ? AND
+                  se.event_key < ?)
+               ) ORDER BY se.source_updated_at, se.discovered_at, se.event_key""",
+            (
+                row["thread_id"],
+                row["source_updated_at"],
+                row["source_updated_at"],
+                row["discovered_at"],
+                row["source_updated_at"],
+                row["discovered_at"],
+                row["event_key"],
+            ),
+        ).fetchall()
+        for item in earlier:
+            if item["status"] == ExecutionStatus.SKIPPED.value:
+                continue
+            if item["status"] == ExecutionStatus.SUCCEEDED.value and item[
+                "publication_status"
+            ] in (
+                PublicationStatus.COMPLETED.value,
+                PublicationStatus.NO_CHANGES.value,
+            ):
+                continue
+            raise ValueError("earlier IssueThread event is unresolved")
+
+    @staticmethod
+    def _claimed_event(row: sqlite3.Row, *, retrying: bool) -> ClaimedEvent:
+        return ClaimedEvent(
+            event_key=row["event_key"],
+            thread_id=row["thread_id"],
+            repo_id=row["repo_id"],
+            repo_full_name=row["repo_full_name"],
+            issue_number=row["issue_number"],
+            body=row["body"],
+            workspace_path=None,
+            retrying=retrying,
+            origin_surface=row["origin_surface"],
+            path=row["path"],
+            line=row["line"],
+            start_line=row["start_line"],
+            side=row["side"],
+            start_side=row["start_side"],
+            diff_hunk=row["diff_hunk"],
+            commit_id=row["commit_id"],
+            original_commit_id=row["original_commit_id"],
+            in_reply_to_id=row["in_reply_to_id"],
+            pull_request_review_id=row["pull_request_review_id"],
+            review_thread_root_id=row["review_thread_root_id"],
+        )
 
     def unconsumed_inputs(self, thread_id: str, *, after_event_key: str | None = None):
         rows = self.source_events_for_thread(thread_id)

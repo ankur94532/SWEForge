@@ -44,6 +44,7 @@ class TaskRunner(Protocol):
         memory_store: BaseStore | None,
         memory_namespace: tuple[str, ...] | None,
         live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
+        live_delivered_event_keys: set[str] | None = None,
     ) -> str: ...
 
 
@@ -195,6 +196,10 @@ def execute_one(
     memory_store: BaseStore | None = None,
     now: Callable[[], datetime] | None = None,
     live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
+    live_delivered_event_keys: set[str] | None = None,
+    approved_plan_text: str | None = None,
+    approved_plan_id: str | None = None,
+    approved_plan_version: int | None = None,
 ) -> ExecutionResult:
     clock = now or (lambda: datetime.now(UTC))
     event = store.claim_next_event(now=utc_timestamp(clock()))
@@ -213,6 +218,10 @@ def execute_one(
                 runner=runner,
                 memory_store=memory_store,
                 live_input_provider=live_input_provider,
+                live_delivered_event_keys=live_delivered_event_keys,
+                approved_plan_text=approved_plan_text,
+                approved_plan_id=approved_plan_id,
+                approved_plan_version=approved_plan_version,
                 now=clock,
             )
     except ThreadLockUnavailable:
@@ -242,6 +251,10 @@ def _execute_claim(
     runner: TaskRunner,
     memory_store: BaseStore | None,
     live_input_provider: Callable[[], list[tuple[str, str]]] | None,
+    live_delivered_event_keys: set[str] | None,
+    approved_plan_text: str | None,
+    approved_plan_id: str | None,
+    approved_plan_version: int | None,
     now: Callable[[], datetime],
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
@@ -292,6 +305,13 @@ def _execute_claim(
             )
         else:
             task = format_source_context(event, task)
+        if approved_plan_text is not None:
+            task += (
+                f"\n\n[Approved SWEForge Plan v{approved_plan_version} "
+                f"{approved_plan_id}]\n{approved_plan_text[:12_000]}\n"
+                "SWEForge application code authorized this exact plan. Execute it; "
+                "do not decide whether approval is valid."
+            )
         memory_namespace = repo_memory_namespace(event.repo_id)
         if memory_store is not None:
             ensure_repo_memory(memory_store, memory_namespace)
@@ -308,6 +328,8 @@ def _execute_claim(
         }
         if live_input_provider is not None:
             runner_kwargs["live_input_provider"] = live_input_provider
+        if live_delivered_event_keys is not None:
+            runner_kwargs["live_delivered_event_keys"] = live_delivered_event_keys
         response = runner(**runner_kwargs)
         changed = tuple(workspace.changed_files())
         diff = workspace.diff()

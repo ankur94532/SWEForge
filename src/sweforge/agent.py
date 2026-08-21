@@ -33,8 +33,13 @@ class LiveInputMiddleware(AgentMiddleware):
     by LangGraph message IDs.
     """
 
-    def __init__(self, pending: Callable[[], list[tuple[str, str]]]) -> None:
+    def __init__(
+        self,
+        pending: Callable[[], list[tuple[str, str]]],
+        delivered_event_keys: set[str] | None = None,
+    ) -> None:
         self.pending = pending
+        self.delivered_event_keys = delivered_event_keys
 
     def before_model(self, state, runtime):
         existing = {
@@ -42,11 +47,16 @@ class LiveInputMiddleware(AgentMiddleware):
             for message in state.get("messages", [])
             if getattr(message, "id", None)
         }
-        messages = [
-            HumanMessage(content=body, id=_live_message_id(event_key))
-            for event_key, body in self.pending()
-            if _live_message_id(event_key) not in existing
-        ]
+        messages = []
+        for event_key, body in self.pending():
+            message_id = _live_message_id(event_key)
+            if message_id in existing:
+                if self.delivered_event_keys is not None:
+                    self.delivered_event_keys.add(event_key)
+                continue
+            messages.append(HumanMessage(content=body, id=message_id))
+            if self.delivered_event_keys is not None:
+                self.delivered_event_keys.add(event_key)
         return {"messages": messages} if messages else None
 
 
@@ -111,6 +121,7 @@ def run_task(
     memory_store: BaseStore | None = None,
     memory_namespace: tuple[str, ...] | None = None,
     live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
+    live_delivered_event_keys: set[str] | None = None,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
@@ -129,7 +140,7 @@ def run_task(
         else None
     )
     middleware = (
-        [LiveInputMiddleware(live_input_provider)]
+        [LiveInputMiddleware(live_input_provider, live_delivered_event_keys)]
         if live_input_provider is not None
         else []
     )

@@ -146,8 +146,13 @@ class WorkflowGitHub:
     def review_comments_for_pull_request(self, repo, number):
         return self.created
 
-    def create_review_comment_reply(self, repo, comment_id, body):
-        item = {"id": len(self.created) + 1, "body": body, "reply_to": comment_id}
+    def create_review_comment_reply(self, repo, pull_number, comment_id, body):
+        item = {
+            "id": len(self.created) + 1,
+            "body": body,
+            "reply_to": comment_id,
+            "pull_number": pull_number,
+        }
         self.created.append(item)
         return item
 

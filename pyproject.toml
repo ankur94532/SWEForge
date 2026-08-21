@@ -14,7 +14,7 @@ dependencies = [
 [project.scripts]
 sweforge = "sweforge.cli:main"
 sweforge-github-poll = "sweforge.github_poll_cli:main"
-sweforge-github-execute = "sweforge.github_execute_cli:main"
+sweforge-github-workflow = "sweforge.workflow_cli:main"
 sweforge-github-execution = "sweforge.github_execution_cli:main"
 sweforge-github-publish = "sweforge.github_publish_cli:main"
 sweforge-repo-memory = "sweforge.repo_memory_cli:main"
