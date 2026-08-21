@@ -346,4 +346,5 @@ def expected_github_remote(api_url: str, full_name: str) -> str:
     path = parsed.path.rstrip("/")
     if path.endswith("/api/v3"):
         path = path[:-7]
-    return f"https://{parsed.netloc}{path}/{full_name}.git"
+    host = "github.com" if parsed.netloc == "api.github.com" else parsed.netloc
+    return f"https://{host}{path}/{full_name}.git"

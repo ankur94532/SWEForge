@@ -1,7 +1,7 @@
 import subprocess
 
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
-from sweforge.github_publisher import GitHubPublisher
+from sweforge.github_publisher import GitHubPublisher, expected_github_remote
 from sweforge.github_store import (
     PublicationStatus,
     SQLiteGitHubStore,
@@ -202,3 +202,14 @@ def test_follow_up_without_changes_does_not_republish_old_commit(tmp_path):
     assert git(workspace, "rev-parse", "HEAD") == published_sha
     assert len(client.pull_requests_created) == 1
     store.close()
+
+
+def test_expected_github_remote_uses_git_host_for_public_api():
+    assert (
+        expected_github_remote("https://api.github.com", "example/repo")
+        == "https://github.com/example/repo.git"
+    )
+    assert (
+        expected_github_remote("https://github.example/api/v3", "example/repo")
+        == "https://github.example/example/repo.git"
+    )
