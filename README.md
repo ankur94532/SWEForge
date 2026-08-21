@@ -46,3 +46,23 @@ untrusted tasks or repositories.
 Future work may add GitHub polling, durable threads, per-thread
 sandboxes/workspaces, repository-scoped memory/skills/tools, and
 multi-repository execution. Those are planned boundaries, not V0 features.
+
+## GitHub ingestion foundation
+
+The next milestone polls GitHub repositories for `@agent` mentions; it is
+polling-based rather than webhook-based and records durable `SourceEvent` and
+`IssueThread` state without executing an agent.
+
+```bash
+SWEFORGE_GITHUB_TOKEN=... uv run sweforge-github-poll \
+  --repo owner/repository \
+  --repo owner/another-repository \
+  --db ~/.sweforge/state.db
+```
+
+The token is read from `SWEFORGE_GITHUB_TOKEN`, the API URL can be overridden
+with `SWEFORGE_GITHUB_API_URL` or `--api-url`, and the default SQLite database
+path can be overridden with `--db`. Do not commit tokens or the state database.
+
+The boundary is: GitHub → poller → durable `SourceEvent`/`IssueThread`;
+execution comes later.

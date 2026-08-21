@@ -6,10 +6,12 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "deepagents>=0.7.0",
+    "httpx>=0.28.0",
 ]
 
 [project.scripts]
 sweforge = "sweforge.cli:main"
+sweforge-github-poll = "sweforge.github_poll_cli:main"
 
 [dependency-groups]
 dev = [

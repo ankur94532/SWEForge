@@ -5,6 +5,9 @@ __pycache__/
 .env
 .env.*
 !.env.example
+*.db
+*.sqlite
+*.sqlite3
 *.py[cod]
 dist/
 build/
