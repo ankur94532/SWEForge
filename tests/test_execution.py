@@ -663,6 +663,57 @@ def test_failure_blocks_later_until_explicit_retry_or_skip(tmp_path):
     store.close()
 
 
+def test_pull_request_event_claim_uses_original_issue_workspace_number(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(1, "owner/repo")
+    issue = source_event(
+        repo, source_id="1", updated="2026-01-01T00:00:00Z", body="@agent issue"
+    )
+    persist(store, issue)
+    pull_request = source_event(
+        repo,
+        source_id="2",
+        updated="2026-01-01T00:01:00Z",
+        body="@agent follow up",
+        subject_kind=SubjectKind.PULL_REQUEST,
+        number=42,
+    )
+    persist(store, pull_request, "review_comments")
+    store.register_pr_mapping(repo.repo_id, 42, issue.thread_id or "github:1:issue:7")
+    store.claim_next_event(now="first")
+    store.mark_execution_succeeded(
+        issue.event_key,
+        completed_at="first",
+        response_text="done",
+        workspace_path="/workspace",
+        start_head_sha="base",
+        end_head_sha="base",
+        end_dirty=False,
+    )
+    store.save_thread_workspace(
+        ThreadWorkspaceRecord(
+            "github:1:issue:7",
+            repo.repo_id,
+            repo.full_name,
+            7,
+            "/repository",
+            "/workspace",
+            "sweforge/issue-7",
+            "base",
+            "first",
+            "first",
+        )
+    )
+    store.ensure_publication(issue.event_key, now="first")
+    store.update_publication(
+        issue.event_key, status=PublicationStatus.COMPLETED, now="first"
+    )
+    claim = store.claim_next_event(now="second")
+    assert claim and claim.event_key == pull_request.event_key
+    assert claim.issue_number == 7
+    store.close()
+
+
 def test_retry_and_skip_status_transitions_are_safe(tmp_path):
     store = SQLiteGitHubStore(tmp_path / "state.db")
     repo = RepositoryRef(1, "owner/repo")

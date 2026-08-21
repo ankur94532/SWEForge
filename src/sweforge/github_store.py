@@ -400,9 +400,11 @@ class SQLiteGitHubStore:
         with self.transaction(immediate=True) as db:
             row = db.execute(
                 """SELECT se.event_key, se.thread_id, se.repo_id,
-                          se.repo_full_name, se.subject_number, se.body,
+                          se.repo_full_name, thread.issue_number, se.body,
                           ee.status AS execution_status
                    FROM source_events AS se
+                   JOIN issue_threads AS thread
+                     ON thread.thread_id = se.thread_id
                    LEFT JOIN event_executions AS ee
                      ON ee.event_key = se.event_key
                    WHERE se.thread_id IS NOT NULL
@@ -473,7 +475,7 @@ class SQLiteGitHubStore:
                 thread_id=row["thread_id"],
                 repo_id=row["repo_id"],
                 repo_full_name=row["repo_full_name"],
-                issue_number=row["subject_number"],
+                issue_number=row["issue_number"],
                 body=row["body"],
                 workspace_path=None,
                 retrying=retrying,
