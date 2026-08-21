@@ -11,6 +11,8 @@ from sweforge.github_models import (
     format_source_context,
 )
 from sweforge.github_store import (
+    ExecutionStatus,
+    PendingWorkflowInputError,
     PlanStatus,
     SQLiteGitHubStore,
     WorkflowMode,
@@ -99,7 +101,9 @@ def test_plan_feedback_approval_and_permit_bind_current_plan(tmp_path):
 
     plan = engine.start_cycle(event_key=root.event_key, plan_text="v1")
     assert plan.status is PlanStatus.DRAFT
-    store.update_plan(plan.plan_id, status=PlanStatus.POSTED, posted_at="now")
+    store.update_plan(
+        plan.plan_id, status=PlanStatus.POSTED, posted_at="2026-01-01T00:02Z"
+    )
     state = store.workflow_state("github:123:issue:7")
     assert state and state.phase is WorkflowPhase.PLANNING
     # Simulate the crash-safe publication transition used by publish_plan.
@@ -109,7 +113,9 @@ def test_plan_feedback_approval_and_permit_bind_current_plan(tmp_path):
     revised = engine.revise(event_key=feedback.event_key, plan_text="v2")
     assert store.plan(plan.plan_id).status is PlanStatus.SUPERSEDED
     assert revised.version == 2
-    store.update_plan(revised.plan_id, status=PlanStatus.POSTED, posted_at="now")
+    store.update_plan(
+        revised.plan_id, status=PlanStatus.POSTED, posted_at="2026-01-01T00:02Z"
+    )
     state = store.workflow_state(state.thread_id)
     store.save_workflow_state(
         replace(state, phase=WorkflowPhase.WAITING_FOR_PLAN_APPROVAL)
@@ -128,6 +134,7 @@ class WorkflowGitHub:
         self.repo = RepositoryRef(123, "example/repo")
         self.labels = labels or []
         self.created = []
+        self.review_numbers = []
 
     def repository(self, full_name):
         return self.repo
@@ -139,11 +146,16 @@ class WorkflowGitHub:
         return self.created
 
     def create_comment(self, repo, number, body):
-        item = {"id": len(self.created) + 1, "body": body}
+        item = {
+            "id": len(self.created) + 1,
+            "body": body,
+            "created_at": "2026-01-01T00:10:00Z",
+        }
         self.created.append(item)
         return item
 
     def review_comments_for_pull_request(self, repo, number):
+        self.review_numbers.append(number)
         return self.created
 
     def create_review_comment_reply(self, repo, pull_number, comment_id, body):
@@ -168,6 +180,7 @@ def test_auto_posts_plan_and_creates_application_permit(tmp_path):
         event_key=root.event_key, plan_text="v1", mode=WorkflowMode.AUTO
     )
     engine.publish_plan(plan.plan_id)
+    engine.authorize_auto(thread_id="github:123:issue:7")
     state = store.workflow_state("github:123:issue:7")
     permit = store.permit_for_plan(plan.plan_id)
     assert state.phase is WorkflowPhase.EXECUTION_READY
@@ -200,3 +213,215 @@ def test_pr_conversation_plan_and_summary_use_pr_surface(tmp_path):
     )
     assert "execution-summary" in client.created[1]["body"]
     store.close()
+
+
+def test_cycle_two_reuses_thread_and_workspace_metadata(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(123, "example/repo")
+    root = make_event(repo, source_id="1", body="@agent implement X")
+    later = make_event(repo, source_id="4", body="@agent also add metrics")
+    seed(store, [root, later])
+    engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:10:00Z")
+    first = engine.start_cycle(event_key=root.event_key, plan_text="v1")
+    state = store.workflow_state(first.thread_id)
+    store.save_workflow_state(replace(state, phase=WorkflowPhase.IDLE))
+    second = engine.start_cycle(event_key=later.event_key, plan_text="v1")
+    assert second.cycle_id == 2
+    assert second.version == 1
+    assert second.thread_id == first.thread_id
+    assert store.workflow_state(first.thread_id).cycle_id == 2
+    store.close()
+
+
+def test_early_approval_is_skipped_until_fresh_approval(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(123, "example/repo")
+    root = make_event(repo, source_id="1", body="@agent implement X")
+    early = make_event(repo, source_id="2", body="@agent approve")
+    fresh = replace(
+        make_event(repo, source_id="4", body="@agent approve"),
+        source_updated_at="2026-01-01T00:20Z",
+        source_created_at="2026-01-01T00:20Z",
+    )
+    seed(store, [root, early, fresh])
+    client = WorkflowGitHub()
+    engine = WorkflowEngine(
+        store=store, client=client, clock=lambda: "2026-01-01T00:11:00Z"
+    )
+    plan = engine.start_cycle(event_key=root.event_key, plan_text="v1")
+    engine.publish_plan(plan.plan_id)
+    with pytest.raises(ValueError, match="predates"):
+        engine.approve(event_key=early.event_key)
+    assert (
+        store.execution_for_event(early.event_key)["status"] == ExecutionStatus.SKIPPED
+    )
+    permit = engine.approve(event_key=fresh.event_key)
+    assert permit.plan_id == plan.plan_id
+    store.close()
+
+
+def test_mark_posted_repairs_plan_posted_workflow_planning(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(123, "example/repo")
+    root = make_event(repo, source_id="1", body="@agent implement X")
+    seed(store, [root])
+    engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:01:00Z")
+    plan = engine.start_cycle(event_key=root.event_key, plan_text="v1")
+    store.update_plan(
+        plan.plan_id,
+        status=PlanStatus.POSTED,
+        posted_at="2026-01-01T00:02:00Z",
+        posted_comment_id=7,
+    )
+    repaired = store.mark_current_plan_posted(
+        plan.plan_id, comment_id=7, posted_at="2026-01-01T00:02:00Z"
+    )
+    assert repaired.status is PlanStatus.POSTED
+    assert (
+        store.workflow_state(plan.thread_id).phase
+        is WorkflowPhase.WAITING_FOR_PLAN_APPROVAL
+    )
+    store.close()
+
+
+def test_real_pr_mapping_preserves_issue_identity(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(123, "example/repo")
+    issue = make_event(repo, source_id="1", body="@agent implement X")
+    seed(store, [issue])
+    store.register_pr_mapping(repo.repo_id, 42, "github:123:issue:7")
+    pr = replace(
+        issue,
+        source_id="2",
+        source_updated_at="2026-01-01T00:02Z",
+        subject_kind=SubjectKind.PULL_REQUEST,
+        subject_number=42,
+        origin_surface=OriginSurface.PR_CONVERSATION,
+        body="@agent please review the PR",
+    )
+    store.record_batch(
+        repo.repo_id,
+        "issue_comments",
+        [pr],
+        since="now",
+        etag=None,
+        polled_at="now",
+    )
+    persisted = store.source_event(pr.event_key)
+    assert persisted["thread_id"] == "github:123:issue:7"
+    engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:03:00Z")
+    plan = engine.start_cycle(event_key=pr.event_key, plan_text="v1")
+    state = store.workflow_state(plan.thread_id)
+    assert state.issue_number == 7
+    assert state.response_subject_number == 42
+    store.close()
+
+
+def test_inline_plan_idempotency_uses_pr_number(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(123, "example/repo")
+    issue = make_event(repo, source_id="1", body="@agent implement X")
+    seed(store, [issue])
+    store.register_pr_mapping(repo.repo_id, 42, "github:123:issue:7")
+    review = replace(
+        issue,
+        source_id="2",
+        source_updated_at="2026-01-01T00:02Z",
+        subject_kind=SubjectKind.PULL_REQUEST,
+        subject_number=42,
+        origin_surface=OriginSurface.PR_INLINE_REVIEW,
+        review_thread_root_id="2",
+        body="@agent fix this line",
+    )
+    store.record_batch(
+        repo.repo_id,
+        "review_comments",
+        [review],
+        since="now",
+        etag=None,
+        polled_at="now",
+    )
+    client = WorkflowGitHub()
+    engine = WorkflowEngine(
+        store=store, client=client, clock=lambda: "2026-01-01T00:03Z"
+    )
+    plan = engine.start_cycle(event_key=review.event_key, plan_text="v1")
+    engine.publish_plan(plan.plan_id)
+    assert client.review_numbers == [42]
+    store.close()
+
+
+def test_bind_rejects_feedback_arriving_after_approval(tmp_path):
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(123, "example/repo")
+    root = make_event(repo, source_id="1", body="@agent implement X")
+    approval = replace(
+        make_event(repo, source_id="2", body="@agent approve"),
+        source_updated_at="2026-01-01T00:20Z",
+        source_created_at="2026-01-01T00:20Z",
+    )
+    feedback = replace(
+        make_event(repo, source_id="3", body="@agent preserve compatibility"),
+        source_updated_at="2026-01-01T00:21Z",
+        source_created_at="2026-01-01T00:21Z",
+    )
+    seed(store, [root, approval, feedback])
+    client = WorkflowGitHub()
+    engine = WorkflowEngine(
+        store=store, client=client, clock=lambda: "2026-01-01T00:22Z"
+    )
+    plan = engine.start_cycle(event_key=root.event_key, plan_text="v1")
+    engine.publish_plan(plan.plan_id)
+    permit = engine.approve(event_key=approval.event_key)
+    with pytest.raises(PendingWorkflowInputError):
+        store.bind_authorized_execution(
+            permit.permit_id,
+            expected_thread_id=permit.thread_id,
+            now="2026-01-01T00:23Z",
+        )
+    assert store.execution_for_event(root.event_key) is None
+    assert store.workflow_state(permit.thread_id).phase is WorkflowPhase.EXECUTION_READY
+    store.close()
+
+
+def test_existing_permit_root_is_backfilled_on_reopen(tmp_path):
+    path = tmp_path / "state.db"
+    store = SQLiteGitHubStore(path)
+    repo = RepositoryRef(123, "example/repo")
+    root = make_event(repo, source_id="1", body="@agent implement X")
+    approval = replace(
+        make_event(repo, source_id="2", body="@agent approve"),
+        source_updated_at="2026-01-01T00:20Z",
+        source_created_at="2026-01-01T00:20Z",
+    )
+    seed(store, [root, approval])
+    client = WorkflowGitHub()
+    engine = WorkflowEngine(
+        store=store, client=client, clock=lambda: "2026-01-01T00:21Z"
+    )
+    plan = engine.start_cycle(event_key=root.event_key, plan_text="v1")
+    engine.publish_plan(plan.plan_id)
+    permit = engine.approve(event_key=approval.event_key)
+    store.connection.execute(
+        "ALTER TABLE execution_permits RENAME TO execution_permits_new"
+    )
+    store.connection.execute(
+        """CREATE TABLE execution_permits(
+           permit_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
+           cycle_id INTEGER NOT NULL, plan_id TEXT NOT NULL,
+           plan_version INTEGER NOT NULL, source TEXT NOT NULL,
+           source_event_key TEXT, created_at TEXT NOT NULL,
+           consumed_at TEXT, invalidated_at TEXT)"""
+    )
+    store.connection.execute(
+        """INSERT INTO execution_permits
+           SELECT permit_id, thread_id, cycle_id, plan_id, plan_version, source,
+                  source_event_key, created_at, consumed_at, invalidated_at
+           FROM execution_permits_new"""
+    )
+    store.connection.execute("DROP TABLE execution_permits_new")
+    store.connection.commit()
+    store.close()
+    reopened = SQLiteGitHubStore(path)
+    assert reopened.permit(permit.permit_id).root_event_key == root.event_key
+    reopened.close()

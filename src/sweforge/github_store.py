@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
-from .github_models import SourceEvent, SubjectKind
+from .github_models import SourceEvent, SubjectKind, starts_with_agent_invocation
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS source_events (
     source_kind TEXT NOT NULL,
     source_id TEXT NOT NULL,
     source_updated_at TEXT NOT NULL,
+    source_created_at TEXT,
     subject_kind TEXT NOT NULL,
     subject_number INTEGER NOT NULL,
     author_login TEXT,
@@ -125,6 +126,7 @@ CREATE TABLE IF NOT EXISTS issue_workflow_state (
     response_comment_id TEXT,
     response_url TEXT,
     review_thread_root_id TEXT,
+    planning_feedback_event_key TEXT REFERENCES source_events(event_key),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -234,6 +236,13 @@ class InputPurpose(StrEnum):
     LIVE_PLANNING_INPUT = "LIVE_PLANNING_INPUT"
     LIVE_EXECUTION_INPUT = "LIVE_EXECUTION_INPUT"
     PLAN_APPROVAL = "PLAN_APPROVAL"
+    EARLY_PLAN_APPROVAL = "EARLY_PLAN_APPROVAL"
+
+
+class PendingWorkflowInputError(ValueError):
+    def __init__(self, event_key: str) -> None:
+        self.event_key = event_key
+        super().__init__(f"workflow input requires replanning: {event_key}")
 
 
 RESUMABLE_PUBLICATION_STATUSES = (
@@ -331,6 +340,7 @@ class WorkflowStateRecord:
     response_comment_id: str | None = None
     response_url: str | None = None
     review_thread_root_id: str | None = None
+    planning_feedback_event_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -416,6 +426,9 @@ class SQLiteGitHubStore:
             for row in self.connection.execute("PRAGMA table_info(source_events)")
         }
         source_migrations = {
+            "source_created_at": (
+                "ALTER TABLE source_events ADD COLUMN source_created_at TEXT"
+            ),
             "origin_surface": (
                 "ALTER TABLE source_events ADD COLUMN origin_surface TEXT "
                 "NOT NULL DEFAULT 'ISSUE'"
@@ -467,6 +480,10 @@ class SQLiteGitHubStore:
             "review_thread_root_id": (
                 "ALTER TABLE issue_workflow_state ADD COLUMN review_thread_root_id TEXT"
             ),
+            "planning_feedback_event_key": (
+                "ALTER TABLE issue_workflow_state ADD COLUMN "
+                "planning_feedback_event_key TEXT"
+            ),
         }
         for column, statement in workflow_migrations.items():
             if column not in workflow_columns:
@@ -479,6 +496,12 @@ class SQLiteGitHubStore:
             self.connection.execute(
                 "ALTER TABLE execution_permits ADD COLUMN root_event_key TEXT"
             )
+        self.connection.execute(
+            """UPDATE execution_permits SET root_event_key = (
+               SELECT root_event_key FROM issue_plans
+               WHERE issue_plans.plan_id = execution_permits.plan_id
+            ) WHERE root_event_key IS NULL"""
+        )
 
     def close(self) -> None:
         self.connection.close()
@@ -544,13 +567,14 @@ class SQLiteGitHubStore:
                 db.execute(
                     """INSERT OR IGNORE INTO source_events(
                        event_key, repo_id, repo_full_name, source_kind, source_id,
-                       source_updated_at, subject_kind, subject_number, author_login,
+                       source_updated_at, source_created_at, subject_kind,
+                       subject_number, author_login,
                        body, html_url, thread_id, discovered_at, origin_surface,
                        path, line, start_line, side, start_side, diff_hunk,
                        commit_id, original_commit_id, in_reply_to_id,
                        pull_request_review_id, review_thread_root_id)
                        VALUES (?, ?, ?, ?, ?,
-                               ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?,
                                ?, ?, ?, ?, ?,
                                ?, ?, ?, ?, ?,
                                ?, ?, ?, ?, ?)""",
@@ -561,6 +585,7 @@ class SQLiteGitHubStore:
                         event.source_kind.value,
                         event.source_id,
                         event.source_updated_at,
+                        event.source_created_at,
                         event.subject_kind.value,
                         event.subject_number,
                         event.author_login,
@@ -1244,8 +1269,9 @@ class SQLiteGitHubStore:
                    thread_id, repo_id, repo_full_name, issue_number, phase,
                    cycle_id, root_event_key, current_plan_id, mode, created_at,
                    updated_at, response_surface, response_subject_number,
-                   response_comment_id, response_url, review_thread_root_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   response_comment_id, response_url, review_thread_root_id,
+                   planning_feedback_event_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(thread_id) DO UPDATE SET phase=excluded.phase,
                    cycle_id=excluded.cycle_id, root_event_key=excluded.root_event_key,
                    current_plan_id=excluded.current_plan_id, mode=excluded.mode,
@@ -1254,7 +1280,8 @@ class SQLiteGitHubStore:
                    response_subject_number=excluded.response_subject_number,
                    response_comment_id=excluded.response_comment_id,
                    response_url=excluded.response_url,
-                   review_thread_root_id=excluded.review_thread_root_id""",
+                   review_thread_root_id=excluded.review_thread_root_id,
+                   planning_feedback_event_key=excluded.planning_feedback_event_key""",
                 (
                     record.thread_id,
                     record.repo_id,
@@ -1272,6 +1299,7 @@ class SQLiteGitHubStore:
                     record.response_comment_id,
                     record.response_url,
                     record.review_thread_root_id,
+                    record.planning_feedback_event_key,
                 ),
             )
         return self.workflow_state(record.thread_id)  # type: ignore[return-value]
@@ -1281,6 +1309,14 @@ class SQLiteGitHubStore:
     ) -> PlanRecord:
         """Atomically consume the root and create its plan/state."""
         with self.transaction(immediate=True) as db:
+            existing = db.execute(
+                "SELECT * FROM issue_workflow_state WHERE thread_id = ?",
+                (state.thread_id,),
+            ).fetchone()
+            if existing is not None and existing["phase"] != WorkflowPhase.IDLE.value:
+                raise ValueError("IssueThread already has an active workflow")
+            if existing is not None and state.cycle_id != existing["cycle_id"] + 1:
+                raise ValueError("workflow cycle must advance exactly one step")
             db.execute(
                 """INSERT INTO thread_input_consumptions(
                    event_key, thread_id, cycle_id, purpose, status, claimed_at,
@@ -1327,8 +1363,21 @@ class SQLiteGitHubStore:
                    thread_id, repo_id, repo_full_name, issue_number, phase,
                    cycle_id, root_event_key, current_plan_id, mode, created_at,
                    updated_at, response_surface, response_subject_number,
-                   response_comment_id, response_url, review_thread_root_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   response_comment_id, response_url, review_thread_root_id,
+                   planning_feedback_event_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(thread_id) DO UPDATE SET
+                   repo_id=excluded.repo_id, repo_full_name=excluded.repo_full_name,
+                   issue_number=excluded.issue_number, phase=excluded.phase,
+                   cycle_id=excluded.cycle_id, root_event_key=excluded.root_event_key,
+                   current_plan_id=excluded.current_plan_id, mode=excluded.mode,
+                   updated_at=excluded.updated_at,
+                   response_surface=excluded.response_surface,
+                   response_subject_number=excluded.response_subject_number,
+                   response_comment_id=excluded.response_comment_id,
+                   response_url=excluded.response_url,
+                   review_thread_root_id=excluded.review_thread_root_id,
+                   planning_feedback_event_key=excluded.planning_feedback_event_key""",
                 (
                     state.thread_id,
                     state.repo_id,
@@ -1346,6 +1395,7 @@ class SQLiteGitHubStore:
                     state.response_comment_id,
                     state.response_url,
                     state.review_thread_root_id,
+                    state.planning_feedback_event_key,
                 ),
             )
         return self.plan(plan.plan_id)  # type: ignore[return-value]
@@ -1437,6 +1487,186 @@ class SQLiteGitHubStore:
                 (WorkflowPhase.EXECUTION_READY.value, approved_at, permit.thread_id),
             )
         return self.permit(permit.permit_id)  # type: ignore[return-value]
+
+    def mark_current_plan_posted(
+        self,
+        plan_id: str,
+        *,
+        comment_id: int,
+        posted_at: str,
+    ) -> PlanRecord:
+        with self.transaction(immediate=True) as db:
+            row = db.execute(
+                """SELECT p.*, w.phase AS workflow_phase, w.current_plan_id
+                   FROM issue_plans p JOIN issue_workflow_state w
+                   ON w.thread_id = p.thread_id WHERE p.plan_id = ?""",
+                (plan_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown plan")
+            if row["current_plan_id"] != plan_id:
+                raise ValueError("plan is no longer current")
+            if row["workflow_phase"] == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL.value:
+                if row["status"] != PlanStatus.POSTED.value:
+                    raise ValueError("posted workflow has inconsistent plan status")
+                return self.plan(plan_id)  # type: ignore[return-value]
+            if (
+                row["workflow_phase"] == WorkflowPhase.PLANNING.value
+                and row["status"] == PlanStatus.POSTED.value
+            ):
+                db.execute(
+                    "UPDATE issue_workflow_state SET phase = ?, updated_at = ? "
+                    "WHERE thread_id = ?",
+                    (
+                        WorkflowPhase.WAITING_FOR_PLAN_APPROVAL.value,
+                        posted_at,
+                        row["thread_id"],
+                    ),
+                )
+                return self.plan(plan_id)  # type: ignore[return-value]
+            if (
+                row["workflow_phase"] != WorkflowPhase.PLANNING.value
+                or row["status"] != PlanStatus.DRAFT.value
+            ):
+                raise ValueError("plan is not ready for publication")
+            db.execute(
+                "UPDATE issue_plans SET status = ?, posted_at = ?, "
+                "posted_comment_id = ? WHERE plan_id = ?",
+                (PlanStatus.POSTED.value, posted_at, comment_id, plan_id),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase = ?, updated_at = ? "
+                "WHERE thread_id = ?",
+                (
+                    WorkflowPhase.WAITING_FOR_PLAN_APPROVAL.value,
+                    posted_at,
+                    row["thread_id"],
+                ),
+            )
+        return self.plan(plan_id)  # type: ignore[return-value]
+
+    def begin_plan_revision(self, event_key: str, *, now: str) -> WorkflowStateRecord:
+        with self.transaction(immediate=True) as db:
+            event = db.execute(
+                "SELECT thread_id FROM source_events WHERE event_key = ?", (event_key,)
+            ).fetchone()
+            if event is None:
+                raise ValueError("unknown workflow input")
+            state = db.execute(
+                "SELECT * FROM issue_workflow_state WHERE thread_id = ?",
+                (event["thread_id"],),
+            ).fetchone()
+            if state is None or (
+                state["phase"]
+                not in (
+                    WorkflowPhase.WAITING_FOR_PLAN_APPROVAL.value,
+                    WorkflowPhase.EXECUTION_READY.value,
+                )
+                and not (
+                    state["phase"] == WorkflowPhase.PLANNING.value
+                    and state["planning_feedback_event_key"] == event_key
+                )
+            ):
+                raise ValueError("feedback is not currently accepted for planning")
+            db.execute(
+                "UPDATE execution_permits SET invalidated_at = ? "
+                "WHERE thread_id = ? AND cycle_id = ? AND consumed_at IS NULL "
+                "AND invalidated_at IS NULL",
+                (now, event["thread_id"], state["cycle_id"]),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase = ?, "
+                "planning_feedback_event_key = ?, updated_at = ? WHERE thread_id = ?",
+                (
+                    WorkflowPhase.PLANNING.value,
+                    event_key,
+                    now,
+                    event["thread_id"],
+                ),
+            )
+        return self.workflow_state(event["thread_id"])  # type: ignore[return-value]
+
+    def finish_plan_revision(
+        self,
+        *,
+        plan: PlanRecord,
+        feedback_event_key: str,
+        finished_at: str,
+    ) -> PlanRecord:
+        with self.transaction(immediate=True) as db:
+            state = db.execute(
+                "SELECT * FROM issue_workflow_state WHERE thread_id = ?",
+                (plan.thread_id,),
+            ).fetchone()
+            current = db.execute(
+                "SELECT * FROM issue_plans WHERE plan_id = ?",
+                (state["current_plan_id"],) if state else (None,),
+            ).fetchone()
+            if (
+                state is None
+                or current is None
+                or state["phase"] != WorkflowPhase.PLANNING.value
+                or state["planning_feedback_event_key"] != feedback_event_key
+            ):
+                raise ValueError("revision is not the active planning operation")
+            db.execute(
+                "UPDATE issue_plans SET status = ? WHERE plan_id = ?",
+                (PlanStatus.SUPERSEDED.value, current["plan_id"]),
+            )
+            db.execute(
+                """INSERT INTO thread_input_consumptions(
+                   event_key, thread_id, cycle_id, purpose, status, claimed_at,
+                   consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(event_key) DO NOTHING""",
+                (
+                    feedback_event_key,
+                    plan.thread_id,
+                    state["cycle_id"],
+                    InputPurpose.PLAN_FEEDBACK.value,
+                    "CONSUMED",
+                    finished_at,
+                    finished_at,
+                ),
+            )
+            self._resolve_workflow_control(
+                db,
+                event_key=feedback_event_key,
+                thread_id=plan.thread_id,
+                claimed_at=finished_at,
+                purpose=InputPurpose.PLAN_FEEDBACK,
+            )
+            db.execute(
+                """INSERT INTO issue_plans(
+                   plan_id, thread_id, repo_id, repo_full_name, issue_number,
+                   cycle_id, version, root_event_key, plan_text, status,
+                   created_at, posted_at, posted_comment_id, approved_at,
+                   approved_by, approval_event_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    plan.plan_id,
+                    plan.thread_id,
+                    plan.repo_id,
+                    plan.repo_full_name,
+                    plan.issue_number,
+                    plan.cycle_id,
+                    plan.version,
+                    plan.root_event_key,
+                    plan.plan_text,
+                    plan.status.value,
+                    plan.created_at,
+                    plan.posted_at,
+                    plan.posted_comment_id,
+                    plan.approved_at,
+                    plan.approved_by,
+                    plan.approval_event_key,
+                ),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET planning_feedback_event_key = NULL, "
+                "current_plan_id = ?, updated_at = ? WHERE thread_id = ?",
+                (plan.plan_id, finished_at, plan.thread_id),
+            )
+        return self.plan(plan.plan_id)  # type: ignore[return-value]
 
     def revise_current_plan(
         self,
@@ -1774,6 +2004,20 @@ class SQLiteGitHubStore:
             ).fetchone()
             if row is None or row["thread_id"] != expected_thread_id:
                 raise ValueError("permit root event does not match the thread")
+            pending = db.execute(
+                """SELECT event_key, body FROM source_events
+                   WHERE thread_id = ? AND event_key != ?
+                   AND event_key NOT IN (
+                     SELECT event_key FROM thread_input_consumptions
+                   ) ORDER BY source_updated_at, discovered_at, event_key""",
+                (expected_thread_id, permit["root_event_key"]),
+            ).fetchall()
+            for candidate in pending:
+                normalized = candidate["body"].strip().lower()
+                if starts_with_agent_invocation(candidate["body"]) and normalized != (
+                    "@agent approve"
+                ):
+                    raise PendingWorkflowInputError(candidate["event_key"])
             if row["execution_status"] not in (
                 None,
                 ExecutionStatus.RETRY_PENDING.value,
@@ -2017,6 +2261,8 @@ class SQLiteGitHubStore:
     @staticmethod
     def _permit_record(row: sqlite3.Row) -> ExecutionPermit:
         values = dict(row)
+        if values.get("root_event_key") is None:
+            raise ValueError("execution permit migration could not recover root event")
         values["source"] = PermitSource(values["source"])
         return ExecutionPermit(**values)
 

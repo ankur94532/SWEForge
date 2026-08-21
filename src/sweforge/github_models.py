@@ -42,6 +42,7 @@ class SourceEvent:
     author_login: str | None
     body: str
     html_url: str | None
+    source_created_at: str | None = None
     thread_id: str | None = None
     origin_surface: OriginSurface = OriginSurface.ISSUE
     path: str | None = None

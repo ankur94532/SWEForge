@@ -207,6 +207,7 @@ class GitHubPoller:
             source_kind=source_kind,
             source_id=str(item["id"]),
             source_updated_at=item["updated_at"],
+            source_created_at=item.get("created_at"),
             subject_kind=subject_kind,
             subject_number=subject_number,
             author_login=(item.get("user") or {}).get("login"),

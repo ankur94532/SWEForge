@@ -3,7 +3,7 @@
 import hashlib
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -22,6 +22,7 @@ from .github_models import format_source_context, starts_with_agent_invocation
 from .github_store import (
     ExecutionPermit,
     InputPurpose,
+    PendingWorkflowInputError,
     PermitSource,
     PlanRecord,
     PlanStatus,
@@ -67,6 +68,21 @@ def matches_current_conversation_target(event: dict, state) -> bool:
     if state.response_surface == "PR_INLINE_REVIEW":
         return event["review_thread_root_id"] == state.review_thread_root_id
     return True
+
+
+def _is_approval_eligible(event: dict, plan: PlanRecord) -> bool:
+    if not plan.posted_at:
+        return False
+    # Older durable rows lack created_at.  The immutable updated_at snapshot is
+    # the only safe fallback; never treat a missing timestamp as eligible.
+    created = event["source_created_at"] or event["source_updated_at"]
+    return created > plan.posted_at
+
+
+def _is_actionable_feedback(event: dict) -> bool:
+    return starts_with_agent_invocation(event["body"]) and not is_exact_approval(
+        event["body"]
+    )
 
 
 def _stable_id(*parts: object) -> str:
@@ -282,7 +298,9 @@ class WorkflowEngine:
         marker = f"<!-- sweforge:plan:{plan.plan_id} -->"
         inline = state.response_surface == "PR_INLINE_REVIEW"
         comments = (
-            self.client.review_comments_for_pull_request(repo, plan.issue_number)
+            self.client.review_comments_for_pull_request(
+                repo, state.response_subject_number or plan.issue_number
+            )
             if inline
             else self.client.comments(
                 repo, state.response_subject_number or plan.issue_number
@@ -291,7 +309,8 @@ class WorkflowEngine:
         matching = [item for item in comments if marker in (item.get("body") or "")]
         if len(matching) > 1:
             raise WorkspaceError("multiple plan comments are ambiguous")
-        comment_id = int(matching[0]["id"]) if matching else None
+        comment = matching[0] if matching else None
+        comment_id = int(comment["id"]) if comment else None
         if comment_id is None:
             mode = state.mode
             suffix = (
@@ -308,37 +327,24 @@ class WorkflowEngine:
                 reply_to = state.review_thread_root_id or state.response_comment_id
                 if not reply_to:
                     raise WorkspaceError("inline review response target is missing")
-                comment_id = int(
-                    self.client.create_review_comment_reply(
-                        repo,
-                        state.response_subject_number or plan.issue_number,
-                        int(reply_to),
-                        body,
-                    )["id"]
+                comment = self.client.create_review_comment_reply(
+                    repo,
+                    state.response_subject_number or plan.issue_number,
+                    int(reply_to),
+                    body,
                 )
+                comment_id = int(comment["id"])
             else:
-                comment_id = int(
-                    self.client.create_comment(
-                        repo, state.response_subject_number or plan.issue_number, body
-                    )["id"]
+                comment = self.client.create_comment(
+                    repo, state.response_subject_number or plan.issue_number, body
                 )
-        updated = self.store.update_plan(
+                comment_id = int(comment["id"])
+        posted_at = (comment or {}).get("created_at") or self.clock()
+        updated = self.store.mark_current_plan_posted(
             plan.plan_id,
-            status=PlanStatus.POSTED,
-            posted_at=self.clock(),
-            posted_comment_id=comment_id,
+            comment_id=comment_id,
+            posted_at=posted_at,
         )
-        self.store.save_workflow_state(
-            WorkflowStateRecord(
-                **{
-                    **state.__dict__,
-                    "phase": WorkflowPhase.WAITING_FOR_PLAN_APPROVAL,
-                    "updated_at": self.clock(),
-                }
-            )
-        )
-        if self.store.workflow_state(plan.thread_id).mode == WorkflowMode.AUTO:
-            self.authorize_auto(thread_id=plan.thread_id)
         return updated
 
     def approve(
@@ -359,6 +365,14 @@ class WorkflowEngine:
         plan = self.store.current_plan(state.thread_id)
         if plan is None or plan.status != PlanStatus.POSTED:
             raise ValueError("no current posted plan can be approved")
+        if not _is_approval_eligible(event, plan):
+            self._acknowledge_delivered(
+                event_key,
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                purpose=InputPurpose.EARLY_PLAN_APPROVAL,
+            )
+            raise ValueError("approval predates the visible plan")
         timestamp = self.clock()
         permit = ExecutionPermit(
             permit_id="permit-"
@@ -421,10 +435,11 @@ class WorkflowEngine:
             approved_by=None,
             approval_event_key=None,
         )
-        return self.store.revise_current_plan(
-            event_key=event_key,
+        self.store.begin_plan_revision(event_key, now=timestamp)
+        return self.store.finish_plan_revision(
             plan=plan,
-            revised_at=timestamp,
+            feedback_event_key=event_key,
+            finished_at=timestamp,
         )
 
     def validate_permit(self, permit_id: str) -> ExecutionPermit:
@@ -625,7 +640,9 @@ class WorkflowEngine:
         repo = self.client.repository(state.repo_full_name)
         inline = state.response_surface == "PR_INLINE_REVIEW"
         comments = (
-            self.client.review_comments_for_pull_request(repo, state.issue_number)
+            self.client.review_comments_for_pull_request(
+                repo, state.response_subject_number or state.issue_number
+            )
             if inline
             else self.client.comments(
                 repo, state.response_subject_number or state.issue_number
@@ -733,6 +750,14 @@ class WorkflowEngine:
             self.complete_publication(
                 thread_id=thread_id,
                 publication_status=publication.status.value,
+                response_text=(
+                    self.store.execution_for_event(state.root_event_key)[
+                        "response_text"
+                    ]
+                    if self.store.execution_for_event(state.root_event_key)
+                    else ""
+                ),
+                pr_url=publication.pr_url,
             )
             return WorkflowAdvanceResult(
                 WorkflowPhase.IDLE, thread_id, message="finalized"
@@ -760,6 +785,22 @@ class WorkflowEngine:
             plan = self.store.current_plan(thread_id)
             if plan is None:
                 raise ValueError("planning workflow has no current plan")
+            if state.planning_feedback_event_key:
+                feedback_event = self.store.source_event(
+                    state.planning_feedback_event_key
+                )
+                if feedback_event is None:
+                    raise ValueError("revision feedback event is missing")
+                plan = self._replan(
+                    state=state,
+                    feedback=invocation_text(feedback_event["body"])
+                    or feedback_event["body"],
+                    model=model,
+                    repo_paths=repo_paths,
+                    workspace_root=workspace_root,
+                    memory_store=memory_store,
+                    event_key=feedback_event["event_key"],
+                )
             if plan.plan_text == "Planning in progress":
                 plan = self.plan_event(
                     event_key=state.root_event_key,
@@ -780,6 +821,70 @@ class WorkflowEngine:
         pending = self.store.unconsumed_inputs(
             thread_id, after_event_key=state.root_event_key
         )
+        all_pending = list(pending)
+        plan = self.store.current_plan(thread_id)
+        if state.phase == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL and plan is not None:
+            for row in pending:
+                if (
+                    is_exact_approval(row["body"])
+                    and matches_current_conversation_target(row, state)
+                    and not _is_approval_eligible(row, plan)
+                ):
+                    self._acknowledge_delivered(
+                        row["event_key"],
+                        thread_id=thread_id,
+                        cycle_id=state.cycle_id,
+                        purpose=InputPurpose.EARLY_PLAN_APPROVAL,
+                    )
+            pending = self.store.unconsumed_inputs(
+                thread_id, after_event_key=state.root_event_key
+            )
+        if (
+            state.phase == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL
+            and state.mode == WorkflowMode.AUTO
+        ):
+            if self.client is not None:
+                repo = self.client.repository(state.repo_full_name)
+                if not issue_has_auto_label(
+                    self.client.issue(repo, state.issue_number)
+                ):
+                    self.store.save_workflow_state(
+                        replace(
+                            state,
+                            mode=WorkflowMode.INTERACTIVE,
+                            updated_at=self.clock(),
+                        )
+                    )
+                elif any(_is_actionable_feedback(row) for row in all_pending):
+                    row = next(
+                        row for row in all_pending if _is_actionable_feedback(row)
+                    )
+                    revised = self._replan(
+                        state=state,
+                        feedback=invocation_text(row["body"]) or row["body"],
+                        model=model,
+                        repo_paths=repo_paths,
+                        workspace_root=workspace_root,
+                        memory_store=memory_store,
+                        event_key=row["event_key"],
+                    )
+                    if self.client is not None:
+                        revised = self.publish_plan(revised.plan_id)
+                    return WorkflowAdvanceResult(
+                        self.store.workflow_state(thread_id).phase,
+                        thread_id,
+                        plan_id=revised.plan_id,
+                        message="AUTO plan revised",
+                    )
+                else:
+                    permit = self.authorize_auto(thread_id=thread_id)
+                    return WorkflowAdvanceResult(
+                        WorkflowPhase.EXECUTION_READY,
+                        thread_id,
+                        plan_id=permit.plan_id,
+                        permit_id=permit.permit_id,
+                        message="AUTO plan approved",
+                    )
         pending = [
             row for row in pending if matches_current_conversation_target(row, state)
         ]
@@ -814,13 +919,65 @@ class WorkflowEngine:
             )
 
         if state.phase == WorkflowPhase.EXECUTION_READY:
+            feedback = next(
+                (row for row in all_pending if _is_actionable_feedback(row)), None
+            )
+            if feedback is not None:
+                revised = self._replan(
+                    state=state,
+                    feedback=invocation_text(feedback["body"]) or feedback["body"],
+                    model=model,
+                    repo_paths=repo_paths,
+                    workspace_root=workspace_root,
+                    memory_store=memory_store,
+                    event_key=feedback["event_key"],
+                )
+                if self.client is not None:
+                    revised = self.publish_plan(revised.plan_id)
+                if self.store.workflow_state(thread_id).mode == WorkflowMode.AUTO:
+                    permit = self.authorize_auto(thread_id=thread_id)
+                    return WorkflowAdvanceResult(
+                        WorkflowPhase.EXECUTION_READY,
+                        thread_id,
+                        plan_id=permit.plan_id,
+                        permit_id=permit.permit_id,
+                        message="AUTO plan revised",
+                    )
+                return WorkflowAdvanceResult(
+                    self.store.workflow_state(thread_id).phase,
+                    thread_id,
+                    plan_id=revised.plan_id,
+                    message="plan revised",
+                )
             permit = self.store.permit_for_plan(state.current_plan_id or "")
             if permit is None:
                 raise ValueError("execution-ready workflow has no permit")
-            result = self.execute_authorized(
-                permit_id=permit.permit_id,
-                **(execute_kwargs or {}),
-            )
+            try:
+                result = self.execute_authorized(
+                    permit_id=permit.permit_id,
+                    **(execute_kwargs or {}),
+                )
+            except PendingWorkflowInputError as exc:
+                revised = self._replan(
+                    state=state,
+                    feedback=invocation_text(
+                        self.store.source_event(exc.event_key)["body"]
+                    )
+                    or self.store.source_event(exc.event_key)["body"],
+                    model=model,
+                    repo_paths=repo_paths,
+                    workspace_root=workspace_root,
+                    memory_store=memory_store,
+                    event_key=exc.event_key,
+                )
+                if self.client is not None:
+                    revised = self.publish_plan(revised.plan_id)
+                return WorkflowAdvanceResult(
+                    self.store.workflow_state(thread_id).phase,
+                    thread_id,
+                    plan_id=revised.plan_id,
+                    message="plan revised after execution race",
+                )
             return WorkflowAdvanceResult(
                 self.store.workflow_state(thread_id).phase,
                 thread_id,
@@ -847,12 +1004,32 @@ class WorkflowEngine:
         root = self.store.source_event(state.root_event_key)
         if root is None:
             raise ValueError("planning root event is missing")
+        current_state = self.store.workflow_state(state.thread_id)
+        if not (
+            current_state
+            and current_state.phase == WorkflowPhase.PLANNING
+            and current_state.planning_feedback_event_key == event_key
+        ):
+            planning_state = self.store.begin_plan_revision(event_key, now=self.clock())
+        else:
+            planning_state = current_state
+        delivered: set[str] = set()
+
+        def live_inputs() -> list[tuple[str, str]]:
+            return [
+                item
+                for item in self.pending_live_inputs(state.thread_id)
+                if item[0] != event_key
+            ]
+
         context = PlannerContext(
             worktree=workspace.workspace_path,
             memory_store=memory_store,
             memory_namespace=repo_memory_namespace(state.repo_id)
             if memory_store is not None
             else None,
+            live_input_provider=live_inputs,
+            live_delivered_event_keys=delivered,
         )
         plan_text = self.planner(
             context=context,
@@ -862,4 +1039,36 @@ class WorkflowEngine:
                 self.store.source_event(event_key) or {}, feedback
             ),
         )
-        return self.revise(event_key=event_key, plan_text=plan_text)
+        timestamp = self.clock()
+        current = self.store.current_plan(state.thread_id)
+        if current is None:
+            raise ValueError("current plan is missing")
+        revised = replace(
+            current,
+            plan_id="plan-"
+            + _stable_id(
+                state.thread_id, state.cycle_id, current.version + 1, plan_text
+            ),
+            version=current.version + 1,
+            plan_text=plan_text[:MAX_COMMENT_CHARS],
+            status=PlanStatus.DRAFT,
+            created_at=timestamp,
+            posted_at=None,
+            posted_comment_id=None,
+            approved_at=None,
+            approved_by=None,
+            approval_event_key=None,
+        )
+        result = self.store.finish_plan_revision(
+            plan=revised,
+            feedback_event_key=event_key,
+            finished_at=timestamp,
+        )
+        for delivered_event_key in delivered:
+            self._acknowledge_delivered(
+                delivered_event_key,
+                thread_id=state.thread_id,
+                cycle_id=planning_state.cycle_id,
+                purpose=InputPurpose.LIVE_PLANNING_INPUT,
+            )
+        return result
