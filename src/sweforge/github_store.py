@@ -1707,6 +1707,10 @@ class SQLiteGitHubStore:
                 "SELECT * FROM execution_attempts WHERE attempt_id=?",
                 (parent["attempt_id"],) if parent else (None,),
             ).fetchone()
+            attempt_id = f"attempt-{permit_id}"
+            existing = db.execute(
+                "SELECT * FROM execution_attempts WHERE attempt_id=?", (attempt_id,)
+            ).fetchone()
             if (
                 state["cycle_id"] != permit["cycle_id"]
                 or state["root_event_key"] != permit["root_event_key"]
@@ -1722,11 +1726,42 @@ class SQLiteGitHubStore:
                 or parent["root_event_key"] != permit["root_event_key"]
                 or parent["plan_id"] != permit["plan_id"]
                 or parent["plan_version"] != permit["plan_version"]
-                or not latest
                 or not parent_attempt
-                or latest["attempt_id"] != parent_attempt["attempt_id"]
-                or latest["status"] != AttemptStatus.SUCCEEDED.value
-                or (latest["repair_round"] or 0) + 1 != permit["repair_round"]
+                or parent_attempt["status"] != AttemptStatus.SUCCEEDED.value
+                or parent_attempt["thread_id"] != expected_thread_id
+                or parent_attempt["cycle_id"] != permit["cycle_id"]
+                or parent_attempt["root_event_key"] != permit["root_event_key"]
+                or parent_attempt["plan_id"] != permit["plan_id"]
+                or parent_attempt["plan_version"] != permit["plan_version"]
+                or (parent_attempt["repair_round"] or 0) + 1 != permit["repair_round"]
+                or (
+                    existing is not None
+                    and (
+                        existing["kind"] != AttemptKind.REVIEW_REPAIR.value
+                        or existing["status"]
+                        not in (
+                            AttemptStatus.FAILED.value,
+                            AttemptStatus.RUNNING.value,
+                        )
+                        or existing["thread_id"] != expected_thread_id
+                        or existing["cycle_id"] != permit["cycle_id"]
+                        or existing["root_event_key"] != permit["root_event_key"]
+                        or existing["plan_id"] != permit["plan_id"]
+                        or existing["plan_version"] != permit["plan_version"]
+                        or existing["parent_review_id"] != permit["parent_review_id"]
+                        or existing["repair_round"] != permit["repair_round"]
+                        or existing["attempt_number"]
+                        != parent_attempt["attempt_number"] + 1
+                    )
+                )
+                or (
+                    existing is None
+                    and (
+                        not latest
+                        or latest["attempt_id"] != parent_attempt["attempt_id"]
+                        or latest["status"] != AttemptStatus.SUCCEEDED.value
+                    )
+                )
             ):
                 raise ValueError("repair permit binding is stale")
             pending = db.execute(
@@ -1773,10 +1808,6 @@ class SQLiteGitHubStore:
             if pending_event:
                 pass
             else:
-                attempt_id = f"attempt-{permit_id}"
-                existing = db.execute(
-                    "SELECT * FROM execution_attempts WHERE attempt_id=?", (attempt_id,)
-                ).fetchone()
                 if existing:
                     db.execute(
                         "UPDATE execution_attempts SET status=?,retry_count=retry_count+1,completed_at=NULL WHERE attempt_id=?",
@@ -1898,6 +1929,10 @@ class SQLiteGitHubStore:
                 "SELECT * FROM execution_reviews WHERE review_id=?",
                 (attempt["parent_review_id"],) if attempt else (None,),
             ).fetchone()
+            parent_attempt = db.execute(
+                "SELECT * FROM execution_attempts WHERE attempt_id=?",
+                (parent["attempt_id"],) if parent else (None,),
+            ).fetchone()
             latest = db.execute(
                 "SELECT attempt_id FROM execution_attempts WHERE thread_id=? AND cycle_id=? "
                 "ORDER BY attempt_number DESC LIMIT 1",
@@ -1925,6 +1960,9 @@ class SQLiteGitHubStore:
                 or permit["plan_id"] != attempt["plan_id"]
                 or permit["plan_version"] != attempt["plan_version"]
                 or permit["root_event_key"] != attempt["root_event_key"]
+                or attempt["authorization_id"] != permit["permit_id"]
+                or permit["parent_review_id"] != attempt["parent_review_id"]
+                or permit["repair_round"] != attempt["repair_round"]
                 or plan["version"] != attempt["plan_version"]
                 or plan["status"]
                 not in (PlanStatus.APPROVED.value, PlanStatus.AUTO_APPROVED.value)
@@ -1934,7 +1972,15 @@ class SQLiteGitHubStore:
                 or parent["root_event_key"] != attempt["root_event_key"]
                 or parent["plan_id"] != attempt["plan_id"]
                 or parent["plan_version"] != attempt["plan_version"]
-                or parent["attempt_id"] != latest["attempt_id"]
+                or not parent_attempt
+                or parent_attempt["status"] != AttemptStatus.SUCCEEDED.value
+                or parent_attempt["thread_id"] != attempt["thread_id"]
+                or parent_attempt["cycle_id"] != attempt["cycle_id"]
+                or parent_attempt["root_event_key"] != attempt["root_event_key"]
+                or parent_attempt["plan_id"] != attempt["plan_id"]
+                or parent_attempt["plan_version"] != attempt["plan_version"]
+                or parent_attempt["attempt_number"] + 1 != attempt["attempt_number"]
+                or (parent_attempt["repair_round"] or 0) + 1 != attempt["repair_round"]
                 or latest["attempt_id"] != attempt["attempt_id"]
             ):
                 raise ValueError("orphaned repair attempt binding is stale")

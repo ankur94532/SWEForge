@@ -164,6 +164,113 @@ def test_repair_ready_executes_same_workspace_and_reaches_accept(tmp_path):
     assert store.publication_is_eligible(root.event_key)
 
 
+def test_sqlite_orphaned_repair_recovery_validates_parent_attempt(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def git(*args):
+        import subprocess
+
+        return subprocess.run(
+            ["git", *args], cwd=source, check=True, capture_output=True
+        )
+
+    git("init", "-q")
+    (source / "README.md").write_text("base\n")
+    git("add", "README.md")
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "base",
+    )
+    repo = RepositoryRef(1, "example/repo")
+    root = event(repo, "1", "@agent fix the bug", "2026-01-01T00:00:00Z")
+    approval = event(repo, "2", "@agent approve", "2026-01-01T00:01:00Z")
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    seed(store, repo, [root, approval])
+    engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:00:30Z")
+    engine.start_cycle(
+        event_key=root.event_key, plan_text="edit README", posted_comment_id=1
+    )
+    engine.approve(event_key=approval.event_key)
+
+    def runner(**kwargs):
+        Path(kwargs["worktree"], "fixed.txt").write_text("fixed\n")
+        return "executor response"
+
+    execute_kwargs = {
+        "model": "cheap-haiku",
+        "repo_paths": {repo.full_name: source},
+        "workspace_root": tmp_path / "workspaces",
+        "lock_root": tmp_path / "locks",
+        "checkpointer": object(),
+        "runner": runner,
+    }
+    first = engine.advance(
+        thread_id="github:1:issue:7",
+        model="planning-sonnet",
+        repo_paths={repo.full_name: source},
+        workspace_root=tmp_path / "workspaces",
+        execute_kwargs=execute_kwargs,
+    )
+    assert first.phase == WorkflowPhase.REVIEW_EXECUTION
+    engine.reviewer = lambda **_: ExecutionReviewResult(
+        verdict="NEEDS_FIXES", summary="fix it"
+    )
+    review = engine.advance(
+        thread_id="github:1:issue:7",
+        model="planning-sonnet",
+        review_model="review-sonnet",
+        repo_paths={repo.full_name: source},
+        workspace_root=tmp_path / "workspaces",
+        execute_kwargs=execute_kwargs,
+    )
+    assert review.phase == WorkflowPhase.REPAIR_READY
+    permit = store.repair_permit_for_thread("github:1:issue:7")
+    assert permit is not None
+    bound = store.begin_or_resume_repair_attempt(
+        permit.permit_id, now="2026-01-01T00:01:00Z"
+    )
+    assert bound.attempt_number == 2
+    assert bound.kind.value == "REVIEW_REPAIR"
+    assert store.workflow_state("github:1:issue:7").phase == WorkflowPhase.EXECUTING
+
+    recovered = engine.advance(
+        thread_id="github:1:issue:7",
+        model="planning-sonnet",
+        repo_paths={repo.full_name: source},
+        workspace_root=tmp_path / "workspaces",
+        execute_kwargs=execute_kwargs,
+    )
+    assert recovered.phase == WorkflowPhase.REPAIR_READY
+    failed = store.execution_attempt(bound.attempt_id)
+    assert failed is not None
+    assert failed.status.value == "FAILED"
+    assert failed.attempt_id == bound.attempt_id
+    assert failed.repair_round == 1
+    parent = store.execution_review(permit.parent_review_id)
+    assert parent is not None
+    assert parent.attempt_id != bound.attempt_id
+    permit_after = store.repair_permit(permit.permit_id)
+    assert permit_after is not None
+    assert permit_after.consumed_at is None
+    assert permit_after.invalidated_at is None
+
+    resumed = store.begin_or_resume_repair_attempt(
+        permit.permit_id, now="2026-01-01T00:02:00Z"
+    )
+    assert resumed.attempt_id == bound.attempt_id
+    assert resumed.repair_round == bound.repair_round
+    assert resumed.retry_count == 1
+    latest = store.latest_attempt("github:1:issue:7", 1)
+    assert latest is not None
+    assert latest.attempt_id == bound.attempt_id
+
+
 @pytest.mark.parametrize("verdict", ["ACCEPT", "NEEDS_FIXES", "BLOCKED"])
 def test_review_result_verdicts_are_bounded(verdict):
     result = ExecutionReviewResult(verdict=verdict, summary="summary")
