@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+from .capabilities import load_capability_registry
 from .execution import SQLiteCheckpointer
 from .github_auth import DEFAULT_API_VERSION, GitHubAppAuthenticator
 from .github_client import HttpxGitHubClient
@@ -42,6 +43,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--planning-model")
     parser.add_argument("--execution-model")
     parser.add_argument("--review-model")
+    parser.add_argument("--memory-model")
+    parser.add_argument(
+        "--capabilities-config",
+        type=Path,
+        help="trusted operator MCP registry config outside target repositories",
+    )
+    parser.add_argument(
+        "--unsafe-local-shell",
+        action="store_true",
+        help="development-only; disables the strict sandbox boundary",
+    )
     parser.add_argument(
         "--api-url",
         default=os.getenv("SWEFORGE_GITHUB_API_URL", "https://api.github.com"),
@@ -68,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     planning_model = args.planning_model or args.model
     execution_model = args.execution_model or args.model
     review_model = args.review_model or args.model
+    memory_model = args.memory_model or review_model
     if not all((planning_model, execution_model, review_model)):
         print(
             "sweforge-github-workflow: planning, execution, and review "
@@ -89,6 +102,11 @@ def main(argv: list[str] | None = None) -> int:
     store = checkpoints = memory = authenticator = client = None
     try:
         mappings = _repo_paths(args.repo_path)
+        capability_registry = (
+            load_capability_registry(args.capabilities_config)
+            if args.capabilities_config
+            else None
+        )
         authenticator = GitHubAppAuthenticator(
             app_id,
             key_path,
@@ -108,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
             thread_id=args.thread_id,
             model=planning_model,
             review_model=review_model,
+            memory_model=memory_model,
             repo_paths=mappings,
             workspace_root=args.workspace_root,
             memory_store=memory.store,
@@ -118,6 +137,9 @@ def main(argv: list[str] | None = None) -> int:
                 "lock_root": args.lock_root,
                 "checkpointer": checkpoints.saver,
                 "memory_store": memory.store,
+                "capability_registry": capability_registry,
+                "secure_execution": not args.unsafe_local_shell,
+                "unsafe_local_shell": args.unsafe_local_shell,
             },
         )
     except (OSError, RuntimeError, ValueError) as exc:

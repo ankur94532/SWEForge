@@ -13,6 +13,7 @@ from deepagents.backends import (
     StateBackend,
     StoreBackend,
 )
+from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware.permissions import FilesystemPermission
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
@@ -20,6 +21,10 @@ from langgraph.store.base import BaseStore
 
 from .capabilities import RepoCapabilityRegistry, load_repo_mcp_tools
 from .context import RepoAgentContext
+from .execution_security import (
+    SandboxBackendProvider,
+    require_secure_backend,
+)
 from .repo_memory import (
     MEMORY_VIRTUAL_PATH,
     repo_memory_namespace,
@@ -113,8 +118,9 @@ def _build_backend(
     repo_context: RepoAgentContext | None = None,
     memory_namespace: tuple[str, ...] | None = None,
     skills_store: BaseStore | None = None,
+    sandbox_backend: BackendProtocol | None = None,
 ) -> CompositeBackend:
-    local = LocalShellBackend(
+    local = sandbox_backend or LocalShellBackend(
         root_dir=worktree,
         virtual_mode=True,
         env={"PATH": os.environ.get("PATH", "")},
@@ -159,6 +165,9 @@ def run_task(
     memory_namespace: tuple[str, ...] | None = None,
     skills_store: BaseStore | None = None,
     capability_registry: RepoCapabilityRegistry | None = None,
+    sandbox_backend_provider: SandboxBackendProvider | None = None,
+    secure_execution: bool = False,
+    unsafe_local_shell: bool = False,
     live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
     live_delivered_event_keys: set[str] | None = None,
 ) -> str:
@@ -169,6 +178,20 @@ def run_task(
         raise ValueError("repository memory requires authoritative context")
     if repo_context is not None and memory_namespace is not None:
         raise ValueError("callers cannot override the context-derived memory namespace")
+    if repo_context is not None and not secure_execution and not unsafe_local_shell:
+        raise ValueError(
+            "repository-scoped execution must select strict sandbox or explicit "
+            "unsafe local-shell mode"
+        )
+    if repo_context is not None and secure_execution:
+        isolated_backend = require_secure_backend(
+            context=repo_context,
+            worktree=worktree,
+            provider=sandbox_backend_provider,
+            unsafe_local_shell=unsafe_local_shell,
+        )
+    else:
+        isolated_backend = None
     effective_skills_store = skills_store or memory_store
     backend = _build_backend(
         worktree,
@@ -176,6 +199,7 @@ def run_task(
         repo_context=repo_context,
         memory_namespace=memory_namespace,
         skills_store=effective_skills_store,
+        sandbox_backend=isolated_backend,
     )
     memory = [MEMORY_VIRTUAL_PATH] if memory_store is not None else None
     permissions = (

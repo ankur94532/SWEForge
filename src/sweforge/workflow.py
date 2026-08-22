@@ -10,6 +10,7 @@ from pathlib import Path
 
 from langgraph.store.base import BaseStore
 
+from .capabilities import RepoCapabilityRegistry
 from .context import RepoAgentContext
 from .execution import (
     ExecutionResult,
@@ -20,6 +21,7 @@ from .execution import (
     thread_lock,
     utc_timestamp,
 )
+from .execution_security import SandboxBackendProvider
 from .github_client import GitHubClient
 from .github_models import (
     format_source_context,
@@ -50,6 +52,7 @@ from .memory_learning import (
     MemoryLearningStatus,
     RepoMemoryCandidate,
     apply_memory_candidates,
+    curate_repository_memory,
 )
 from .planner import PlannerContext, generate_plan
 from .reviewer import ExecutionReviewResult, ReviewerContext, review_execution
@@ -624,6 +627,10 @@ class WorkflowEngine:
         memory_store: BaseStore | None = None,
         live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
         now: Callable[[], datetime] | None = None,
+        capability_registry: RepoCapabilityRegistry | None = None,
+        sandbox_backend_provider: SandboxBackendProvider | None = None,
+        secure_execution: bool = True,
+        unsafe_local_shell: bool = False,
     ) -> ExecutionResult:
         permit = self.validate_permit(permit_id)
         if live_input_provider is None:
@@ -669,6 +676,10 @@ class WorkflowEngine:
                     checkpointer=checkpointer,
                     runner=runner or run_task,
                     memory_store=memory_store,
+                    capability_registry=capability_registry,
+                    sandbox_backend_provider=sandbox_backend_provider,
+                    secure_execution=secure_execution,
+                    unsafe_local_shell=unsafe_local_shell,
                 )
                 for event_key in delivered:
                     self._acknowledge_delivered(
@@ -727,6 +738,10 @@ class WorkflowEngine:
         memory_store: BaseStore | None = None,
         live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
         now: Callable[[], datetime] | None = None,
+        capability_registry: RepoCapabilityRegistry | None = None,
+        sandbox_backend_provider: SandboxBackendProvider | None = None,
+        secure_execution: bool = True,
+        unsafe_local_shell: bool = False,
     ) -> ExecutionResult:
         """Run a review-authorized repair in the existing cumulative workspace."""
         permit = self.store.repair_permit(permit_id)
@@ -798,6 +813,10 @@ class WorkflowEngine:
                     message_id="sweforge:review-repair:"
                     + hashlib.sha256(permit_id.encode()).hexdigest(),
                     prepared_task=task,
+                    capability_registry=capability_registry,
+                    sandbox_backend_provider=sandbox_backend_provider,
+                    secure_execution=secure_execution,
+                    unsafe_local_shell=unsafe_local_shell,
                 )
                 for event_key in delivered:
                     self._acknowledge_delivered(
@@ -891,6 +910,7 @@ class WorkflowEngine:
         pr_url: str | None = None,
         memory_store: BaseStore | None = None,
         memory_lock_root: str | Path = "~/.sweforge/locks",
+        memory_model: str | None = None,
     ) -> str | None:
         if publication_status not in {"COMPLETED", "NO_CHANGES"}:
             return None
@@ -952,6 +972,21 @@ class WorkflowEngine:
         plan = self.store.current_plan(thread_id)
         if plan:
             self.store.update_plan(plan.plan_id, status=PlanStatus.EXECUTED)
+        learning_now = self.clock()
+        self.store.save_repo_memory_learning(
+            RepoMemoryLearningRecord(
+                event_key=state.root_event_key,
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                repo_id=state.repo_id,
+                status=MemoryLearningStatus.PENDING.value,
+                accepted_candidates=0,
+                rejected_candidates=0,
+                error_message=None,
+                created_at=learning_now,
+                updated_at=learning_now,
+            )
+        )
         self.store.save_workflow_state(
             WorkflowStateRecord(
                 **{
@@ -967,6 +1002,7 @@ class WorkflowEngine:
             workspace_path=workspace.workspace_path if workspace else None,
             memory_store=memory_store,
             lock_root=memory_lock_root,
+            memory_model=memory_model,
         )
         return comment_id
 
@@ -977,23 +1013,47 @@ class WorkflowEngine:
         workspace_path: str | None,
         memory_store: BaseStore | None,
         lock_root: str | Path,
+        memory_model: str | None,
     ) -> None:
         now = self.clock()
         existing = self.store.repo_memory_learning(state.root_event_key)
-        if (
-            existing is not None
-            and existing.status != MemoryLearningStatus.FAILED.value
-        ):
+        if existing is not None and existing.status in {
+            MemoryLearningStatus.UPDATED.value,
+            MemoryLearningStatus.NO_UPDATE.value,
+        }:
             return
         try:
-            candidates = (
-                self.memory_learner(
+            if self.memory_learner and workspace_path:
+                candidates = self.memory_learner(
                     state=state,
                     worktree=workspace_path,
                 )
-                if self.memory_learner and workspace_path
-                else []
-            )
+            elif memory_model and workspace_path and memory_store is not None:
+                workspace_record = self.store.thread_workspace(state.thread_id)
+                plan = self.store.current_plan(state.thread_id)
+                if workspace_record is None:
+                    raise ValueError("repository workspace metadata is missing")
+                inspection = Workspace(
+                    Path(workspace_path),
+                    Path(workspace_path),
+                    workspace_record.base_commit,
+                )
+                from .repo_memory import read_repo_memory, repo_memory_namespace
+
+                candidates = curate_repository_memory(
+                    model=memory_model,
+                    repo_id=state.repo_id,
+                    worktree=workspace_path,
+                    changed_files=inspection.changed_files()[:100],
+                    diff=inspection.diff()[:40_000],
+                    existing_memory=read_repo_memory(
+                        memory_store, repo_memory_namespace(state.repo_id)
+                    )
+                    or "",
+                    plan_text=plan.plan_text if plan else "",
+                )
+            else:
+                candidates = []
             if memory_store is None or not workspace_path:
                 result = MemoryLearningResult(
                     MemoryLearningStatus.NO_UPDATE,
@@ -1335,6 +1395,7 @@ class WorkflowEngine:
         thread_id: str,
         model: str,
         review_model: str | None = None,
+        memory_model: str | None = None,
         repo_paths: dict[str, str | Path],
         workspace_root: str | Path,
         memory_store: BaseStore | None = None,
@@ -1366,6 +1427,25 @@ class WorkflowEngine:
                     WorkflowPhase.REPAIR_READY,
                     thread_id,
                     message="orphaned repair recovered",
+                )
+        if state and state.phase == WorkflowPhase.IDLE:
+            learning = self.store.repo_memory_learning(state.root_event_key)
+            if learning and learning.status in {
+                MemoryLearningStatus.PENDING.value,
+                MemoryLearningStatus.FAILED.value,
+            }:
+                workspace = self.store.thread_workspace(thread_id)
+                self._learn_repository_memory(
+                    state=state,
+                    workspace_path=workspace.workspace_path if workspace else None,
+                    memory_store=memory_store,
+                    lock_root=(execute_kwargs or {}).get(
+                        "memory_lock_root", "~/.sweforge/locks"
+                    ),
+                    memory_model=memory_model,
+                )
+                return WorkflowAdvanceResult(
+                    WorkflowPhase.IDLE, thread_id, message="repository learning retried"
                 )
         if state and state.phase == WorkflowPhase.REVIEW_BLOCKED:
             latest = self.store.latest_attempt(thread_id, state.cycle_id)
@@ -1405,6 +1485,7 @@ class WorkflowEngine:
                 memory_lock_root=(execute_kwargs or {}).get(
                     "memory_lock_root", "~/.sweforge/locks"
                 ),
+                memory_model=memory_model,
             )
             return WorkflowAdvanceResult(
                 WorkflowPhase.IDLE, thread_id, message="finalized"
@@ -1766,6 +1847,10 @@ class WorkflowEngine:
                 checkpointer=kwargs.pop("checkpointer"),
                 runner=kwargs.pop("runner", None),
                 memory_store=kwargs.pop("memory_store", memory_store),
+                capability_registry=kwargs.pop("capability_registry", None),
+                sandbox_backend_provider=kwargs.pop("sandbox_backend_provider", None),
+                secure_execution=kwargs.pop("secure_execution", True),
+                unsafe_local_shell=kwargs.pop("unsafe_local_shell", False),
             )
             return WorkflowAdvanceResult(
                 self.store.workflow_state(thread_id).phase,

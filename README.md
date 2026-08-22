@@ -45,14 +45,20 @@ untrusted tasks or repositories.
 - LANGGRAPH is the durable orchestration/runtime.
 - SWEFORGE owns the SWE-specific lifecycle and composition.
 
-Every GitHub-triggered agent invocation receives its repository authority from
+Every strict GitHub-triggered agent invocation receives its repository authority from
 the persisted IssueThread/SourceEvent, never from model text or repository
 configuration. Memory and skills use separate namespaces derived from the
 stable GitHub repository ID. MCP discovery is filtered by a trusted
 `RepoCapabilityRegistry`, and every MCP call is re-authorized by an interceptor.
 The default task subagent inherits the same runtime context and filesystem
-permissions. Repository A therefore cannot discover or access repository B's
-memory, skills, MCP tools, workspace, or credentials.
+permissions. Strict GitHub execution requires a configured provider-neutral
+sandbox backend and fails closed when none is available. Repository A therefore
+cannot discover or access repository B's memory, skills, MCP tools, workspace,
+or credentials in strict mode.
+
+`LocalShellBackend` is retained only for the standalone development harness and
+the explicit workflow `--unsafe-local-shell` escape hatch. It executes with
+host permissions and does not enforce cross-repository isolation.
 
 Shared memory and skills are read-only to ordinary task agents. Trusted
 operator APIs/CLIs and the application-controlled post-publication learning

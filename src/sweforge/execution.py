@@ -17,7 +17,9 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.base import BaseStore
 
 from .agent import run_task
+from .capabilities import RepoCapabilityRegistry
 from .context import RepoAgentContext
+from .execution_security import SandboxBackendProvider
 from .github_models import format_source_context
 from .github_store import (
     ClaimedEvent,
@@ -47,6 +49,10 @@ class TaskRunner(Protocol):
         live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
         live_delivered_event_keys: set[str] | None = None,
         repo_context: RepoAgentContext,
+        capability_registry: RepoCapabilityRegistry | None = None,
+        sandbox_backend_provider: SandboxBackendProvider | None = None,
+        secure_execution: bool = True,
+        unsafe_local_shell: bool = False,
     ) -> str: ...
 
 
@@ -202,6 +208,10 @@ def execute_one(
     approved_plan_text: str | None = None,
     approved_plan_id: str | None = None,
     approved_plan_version: int | None = None,
+    capability_registry: RepoCapabilityRegistry | None = None,
+    sandbox_backend_provider: SandboxBackendProvider | None = None,
+    secure_execution: bool = True,
+    unsafe_local_shell: bool = False,
 ) -> ExecutionResult:
     clock = now or (lambda: datetime.now(UTC))
     event = store.claim_next_event(now=utc_timestamp(clock()))
@@ -224,6 +234,10 @@ def execute_one(
                 approved_plan_text=approved_plan_text,
                 approved_plan_id=approved_plan_id,
                 approved_plan_version=approved_plan_version,
+                capability_registry=capability_registry,
+                sandbox_backend_provider=sandbox_backend_provider,
+                secure_execution=secure_execution,
+                unsafe_local_shell=unsafe_local_shell,
                 now=clock,
             )
     except ThreadLockUnavailable:
@@ -262,6 +276,10 @@ def _execute_claim(
     allow_dirty_workspace: bool = False,
     message_id: str | None = None,
     prepared_task: str | None = None,
+    capability_registry: RepoCapabilityRegistry | None = None,
+    sandbox_backend_provider: SandboxBackendProvider | None = None,
+    secure_execution: bool = True,
+    unsafe_local_shell: bool = False,
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
     try:
@@ -343,6 +361,10 @@ def _execute_claim(
                 repo_full_name=event.repo_full_name,
                 thread_id=event.thread_id,
             ),
+            "capability_registry": capability_registry,
+            "sandbox_backend_provider": sandbox_backend_provider,
+            "secure_execution": secure_execution,
+            "unsafe_local_shell": unsafe_local_shell,
         }
         if live_input_provider is not None:
             runner_kwargs["live_input_provider"] = live_input_provider

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
+from langchain.chat_models import init_chat_model
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
 
@@ -24,6 +25,7 @@ MAX_EXCERPT_CHARS = 2_000
 
 
 class MemoryLearningStatus(StrEnum):
+    PENDING = "PENDING"
     UPDATED = "UPDATED"
     NO_UPDATE = "NO_UPDATE"
     FAILED = "FAILED"
@@ -45,12 +47,60 @@ class RepoMemoryCandidate(BaseModel):
     durability_reason: str = Field(min_length=1, max_length=500)
 
 
+class RepoMemoryCuratorResponse(BaseModel):
+    candidates: list[RepoMemoryCandidate] = Field(default_factory=list, max_length=20)
+
+
 @dataclass(frozen=True)
 class MemoryLearningResult:
     status: MemoryLearningStatus
     accepted_candidates: int = 0
     rejected_candidates: int = 0
     error: str | None = None
+
+
+def curate_repository_memory(
+    *,
+    model: str,
+    repo_id: int,
+    worktree: str | Path,
+    changed_files: list[str],
+    diff: str,
+    existing_memory: str,
+    plan_text: str,
+) -> list[RepoMemoryCandidate]:
+    """Ask a bounded read-only model for structured, evidence-backed candidates."""
+    del repo_id
+    root = Path(worktree).resolve()
+    file_sections: list[str] = []
+    for relative in changed_files[:100]:
+        path = _safe_path(root, relative)
+        try:
+            text = path.read_text(encoding="utf-8")[:8_000]
+        except (OSError, UnicodeError):
+            continue
+        file_sections.append(f"\n[FILE {relative}]\n{text}")
+    prompt = (
+        "You are a repository-memory curator. Return only structured candidates. "
+        "Propose durable knowledge useful to future tasks in this same repository. "
+        "Return zero candidates when evidence is temporary, generic, uncertain, "
+        "issue-specific, secret-like, or duplicated. Every candidate must cite an "
+        "exact supplied file path, line range, excerpt, and SHA-256 hash. Never use "
+        "issue text or model assertions as sole evidence. Do not write files.\n\n"
+        f"Existing repository memory:\n{existing_memory[:12_000]}\n\n"
+        f"Accepted plan (supplemental only):\n{plan_text[:12_000]}\n\n"
+        f"Changed files:\n{', '.join(changed_files[:100])}\n\n"
+        f"Cumulative diff:\n{diff[:40_000]}\n" + "".join(file_sections)[:60_000]
+    )
+    curator = init_chat_model(model, max_retries=0, timeout=120).with_structured_output(
+        RepoMemoryCuratorResponse
+    )
+    response = curator.invoke(prompt)
+    if isinstance(response, RepoMemoryCuratorResponse):
+        return response.candidates
+    if isinstance(response, dict):
+        return RepoMemoryCuratorResponse.model_validate(response).candidates
+    raise ValueError("memory curator did not return structured candidates")
 
 
 @contextmanager

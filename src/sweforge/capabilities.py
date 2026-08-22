@@ -1,6 +1,8 @@
 """Trusted repo-scoped MCP capability registry and interceptor."""
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import ToolMessage
@@ -46,6 +48,23 @@ class RepoCapabilityRegistry:
     def is_allowed(self, repo_id: int, server_id: str, tool_name: str) -> bool:
         return tool_name in self._approved.get(repo_id, {}).get(server_id, ())
 
+    def approved_tools(self, repo_id: int, server_id: str) -> frozenset[str]:
+        return self._approved.get(repo_id, {}).get(server_id, frozenset())
+
+
+def load_capability_registry(path: str | Path) -> RepoCapabilityRegistry:
+    """Load trusted operator config; target repositories never provide this file."""
+    document = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    registry = RepoCapabilityRegistry()
+    for server_id, connection in document.get("servers", {}).items():
+        if not isinstance(connection, dict):
+            raise ValueError("MCP server connection must be an object")
+        registry.register_server(MCPServerSpec(server_id, connection))
+    for repo_id, servers in document.get("repositories", {}).items():
+        for server_id, tool_names in servers.items():
+            registry.approve(int(repo_id), server_id, set(tool_names))
+    return registry
+
 
 def repo_scope_interceptor(registry: RepoCapabilityRegistry):
     """Return an adapter interceptor that re-authorizes every MCP invocation."""
@@ -90,12 +109,17 @@ async def load_repo_mcp_tools(
             for key, spec in registry.approved_servers(context.repo_id).items()
         },
         tool_interceptors=[repo_scope_interceptor(registry)],
+        tool_name_prefix=True,
         handle_tool_errors=False,
     )
-    tools = await client.get_tools()
-    allowed = registry._approved.get(context.repo_id, {})
-    return [
-        tool
-        for tool in tools
-        if any(tool.name == name for names in allowed.values() for name in names)
-    ], client
+    tools = []
+    for server_id in registry.approved_servers(context.repo_id):
+        server_tools = await client.get_tools(server_name=server_id)
+        allowed = registry.approved_tools(context.repo_id, server_id)
+        prefix = f"{server_id}_"
+        tools.extend(
+            tool
+            for tool in server_tools
+            if tool.name.startswith(prefix) and tool.name[len(prefix) :] in allowed
+        )
+    return tools, client
