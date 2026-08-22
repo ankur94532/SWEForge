@@ -553,8 +553,15 @@ class WorkflowEngine:
         self,
         *,
         permit_id: str,
+        model: str,
+        repo_paths: dict[str, str | Path],
+        workspace_root: str | Path,
+        lock_root: str | Path,
+        checkpointer: object,
+        runner: Callable[..., str] | None = None,
+        memory_store: BaseStore | None = None,
         live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
-        **execute_kwargs,
+        now: Callable[[], datetime] | None = None,
     ) -> ExecutionResult:
         permit = self.validate_permit(permit_id)
         if live_input_provider is None:
@@ -563,9 +570,7 @@ class WorkflowEngine:
                 return self.pending_live_inputs(permit.thread_id)
 
         delivered: set[str] = set()
-        lock_root = execute_kwargs.pop("lock_root")
-        clock = execute_kwargs.pop("now", None) or (lambda: datetime.now(UTC))
-        execute_kwargs.setdefault("memory_store", None)
+        clock = now or (lambda: datetime.now(UTC))
         try:
             with thread_lock(lock_root, permit.thread_id):
                 event = self.store.bind_authorized_execution(
@@ -596,7 +601,12 @@ class WorkflowEngine:
                     approved_plan_id=plan.plan_id,
                     approved_plan_version=plan.version,
                     now=clock,
-                    **execute_kwargs,
+                    model=model,
+                    repo_paths=repo_paths,
+                    workspace_root=workspace_root,
+                    checkpointer=checkpointer,
+                    runner=runner or run_task,
+                    memory_store=memory_store,
                 )
                 for event_key in delivered:
                     self._acknowledge_delivered(

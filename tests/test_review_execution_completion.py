@@ -1,7 +1,9 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from sweforge.execution import recover_stale
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import SQLiteGitHubStore, WorkflowPhase
 from sweforge.reviewer import (
@@ -34,6 +36,173 @@ def seed(store, repo, events):
     store.record_batch(
         repo.repo_id, "issue_comments", events, since="now", etag=None, polled_at="now"
     )
+
+
+def execution_ready_fixture(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=source, check=True, capture_output=True
+        )
+
+    git("init", "-q")
+    (source / "README.md").write_text("base\n")
+    git("add", "README.md")
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "base",
+    )
+    repo = RepositoryRef(1, "example/repo")
+    root = event(repo, "1", "@agent fix the bug", "2026-01-01T00:00:00Z")
+    approval = event(repo, "2", "@agent approve", "2026-01-01T00:01:00Z")
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    seed(store, repo, [root, approval])
+    engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:00:30Z")
+    engine.start_cycle(
+        event_key=root.event_key, plan_text="edit README", posted_comment_id=1
+    )
+    engine.approve(event_key=approval.event_key)
+    execute_kwargs = {
+        "model": "cheap-haiku",
+        "repo_paths": {repo.full_name: source},
+        "workspace_root": tmp_path / "workspaces",
+        "lock_root": tmp_path / "locks",
+        "checkpointer": object(),
+    }
+    return store, engine, repo, root, "github:1:issue:7", execute_kwargs
+
+
+def test_advance_execution_uses_durable_default_runner(monkeypatch, tmp_path):
+    (
+        store,
+        engine,
+        repo,
+        root,
+        thread_id,
+        execute_kwargs,
+    ) = execution_ready_fixture(tmp_path)
+    calls = []
+
+    def runner(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["model"] == "cheap-haiku"
+        assert kwargs["thread_id"] == thread_id
+        assert "edit README" in kwargs["task"]
+        Path(kwargs["worktree"], "fixed.txt").write_text("fixed\n")
+        return "executor response"
+
+    monkeypatch.setattr("sweforge.workflow.run_task", runner)
+    result = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        repo_paths={repo.full_name: execute_kwargs["repo_paths"][repo.full_name]},
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+
+    assert result.phase == WorkflowPhase.REVIEW_EXECUTION
+    assert len(calls) == 1
+    execution = store.execution_for_event(root.event_key)
+    assert execution["status"] == "SUCCEEDED"
+    attempt = store.latest_attempt(thread_id, 1)
+    assert attempt is not None
+    assert attempt.status.value == "SUCCEEDED"
+
+
+def test_execute_authorized_required_arguments_fail_before_mutation(tmp_path):
+    (
+        store,
+        engine,
+        repo,
+        root,
+        thread_id,
+        execute_kwargs,
+    ) = execution_ready_fixture(tmp_path)
+    permit = store.permit_for_plan(store.workflow_state(thread_id).current_plan_id)
+    assert permit is not None
+
+    with pytest.raises(TypeError, match="checkpointer"):
+        engine.execute_authorized(
+            permit_id=permit.permit_id,
+            model=execute_kwargs["model"],
+            repo_paths=execute_kwargs["repo_paths"],
+            workspace_root=execute_kwargs["workspace_root"],
+            lock_root=execute_kwargs["lock_root"],
+        )
+
+    assert store.workflow_state(thread_id).phase == WorkflowPhase.EXECUTION_READY
+    assert store.permit(permit.permit_id).consumed_at is None
+    assert store.execution_for_event(root.event_key) is None
+    assert store.latest_attempt(thread_id, 1) is None
+    assert not execute_kwargs["workspace_root"].exists()
+
+
+def test_initial_execution_recovery_reuses_same_attempt(tmp_path):
+    (
+        store,
+        engine,
+        repo,
+        root,
+        thread_id,
+        execute_kwargs,
+    ) = execution_ready_fixture(tmp_path)
+    permit = store.permit_for_plan(store.workflow_state(thread_id).current_plan_id)
+    assert permit is not None
+    store.bind_authorized_execution(
+        permit.permit_id,
+        expected_thread_id=thread_id,
+        now="2026-01-01T00:00:30Z",
+    )
+    attempt = store.execution_attempt(f"attempt-{permit.permit_id}")
+    assert attempt is not None
+    assert attempt.retry_count == 0
+    assert store.workflow_state(thread_id).phase == WorkflowPhase.EXECUTING
+
+    assert recover_stale(
+        store=store,
+        lock_root=execute_kwargs["lock_root"],
+        older_than_seconds=60,
+        now=datetime(2026, 1, 1, 0, 2, tzinfo=UTC),
+    ) == [root.event_key]
+    assert store.retry_execution(root.event_key).value == "RETRY_PENDING"
+    assert store.workflow_state(thread_id).phase == WorkflowPhase.EXECUTION_READY
+    reusable = store.permit(permit.permit_id)
+    assert reusable is not None
+    assert reusable.consumed_at is None
+    assert reusable.invalidated_at is None
+
+    def runner(**kwargs):
+        Path(kwargs["worktree"], "fixed.txt").write_text("fixed\n")
+        return "executor response"
+
+    execute_kwargs["runner"] = runner
+    result = engine.execute_authorized(
+        permit_id=permit.permit_id,
+        **execute_kwargs,
+    )
+
+    assert result.status == "SUCCEEDED"
+    assert store.workflow_state(thread_id).phase == WorkflowPhase.REVIEW_EXECUTION
+    resumed = store.execution_attempt(attempt.attempt_id)
+    assert resumed is not None
+    assert resumed.attempt_id == attempt.attempt_id
+    assert resumed.attempt_number == 1
+    assert resumed.kind.value == "INITIAL"
+    assert resumed.retry_count == 1
+    assert resumed.status.value == "SUCCEEDED"
+    assert store.execution_for_event(root.event_key)["status"] == "SUCCEEDED"
+    latest = store.latest_attempt(thread_id, 1)
+    assert latest is not None
+    assert latest.attempt_id == attempt.attempt_id
 
 
 def test_direct_success_without_review_is_not_publishable(tmp_path):
