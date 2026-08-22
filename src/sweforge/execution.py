@@ -259,11 +259,13 @@ def _execute_claim(
     persist_execution: bool = True,
     allow_dirty_workspace: bool = False,
     message_id: str | None = None,
-    task_override: str | None = None,
+    prepared_task: str | None = None,
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
     try:
-        task = task_override or normalize_task(event.body)
+        task = (
+            prepared_task if prepared_task is not None else normalize_task(event.body)
+        )
         repository_path = repo_paths.get(event.repo_full_name)
         if repository_path is None:
             raise WorkspaceError(
@@ -307,12 +309,13 @@ def _execute_claim(
                 "existing workspace is dirty before a new IssueThread event"
             )
         start_head_sha = workspace.head_sha()
-        if event.path:
-            task = format_source_context(
-                event, task, _review_context(workspace.path, event)
-            )
-        else:
-            task = format_source_context(event, task)
+        if prepared_task is None:
+            if event.path:
+                task = format_source_context(
+                    event, task, _review_context(workspace.path, event)
+                )
+            else:
+                task = format_source_context(event, task)
         if approved_plan_text is not None:
             task += (
                 f"\n\n[Approved SWEForge Plan v{approved_plan_version} "

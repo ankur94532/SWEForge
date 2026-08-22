@@ -13,6 +13,7 @@ from sweforge.reviewer import (
     ExecutionReviewResult,
     ReviewerContext,
     ReviewerReadError,
+    ReviewFinding,
     _resolve_reviewer_file,
     build_reviewer,
     render_review_evidence,
@@ -44,7 +45,7 @@ def seed(store, repo, events):
     )
 
 
-def execution_ready_fixture(tmp_path):
+def execution_ready_fixture(tmp_path, plan_text="edit README"):
     source = tmp_path / "source"
     source.mkdir()
 
@@ -74,7 +75,7 @@ def execution_ready_fixture(tmp_path):
     seed(store, repo, [root, approval])
     engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:00:30Z")
     engine.start_cycle(
-        event_key=root.event_key, plan_text="edit README", posted_comment_id=1
+        event_key=root.event_key, plan_text=plan_text, posted_comment_id=1
     )
     engine.approve(event_key=approval.event_key)
     execute_kwargs = {
@@ -339,6 +340,94 @@ def test_repair_ready_executes_same_workspace_and_reaches_accept(tmp_path):
     assert store.publication_is_eligible(root.event_key)
 
 
+def test_repair_prompt_preserves_review_feedback_past_external_bound(tmp_path):
+    long_plan = "approved step\n" * 550 + "PLAN_TAIL_SENTINEL"
+    store, engine, repo, root, thread_id, execute_kwargs = execution_ready_fixture(
+        tmp_path, plan_text=long_plan
+    )
+    calls = []
+
+    def runner(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            Path(kwargs["worktree"], "fixed.txt").write_text("fixed\n")
+        return "executor response"
+
+    execute_kwargs["runner"] = runner
+    first = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert first.phase == WorkflowPhase.REVIEW_EXECUTION
+    engine.reviewer = lambda **_: ExecutionReviewResult(
+        verdict="NEEDS_FIXES",
+        summary="REVIEW_SUMMARY_SENTINEL",
+        findings=[
+            ReviewFinding(
+                severity="BLOCKING",
+                path="src/main.py",
+                description="BLOCKING_FINDING_SENTINEL",
+                evidence="evidence",
+            )
+        ],
+        repair_instructions=["REPAIR_INSTRUCTION_SENTINEL"],
+    )
+    reviewed = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        review_model="review-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert reviewed.phase == WorkflowPhase.REPAIR_READY
+
+    repaired = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert repaired.phase == WorkflowPhase.REVIEW_EXECUTION
+    task = calls[1]["task"]
+    assert len(task) <= 50_000
+    assert "PLAN_TAIL_SENTINEL" in task
+    assert "[Execution Review NEEDS_FIXES]" in task
+    assert "REVIEW_SUMMARY_SENTINEL" in task
+    assert "BLOCKING_FINDING_SENTINEL" in task
+    assert "REPAIR_INSTRUCTION_SENTINEL" in task
+    assert "Review " in task
+
+
+def test_distinct_repair_reviews_produce_distinct_tasks():
+    from types import SimpleNamespace
+
+    from sweforge.workflow import _build_repair_task
+
+    plan = SimpleNamespace(version=1, plan_text="approved plan")
+    review_a = SimpleNamespace(
+        review_id="review-a",
+        summary="summary",
+        findings_json="[]",
+        repair_instructions_json='["instruction A"]',
+    )
+    review_b = SimpleNamespace(
+        review_id="review-b",
+        summary="summary",
+        findings_json="[]",
+        repair_instructions_json='["instruction B"]',
+    )
+    task_a = _build_repair_task(plan, review_a)
+    task_b = _build_repair_task(plan, review_b)
+    assert "instruction A" in task_a and "instruction A" not in task_b
+    assert "instruction B" in task_b and "instruction B" not in task_a
+    assert task_a != task_b
+
+
 def test_sqlite_orphaned_repair_recovery_validates_parent_attempt(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -466,6 +555,19 @@ def test_reviewer_prompt_declares_bounded_authority(monkeypatch):
     assert "NEEDS_FIXES" in prompt
     assert "BLOCKED" in prompt
     assert "evidence" in prompt
+    assert "before publication" in prompt
+    assert "Absence of a commit, push, or PR is not itself a defect" in prompt
+
+
+def test_finalizer_prompt_declares_uncommitted_worktree_authority():
+    from sweforge.reviewer import FINALIZER_SYSTEM_PROMPT
+
+    assert "before publication" in FINALIZER_SYSTEM_PROMPT
+    assert (
+        "Absence of a commit, push, or PR is not itself a defect"
+        in FINALIZER_SYSTEM_PROMPT
+    )
+    assert "cumulative diff" in FINALIZER_SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize("path", ["/memories/AGENTS.md", "/memories/notes.md"])

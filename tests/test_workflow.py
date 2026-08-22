@@ -92,6 +92,15 @@ def test_inline_source_context_contains_bounded_review_provenance():
     assert "outdated" in context
 
 
+def test_normal_external_task_remains_bounded():
+    context = format_source_context(
+        {"origin_surface": "ISSUE", "author_login": "alice", "subject_number": 7},
+        "x" * 5_000,
+    )
+    assert len(context) == len("[GitHub issue #7 comment by alice]\n") + 4_000
+    assert context.endswith("x" * 4_000)
+
+
 def test_plan_feedback_approval_and_permit_bind_current_plan(tmp_path):
     store = SQLiteGitHubStore(tmp_path / "state.db")
     repo = RepositoryRef(123, "example/repo")

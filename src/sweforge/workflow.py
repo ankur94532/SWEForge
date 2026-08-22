@@ -50,6 +50,12 @@ from .workspace import ThreadWorkspace, Workspace, WorkspaceError
 
 _PREFIX_RE = re.compile(r"^\s*@agent\b", re.IGNORECASE)
 MAX_COMMENT_CHARS = 12_000
+MAX_REPAIR_PLAN_CHARS = 12_000
+MAX_REPAIR_SUMMARY_CHARS = 2_000
+MAX_REPAIR_FINDINGS_CHARS = 14_000
+MAX_REPAIR_INSTRUCTIONS_CHARS = 12_000
+MAX_REPAIR_REVIEW_CHARS = 30_000
+MAX_REPAIR_TASK_CHARS = 50_000
 
 
 def is_exact_approval(body: str) -> bool:
@@ -106,6 +112,50 @@ def _stable_id(*parts: object) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _bounded_repair_section(text: str, limit: int, label: str) -> str:
+    if len(text) <= limit:
+        return text
+    marker = f"\n[{label} truncated at {limit} characters]"
+    return text[: max(0, limit - len(marker))].rstrip() + marker
+
+
+def _build_repair_task(plan: PlanRecord, parent: ExecutionReviewRecord) -> str:
+    """Build a bounded application-owned task without external-input truncation."""
+    summary = _bounded_repair_section(
+        parent.summary, MAX_REPAIR_SUMMARY_CHARS, "review summary"
+    )
+    findings = _bounded_repair_section(
+        parent.findings_json, MAX_REPAIR_FINDINGS_CHARS, "review findings"
+    )
+    instructions = _bounded_repair_section(
+        parent.repair_instructions_json,
+        MAX_REPAIR_INSTRUCTIONS_CHARS,
+        "repair instructions",
+    )
+    review = (
+        f"Review {parent.review_id}\n"
+        f"Summary\n{summary}\n"
+        f"Findings\n{findings}\n"
+        f"Repair instructions\n{instructions}"
+    )
+    review = _bounded_repair_section(review, MAX_REPAIR_REVIEW_CHARS, "review")
+    authority = (
+        "Fix only the listed deficiencies within the approved plan. Inspect the "
+        "current cumulative workspace, make the smallest corrections, and validate "
+        "them before finishing. Do not expand scope."
+    )
+    suffix = f"\n\n[Execution Review NEEDS_FIXES]\n{review}\n\n[Authority]\n{authority}"
+    plan_limit = min(
+        MAX_REPAIR_PLAN_CHARS,
+        max(0, MAX_REPAIR_TASK_CHARS - len(suffix) - 40),
+    )
+    plan_text = _bounded_repair_section(plan.plan_text, plan_limit, "approved plan")
+    task = f"[Approved SWEForge Plan v{plan.version}]\n{plan_text}{suffix}"
+    if len(task) > MAX_REPAIR_TASK_CHARS:
+        raise ValueError("bounded repair task exceeded its hard maximum")
+    return task
 
 
 @dataclass(frozen=True)
@@ -699,20 +749,10 @@ class WorkflowEngine:
             review_thread_root_id=source["review_thread_root_id"],
         )
         clock = now or (lambda: datetime.now(UTC))
-        review_text = "No parent review available."
         parent = self.store.execution_review(permit.parent_review_id)
-        if parent:
-            review_text = (
-                f"Review {parent.review_id}: {parent.summary}\n"
-                f"{parent.findings_json}\n{parent.repair_instructions_json}"
-            )
-        task = (
-            f"[Approved SWEForge Plan v{plan.version}]\n{plan.plan_text}\n\n"
-            f"[Execution Review NEEDS_FIXES]\n{review_text}\n\n"
-            "[Authority]\nFix only the listed deficiencies within the approved plan. "
-            "Inspect the current cumulative workspace, make the smallest corrections, "
-            "and validate them before finishing. Do not expand scope."
-        )
+        if parent is None:
+            raise ValueError("repair permit parent review is unavailable")
+        task = _build_repair_task(plan, parent)
         if live_input_provider is None:
 
             def live_input_provider():
@@ -745,7 +785,7 @@ class WorkflowEngine:
                     allow_dirty_workspace=True,
                     message_id="sweforge:review-repair:"
                     + hashlib.sha256(permit_id.encode()).hexdigest(),
-                    task_override=task,
+                    prepared_task=task,
                 )
                 for event_key in delivered:
                     self._acknowledge_delivered(
