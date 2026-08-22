@@ -35,17 +35,30 @@ untrusted tasks or repositories.
 
 ## Conceptual boundaries
 
-- TOOLS are what the agent can do.
-- SKILLS are specialized procedural knowledge.
-- MEMORY is previously learned repository knowledge.
+- TOOLS are programmatic capabilities, including approved LangChain MCP tools.
+- SKILLS are repo-scoped procedural knowledge loaded natively by Deep Agents.
+- MEMORY is repo-scoped durable knowledge in the LangGraph Store.
+- STATE is IssueThread-local workflow history and checkpoints.
+- CONTEXT is immutable invocation authority, including repository identity.
 - MODEL is the reasoning engine.
 - DEEP AGENTS is the inner agent harness.
 - LANGGRAPH is the durable orchestration/runtime.
 - SWEFORGE owns the SWE-specific lifecycle and composition.
 
-Future work may add per-thread sandboxes/workspaces,
-repository-scoped skills/tools, and multi-repository execution. Those
-are planned boundaries, not V0 features.
+Every GitHub-triggered agent invocation receives its repository authority from
+the persisted IssueThread/SourceEvent, never from model text or repository
+configuration. Memory and skills use separate namespaces derived from the
+stable GitHub repository ID. MCP discovery is filtered by a trusted
+`RepoCapabilityRegistry`, and every MCP call is re-authorized by an interceptor.
+The default task subagent inherits the same runtime context and filesystem
+permissions. Repository A therefore cannot discover or access repository B's
+memory, skills, MCP tools, workspace, or credentials.
+
+Shared memory and skills are read-only to ordinary task agents. Trusted
+operator APIs/CLIs and the application-controlled post-publication learning
+pass are the only mutation paths. Learning is evidence-backed and records
+`UPDATED`, `NO_UPDATE`, or `FAILED` without invalidating an already successful
+publication.
 
 ## GitHub ingestion foundation
 
@@ -154,6 +167,16 @@ uv run sweforge-repo-memory \
 uv run sweforge-repo-memory \
   --state-db ~/.sweforge/state.db \
   --repo owner/repository append --text "Run tests with mvn test."
+```
+
+Trusted repository skills are managed separately and are mounted at
+`/skills/` through the repo-scoped Store namespace:
+
+```bash
+uv run sweforge-repo-skills --state-db ~/.sweforge/state.db \
+  --repo owner/repository list
+uv run sweforge-repo-skills --state-db ~/.sweforge/state.db \
+  --repo owner/repository put build/SKILL.md --file /secure/operator/path/SKILL.md
 ```
 
 The memory database is separate from `state.db` and the checkpoint database,

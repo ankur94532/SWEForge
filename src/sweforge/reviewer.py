@@ -25,6 +25,7 @@ from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field, ValidationError
 
 from .agent import LiveInputMiddleware
+from .context import RepoAgentContext
 from .execution import normalize_task
 from .github_models import format_source_context
 
@@ -363,6 +364,7 @@ class ExecutionReviewResult(BaseModel):
 @dataclass(frozen=True)
 class ReviewerContext:
     worktree: str
+    repo_context: RepoAgentContext | None = None
     memory_store: BaseStore | None = None
     memory_namespace: tuple[str, ...] | None = None
     live_input_provider: object | None = None
@@ -808,7 +810,9 @@ def _reviewer_read_tool(context: ReviewerContext) -> StructuredTool:
 
 def build_reviewer(context: ReviewerContext, *, model: str):
     """Build the bounded reviewer-specific read-only inspection agent."""
-    if (context.memory_store is None) != (context.memory_namespace is None):
+    if context.repo_context is None and (context.memory_store is None) != (
+        context.memory_namespace is None
+    ):
         raise ValueError("memory_store and memory_namespace must be supplied together")
     middleware = []
     if context.live_input_provider is not None:
@@ -817,7 +821,22 @@ def build_reviewer(context: ReviewerContext, *, model: str):
                 context.live_input_provider, context.live_delivered_event_keys
             )
         )
-    if context.memory_store is not None and context.memory_namespace is not None:
+    if context.memory_store is not None and context.repo_context is not None:
+        middleware.append(
+            MemoryMiddleware(
+                backend=StoreBackend(
+                    namespace=lambda runtime: (
+                        "sweforge",
+                        "repo",
+                        str(runtime.context.repo_id),
+                        "memory",
+                    ),
+                    store=context.memory_store,
+                ),
+                sources=["/memories/AGENTS.md"],
+            )
+        )
+    elif context.memory_store is not None and context.memory_namespace is not None:
         middleware.append(
             MemoryMiddleware(
                 backend=StoreBackend(
@@ -843,6 +862,7 @@ def build_reviewer(context: ReviewerContext, *, model: str):
             ),
         ],
         system_prompt=INSPECTOR_SYSTEM_PROMPT,
+        context_schema=RepoAgentContext if context.repo_context else None,
     )
 
 
@@ -2777,6 +2797,7 @@ def review_execution(
     inspection_report = InspectionReport()
     inspection_context = ReviewerContext(
         worktree=context.worktree,
+        repo_context=context.repo_context,
         memory_store=context.memory_store,
         memory_namespace=context.memory_namespace,
         live_input_provider=context.live_input_provider,
@@ -2795,13 +2816,18 @@ def review_execution(
     )
     inspection_truncated = False
     try:
-        inspection = build_reviewer(inspection_context, model=model).invoke(
-            {
-                "messages": [
-                    {"role": "user", "content": _bounded_inspection_prompt(evidence)}
-                ]
-            }
-        )
+        inspection_agent = build_reviewer(inspection_context, model=model)
+        inspection_input = {
+            "messages": [
+                {"role": "user", "content": _bounded_inspection_prompt(evidence)}
+            ]
+        }
+        if inspection_context.repo_context is None:
+            inspection = inspection_agent.invoke(inspection_input)
+        else:
+            inspection = inspection_agent.invoke(
+                inspection_input, context=inspection_context.repo_context
+            )
         inspection_report = _structured(inspection, InspectionReport)
     except (ModelCallLimitExceededError, ToolCallLimitExceededError):
         inspection_truncated = True

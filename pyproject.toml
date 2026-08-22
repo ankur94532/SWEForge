@@ -7,7 +7,9 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "deepagents>=0.7.0",
     "httpx>=0.28.0",
+    "langchain-mcp-adapters>=0.3.0",
     "langgraph-checkpoint-sqlite>=3.1.1",
+    "langchain-mcp-adapters>=0.3.0",
     "pyjwt[crypto]>=2.9.0",
 ]
 
@@ -18,6 +20,7 @@ sweforge-github-workflow = "sweforge.workflow_cli:main"
 sweforge-github-execution = "sweforge.github_execution_cli:main"
 sweforge-github-publish = "sweforge.github_publish_cli:main"
 sweforge-repo-memory = "sweforge.repo_memory_cli:main"
+sweforge-repo-skills = "sweforge.skills_cli:main"
 
 [dependency-groups]
 dev = [

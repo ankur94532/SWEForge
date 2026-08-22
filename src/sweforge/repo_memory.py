@@ -15,7 +15,17 @@ DEFAULT_MEMORY_CONTENT = "# SWEForge Repository Memory\n"
 
 def repo_memory_namespace(repo_id: int) -> tuple[str, ...]:
     """Return the stable store namespace for one GitHub repository."""
+    return ("sweforge", "repo", str(repo_id), "memory")
+
+
+def legacy_repo_memory_namespace(repo_id: int) -> tuple[str, ...]:
+    """Namespace used before memory and skills received separate scopes."""
     return ("sweforge", "repo", str(repo_id))
+
+
+def repo_skills_namespace(repo_id: int) -> tuple[str, ...]:
+    """Return the separate durable namespace for one repository's skills."""
+    return ("sweforge", "repo", str(repo_id), "skills")
 
 
 class SQLiteMemoryStore:
@@ -53,6 +63,11 @@ def ensure_repo_memory(store: BaseStore, namespace: tuple[str, ...]) -> None:
     if store.get(namespace, MEMORY_STORE_KEY) is not None:
         return
     legacy = store.get(namespace, LEGACY_MEMORY_STORE_KEY)
+    if legacy is None and len(namespace) == 4 and namespace[-1] == "memory":
+        legacy_namespace = (*namespace[:-1],)
+        legacy = store.get(legacy_namespace, MEMORY_STORE_KEY)
+        if legacy is None:
+            legacy = store.get(legacy_namespace, LEGACY_MEMORY_STORE_KEY)
     if legacy is not None:
         store.put(namespace, MEMORY_STORE_KEY, dict(legacy.value))
         return

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from langgraph.store.base import BaseStore
 
+from .context import RepoAgentContext
 from .execution import (
     ExecutionResult,
     ThreadLockUnavailable,
@@ -37,14 +38,20 @@ from .github_store import (
     PermitSource,
     PlanRecord,
     PlanStatus,
+    RepoMemoryLearningRecord,
     SQLiteGitHubStore,
     ThreadWorkspaceRecord,
     WorkflowMode,
     WorkflowPhase,
     WorkflowStateRecord,
 )
+from .memory_learning import (
+    MemoryLearningResult,
+    MemoryLearningStatus,
+    RepoMemoryCandidate,
+    apply_memory_candidates,
+)
 from .planner import PlannerContext, generate_plan
-from .repo_memory import repo_memory_namespace
 from .reviewer import ExecutionReviewResult, ReviewerContext, review_execution
 from .workspace import ThreadWorkspace, Workspace, WorkspaceError
 
@@ -182,12 +189,14 @@ class WorkflowEngine:
         client: GitHubClient | None = None,
         planner: Callable[..., str] | None = None,
         reviewer: Callable[..., ExecutionReviewResult] | None = None,
+        memory_learner: Callable[..., list[RepoMemoryCandidate]] | None = None,
         clock: Callable[[], str] = _now,
     ) -> None:
         self.store = store
         self.client = client
         self.planner = planner or generate_plan
         self.reviewer = reviewer or review_execution
+        self.memory_learner = memory_learner
         self.clock = clock
 
     def start_cycle(
@@ -327,10 +336,13 @@ class WorkflowEngine:
         delivered: set[str] = set()
         context = PlannerContext(
             worktree=str(workspace.path),
+            repo_context=RepoAgentContext(
+                repo_id=event["repo_id"],
+                repo_full_name=event["repo_full_name"],
+                thread_id=event["thread_id"],
+            ),
             memory_store=memory_store,
-            memory_namespace=repo_memory_namespace(event["repo_id"])
-            if memory_store is not None
-            else None,
+            memory_namespace=None,
             live_input_provider=lambda: self.pending_live_inputs(event["thread_id"]),
             live_delivered_event_keys=delivered,
         )
@@ -877,6 +889,8 @@ class WorkflowEngine:
         response_text: str = "",
         changed_files: tuple[str, ...] = (),
         pr_url: str | None = None,
+        memory_store: BaseStore | None = None,
+        memory_lock_root: str | Path = "~/.sweforge/locks",
     ) -> str | None:
         if publication_status not in {"COMPLETED", "NO_CHANGES"}:
             return None
@@ -947,7 +961,71 @@ class WorkflowEngine:
                 }
             )
         )
+        workspace = self.store.thread_workspace(thread_id)
+        self._learn_repository_memory(
+            state=state,
+            workspace_path=workspace.workspace_path if workspace else None,
+            memory_store=memory_store,
+            lock_root=memory_lock_root,
+        )
         return comment_id
+
+    def _learn_repository_memory(
+        self,
+        *,
+        state: WorkflowStateRecord,
+        workspace_path: str | None,
+        memory_store: BaseStore | None,
+        lock_root: str | Path,
+    ) -> None:
+        now = self.clock()
+        existing = self.store.repo_memory_learning(state.root_event_key)
+        if (
+            existing is not None
+            and existing.status != MemoryLearningStatus.FAILED.value
+        ):
+            return
+        try:
+            candidates = (
+                self.memory_learner(
+                    state=state,
+                    worktree=workspace_path,
+                )
+                if self.memory_learner and workspace_path
+                else []
+            )
+            if memory_store is None or not workspace_path:
+                result = MemoryLearningResult(
+                    MemoryLearningStatus.NO_UPDATE,
+                    rejected_candidates=len(candidates),
+                )
+            else:
+                result = apply_memory_candidates(
+                    memory_store,
+                    repo_id=state.repo_id,
+                    worktree=workspace_path,
+                    candidates=candidates,
+                    lock_root=lock_root,
+                )
+        except Exception as exc:
+            result = MemoryLearningResult(
+                MemoryLearningStatus.FAILED,
+                error=str(exc)[:500],
+            )
+        self.store.save_repo_memory_learning(
+            RepoMemoryLearningRecord(
+                event_key=state.root_event_key,
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                repo_id=state.repo_id,
+                status=result.status.value,
+                accepted_candidates=result.accepted_candidates,
+                rejected_candidates=result.rejected_candidates,
+                error_message=result.error,
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
     def post_blocked_review_comment(
         self, thread_id: str, *, summary: str
@@ -1184,8 +1262,13 @@ class WorkflowEngine:
         result = self.reviewer(
             context=ReviewerContext(
                 worktree=workspace.workspace_path,
+                repo_context=RepoAgentContext(
+                    repo_id=state.repo_id,
+                    repo_full_name=state.repo_full_name,
+                    thread_id=state.thread_id,
+                ),
                 memory_store=memory_store,
-                memory_namespace=repo_memory_namespace(state.repo_id),
+                memory_namespace=None,
                 live_input_provider=lambda: self.pending_live_inputs(state.thread_id),
                 live_delivered_event_keys=review_delivered,
             ),
@@ -1318,6 +1401,10 @@ class WorkflowEngine:
                     else ""
                 ),
                 pr_url=publication.pr_url,
+                memory_store=memory_store,
+                memory_lock_root=(execute_kwargs or {}).get(
+                    "memory_lock_root", "~/.sweforge/locks"
+                ),
             )
             return WorkflowAdvanceResult(
                 WorkflowPhase.IDLE, thread_id, message="finalized"
@@ -1725,10 +1812,13 @@ class WorkflowEngine:
 
         context = PlannerContext(
             worktree=workspace.workspace_path,
+            repo_context=RepoAgentContext(
+                repo_id=state.repo_id,
+                repo_full_name=state.repo_full_name,
+                thread_id=state.thread_id,
+            ),
             memory_store=memory_store,
-            memory_namespace=repo_memory_namespace(state.repo_id)
-            if memory_store is not None
-            else None,
+            memory_namespace=None,
             live_input_provider=live_inputs,
             live_delivered_event_keys=delivered,
         )

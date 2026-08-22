@@ -1,5 +1,6 @@
 """Deep Agent construction and invocation."""
 
+import asyncio
 import hashlib
 import os
 from collections.abc import Callable, Mapping
@@ -17,7 +18,14 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
 from langgraph.store.base import BaseStore
 
-from .repo_memory import MEMORY_VIRTUAL_PATH
+from .capabilities import RepoCapabilityRegistry, load_repo_mcp_tools
+from .context import RepoAgentContext
+from .repo_memory import (
+    MEMORY_VIRTUAL_PATH,
+    repo_memory_namespace,
+    repo_skills_namespace,
+)
+from .skills import SKILLS_VIRTUAL_PATH
 
 
 def _live_message_id(event_key: str) -> str:
@@ -89,11 +97,22 @@ def _normalize_response_text(message: Any) -> str:
     return "\n".join(text_blocks)
 
 
+def _invoke_agent(agent, state, *, config=None, durability=None, context=None):
+    kwargs = {"config": config} if config is not None else {}
+    if durability is not None:
+        kwargs["durability"] = durability
+    if context is not None:
+        kwargs["context"] = context
+    return agent.invoke(state, **kwargs)
+
+
 def _build_backend(
     worktree: str,
     *,
     memory_store: BaseStore | None = None,
+    repo_context: RepoAgentContext | None = None,
     memory_namespace: tuple[str, ...] | None = None,
+    skills_store: BaseStore | None = None,
 ) -> CompositeBackend:
     local = LocalShellBackend(
         root_dir=worktree,
@@ -102,12 +121,24 @@ def _build_backend(
         inherit_env=False,
     )
     routes = {"/sweforge_internal/": StateBackend()}
-    if (memory_store is None) != (memory_namespace is None):
+    if repo_context is None and (memory_store is None) != (memory_namespace is None):
         raise ValueError("memory_store and memory_namespace must be supplied together")
-    if memory_store is not None and memory_namespace is not None:
+    if repo_context is not None and memory_store is not None:
+        routes["/memories/"] = StoreBackend(
+            namespace=lambda runtime: repo_memory_namespace(runtime.context.repo_id),
+            store=memory_store,
+        )
+    elif memory_store is not None and memory_namespace is not None:
+        # Compatibility for the standalone V0 CLI; GitHub workflows always
+        # provide RepoAgentContext and cannot select a namespace themselves.
         routes["/memories/"] = StoreBackend(
             namespace=lambda _runtime: memory_namespace,
             store=memory_store,
+        )
+    if repo_context is not None and skills_store is not None:
+        routes["/skills/"] = StoreBackend(
+            namespace=lambda runtime: repo_skills_namespace(runtime.context.repo_id),
+            store=skills_store,
         )
     return CompositeBackend(
         default=local, routes=routes, artifacts_root="/sweforge_internal/"
@@ -124,24 +155,39 @@ def run_task(
     message_id: str | None = None,
     resume_if_present: bool = False,
     memory_store: BaseStore | None = None,
+    repo_context: RepoAgentContext | None = None,
     memory_namespace: tuple[str, ...] | None = None,
+    skills_store: BaseStore | None = None,
+    capability_registry: RepoCapabilityRegistry | None = None,
     live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
     live_delivered_event_keys: set[str] | None = None,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
         raise ValueError("thread_id is required when a checkpointer is supplied")
+    if memory_store is not None and repo_context is None and memory_namespace is None:
+        raise ValueError("repository memory requires authoritative context")
+    if repo_context is not None and memory_namespace is not None:
+        raise ValueError("callers cannot override the context-derived memory namespace")
+    effective_skills_store = skills_store or memory_store
     backend = _build_backend(
-        worktree, memory_store=memory_store, memory_namespace=memory_namespace
+        worktree,
+        memory_store=memory_store,
+        repo_context=repo_context,
+        memory_namespace=memory_namespace,
+        skills_store=effective_skills_store,
     )
     memory = [MEMORY_VIRTUAL_PATH] if memory_store is not None else None
     permissions = (
         [
             FilesystemPermission(
                 operations=["write"], paths=["/memories/**"], mode="deny"
-            )
+            ),
+            FilesystemPermission(
+                operations=["write"], paths=["/skills/**"], mode="deny"
+            ),
         ]
-        if memory_store is not None
+        if memory_store is not None or skills_store is not None
         else None
     )
     middleware = (
@@ -149,8 +195,16 @@ def run_task(
         if live_input_provider is not None
         else []
     )
+    mcp_tools = []
+    if capability_registry is not None:
+        if repo_context is None:
+            raise ValueError("MCP capabilities require authoritative context")
+        mcp_tools, _ = asyncio.run(
+            load_repo_mcp_tools(capability_registry, repo_context)
+        )
     agent = create_deep_agent(
         model=model,
+        tools=mcp_tools,
         backend=backend,
         system_prompt=(
             "Work only within the provided repository worktree. Inspect the code, "
@@ -162,8 +216,12 @@ def run_task(
             "Summarize what you changed and any validation results."
         ),
         memory=memory,
+        skills=[SKILLS_VIRTUAL_PATH]
+        if effective_skills_store is not None and repo_context is not None
+        else None,
         permissions=permissions,
         store=memory_store,
+        context_schema=RepoAgentContext if repo_context is not None else None,
         checkpointer=checkpointer,
         middleware=middleware,
     )
@@ -187,13 +245,19 @@ def run_task(
                     ]
                 }
         if message_id:
-            result: dict[str, Any] = agent.invoke(
-                input_state, config=config, durability="sync"
+            result: dict[str, Any] = _invoke_agent(
+                agent,
+                input_state,
+                config=config,
+                durability="sync",
+                context=repo_context,
             )
         else:
-            result = agent.invoke(input_state, config=config)
+            result = _invoke_agent(
+                agent, input_state, config=config, context=repo_context
+            )
     else:
-        result = agent.invoke(input_state)
+        result = _invoke_agent(agent, input_state, context=repo_context)
     messages = result.get("messages", [])
     if not messages:
         return ""

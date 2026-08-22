@@ -16,7 +16,13 @@ from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
 
 from .agent import LiveInputMiddleware
-from .repo_memory import MEMORY_VIRTUAL_PATH
+from .context import RepoAgentContext
+from .repo_memory import (
+    MEMORY_VIRTUAL_PATH,
+    repo_memory_namespace,
+    repo_skills_namespace,
+)
+from .skills import SKILLS_VIRTUAL_PATH
 
 MAX_PLAN_CHARS = 12_000
 MAX_STEP_CHARS = 500
@@ -58,6 +64,7 @@ class ReadOnlyFilesystemBackend(FilesystemBackend):
 @dataclass(frozen=True)
 class PlannerContext:
     worktree: str
+    repo_context: RepoAgentContext | None = None
     memory_store: BaseStore | None = None
     memory_namespace: tuple[str, ...] | None = None
     live_input_provider: Any = None
@@ -67,9 +74,20 @@ class PlannerContext:
 def _planner_backend(context: PlannerContext) -> CompositeBackend:
     default = ReadOnlyFilesystemBackend(context.worktree, virtual_mode=True)
     routes: dict[str, Any] = {"/sweforge_internal/": StateBackend()}
-    if (context.memory_store is None) != (context.memory_namespace is None):
+    if context.repo_context is None and (context.memory_store is None) != (
+        context.memory_namespace is None
+    ):
         raise ValueError("memory_store and memory_namespace must be supplied together")
-    if context.memory_store is not None and context.memory_namespace is not None:
+    if context.memory_store is not None and context.repo_context is not None:
+        routes["/memories/"] = StoreBackend(
+            namespace=lambda runtime: repo_memory_namespace(runtime.context.repo_id),
+            store=context.memory_store,
+        )
+        routes["/skills/"] = StoreBackend(
+            namespace=lambda runtime: repo_skills_namespace(runtime.context.repo_id),
+            store=context.memory_store,
+        )
+    elif context.memory_store is not None and context.memory_namespace is not None:
         routes["/memories/"] = StoreBackend(
             namespace=lambda _runtime: context.memory_namespace,  # type: ignore[return-value]
             store=context.memory_store,
@@ -99,8 +117,10 @@ def build_planner(context: PlannerContext, *, model: str):
         model=model,
         backend=_planner_backend(context),
         memory=memory,
+        skills=[SKILLS_VIRTUAL_PATH] if context.repo_context else None,
         permissions=permissions,
         store=context.memory_store,
+        context_schema=RepoAgentContext if context.repo_context else None,
         response_format=PlanResult,
         middleware=middleware,
         system_prompt=(
@@ -142,7 +162,10 @@ def generate_plan(
     )
     if feedback:
         prompt += f"\nPlanning feedback (untrusted user input):\n{feedback}\n"
-    result = agent.invoke({"messages": [{"role": "user", "content": prompt}]})
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": prompt}]},
+        context=context.repo_context,
+    )
     structured = result.get("structured_response")
     if isinstance(structured, PlanResult):
         return render_plan(structured)

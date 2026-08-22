@@ -17,6 +17,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.store.base import BaseStore
 
 from .agent import run_task
+from .context import RepoAgentContext
 from .github_models import format_source_context
 from .github_store import (
     ClaimedEvent,
@@ -45,6 +46,7 @@ class TaskRunner(Protocol):
         memory_namespace: tuple[str, ...] | None,
         live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
         live_delivered_event_keys: set[str] | None = None,
+        repo_context: RepoAgentContext,
     ) -> str: ...
 
 
@@ -335,7 +337,12 @@ def _execute_claim(
             "message_id": message_id or event_message_id(event.event_key),
             "resume_if_present": True,
             "memory_store": memory_store,
-            "memory_namespace": memory_namespace if memory_store is not None else None,
+            "memory_namespace": None,
+            "repo_context": RepoAgentContext(
+                repo_id=event.repo_id,
+                repo_full_name=event.repo_full_name,
+                thread_id=event.thread_id,
+            ),
         }
         if live_input_provider is not None:
             runner_kwargs["live_input_provider"] = live_input_provider

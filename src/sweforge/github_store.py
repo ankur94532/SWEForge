@@ -236,6 +236,18 @@ CREATE TABLE IF NOT EXISTS thread_input_consumptions (
     claimed_at TEXT NOT NULL,
     consumed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS repo_memory_learning (
+    event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    status TEXT NOT NULL,
+    accepted_candidates INTEGER NOT NULL DEFAULT 0,
+    rejected_candidates INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -519,6 +531,20 @@ class WorkflowInputRecord:
     status: str
     claimed_at: str
     consumed_at: str | None
+
+
+@dataclass(frozen=True)
+class RepoMemoryLearningRecord:
+    event_key: str
+    thread_id: str
+    cycle_id: int
+    repo_id: int
+    status: str
+    accepted_candidates: int
+    rejected_candidates: int
+    error_message: str | None
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -2362,6 +2388,42 @@ class SQLiteGitHubStore:
             "SELECT * FROM issue_workflow_state WHERE thread_id = ?", (thread_id,)
         ).fetchone()
         return self._workflow_state_record(row) if row else None
+
+    def repo_memory_learning(self, event_key: str) -> RepoMemoryLearningRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM repo_memory_learning WHERE event_key = ?", (event_key,)
+        ).fetchone()
+        return RepoMemoryLearningRecord(**dict(row)) if row else None
+
+    def save_repo_memory_learning(
+        self, record: RepoMemoryLearningRecord
+    ) -> RepoMemoryLearningRecord:
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO repo_memory_learning(
+                   event_key, thread_id, cycle_id, repo_id, status,
+                   accepted_candidates, rejected_candidates, error_message,
+                   created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(event_key) DO UPDATE SET status=excluded.status,
+                   accepted_candidates=excluded.accepted_candidates,
+                   rejected_candidates=excluded.rejected_candidates,
+                   error_message=excluded.error_message,
+                   updated_at=excluded.updated_at""",
+                (
+                    record.event_key,
+                    record.thread_id,
+                    record.cycle_id,
+                    record.repo_id,
+                    record.status,
+                    record.accepted_candidates,
+                    record.rejected_candidates,
+                    record.error_message,
+                    record.created_at,
+                    record.updated_at,
+                ),
+            )
+        return self.repo_memory_learning(record.event_key)  # type: ignore[return-value]
 
     def save_workflow_state(self, record: WorkflowStateRecord) -> WorkflowStateRecord:
         with self.transaction(immediate=True) as db:
