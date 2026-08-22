@@ -1230,7 +1230,9 @@ class WorkflowEngine:
                     else "{}"
                 ),
                 challenge_json=(
-                    result.challenge_report.model_dump_json()
+                    result.semantic_review.model_dump_json()
+                    if result.semantic_review is not None
+                    else result.challenge_report.model_dump_json()
                     if result.challenge_report is not None
                     else "{}"
                 ),
