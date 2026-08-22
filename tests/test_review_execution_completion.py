@@ -2,15 +2,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from langchain.agents.structured_output import ToolStrategy
 
 from sweforge.execution import recover_stale
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import SQLiteGitHubStore, WorkflowPhase
 from sweforge.reviewer import (
+    REVIEW_INSPECTION_MODEL_CALL_LIMIT,
+    REVIEW_INSPECTION_TOOL_CALL_LIMIT,
     ExecutionReviewResult,
     ReviewerContext,
+    ReviewerReadError,
+    _resolve_reviewer_file,
     build_reviewer,
     render_review_evidence,
+    review_execution,
 )
 from sweforge.workflow import WorkflowEngine
 
@@ -449,11 +455,11 @@ def test_review_result_verdicts_are_bounded(verdict):
 def test_reviewer_prompt_declares_bounded_authority(monkeypatch):
     captured = {}
 
-    def fake_create_deep_agent(**kwargs):
+    def fake_create_agent(**kwargs):
         captured.update(kwargs)
         return object()
 
-    monkeypatch.setattr("sweforge.reviewer.create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr("sweforge.reviewer.create_agent", fake_create_agent)
     build_reviewer(ReviewerContext(worktree="/tmp/worktree"), model="reviewer")
     prompt = captured["system_prompt"]
     assert "exact approved plan" in prompt
@@ -466,11 +472,11 @@ def test_reviewer_prompt_declares_bounded_authority(monkeypatch):
 def test_reviewer_is_structurally_read_only(monkeypatch, path):
     captured = {}
 
-    def fake_create_deep_agent(**kwargs):
+    def fake_create_agent(**kwargs):
         captured.update(kwargs)
         return object()
 
-    monkeypatch.setattr("sweforge.reviewer.create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr("sweforge.reviewer.create_agent", fake_create_agent)
     build_reviewer(
         ReviewerContext(
             worktree="/tmp/worktree",
@@ -479,6 +485,224 @@ def test_reviewer_is_structurally_read_only(monkeypatch, path):
         ),
         model="reviewer",
     )
-    permission = captured["permissions"][0]
-    assert permission.mode == "deny"
+    assert [tool.name for tool in captured["tools"]] == ["read_repo_file"]
     assert path.startswith("/memories/")
+
+
+def test_reviewer_limits_and_tool_surface_are_scoped(monkeypatch):
+    captured = {}
+
+    def fake_create_agent(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("sweforge.reviewer.create_agent", fake_create_agent)
+    build_reviewer(ReviewerContext(worktree="/tmp/worktree"), model="reviewer")
+
+    assert [tool.name for tool in captured["tools"]] == ["read_repo_file"]
+    assert all(
+        tool.name
+        not in {"ls", "glob", "grep", "write_file", "edit_file", "execute", "task"}
+        for tool in captured["tools"]
+    )
+    limits = captured["middleware"][-2:]
+    assert limits[0].run_limit == REVIEW_INSPECTION_MODEL_CALL_LIMIT
+    assert limits[1].run_limit == REVIEW_INSPECTION_TOOL_CALL_LIMIT
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../../secret",
+        "/Users/someone/secret",
+        ".git/config",
+        "build/reports/tests.html",
+        ".gradle/cache.bin",
+        "/sweforge_internal/state",
+    ],
+)
+def test_reviewer_read_policy_rejects_unsafe_paths(tmp_path, path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print('ok')\n")
+    with pytest.raises(ReviewerReadError):
+        _resolve_reviewer_file(str(tmp_path), path)
+
+
+def test_reviewer_read_policy_accepts_relative_and_virtual_paths(tmp_path):
+    (tmp_path / "src").mkdir()
+    file_path = tmp_path / "src" / "main.py"
+    file_path.write_text("one\ntwo\n")
+    assert _resolve_reviewer_file(str(tmp_path), "src/main.py") == file_path
+    assert _resolve_reviewer_file(str(tmp_path), "/src/main.py") == file_path
+
+
+def test_reviewer_read_tool_bounds_file_output(tmp_path):
+    from sweforge.reviewer import _reviewer_read_tool
+
+    file_path = tmp_path / "main.py"
+    file_path.write_text("one\ntwo\nthree\n")
+    tool = _reviewer_read_tool(ReviewerContext(worktree=str(tmp_path)))
+    assert tool.invoke({"path": "main.py", "offset": 1, "limit": 1}) == "two\n"
+    with pytest.raises(Exception, match="limit"):
+        tool.invoke({"path": "main.py", "limit": 4_001})
+
+
+def test_finalizer_construction_has_no_filesystem_tools(monkeypatch):
+    from sweforge.reviewer import _build_finalizer
+
+    captured = {}
+
+    def fake_create_agent(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("sweforge.reviewer.create_agent", fake_create_agent)
+    _build_finalizer(
+        ReviewerContext(worktree="/tmp/worktree"),
+        model="reviewer",
+        live_middleware=[],
+    )
+    assert captured["tools"] == []
+    assert isinstance(captured["response_format"], ToolStrategy)
+
+
+class _FakeAgent:
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    def invoke(self, payload):
+        self.calls.append(payload)
+        if self.error:
+            raise self.error
+        return self.result
+
+
+def _review_evidence():
+    return {
+        "plan": {"id": "plan-1", "version": 1, "text": "edit src/main.py"},
+        "source": {"event_key": "root"},
+        "attempt": {"attempt_id": "attempt-1"},
+        "execution": {"status": "SUCCEEDED"},
+        "current_head": "head",
+        "base_head": "base",
+        "dirty": True,
+        "changed_files": ["src/main.py"],
+        "diff": "-old\n+new\n",
+    }
+
+
+def test_review_finalizer_has_no_filesystem_tools_and_accepts(monkeypatch):
+    inspector = _FakeAgent({"messages": [type("M", (), {"content": "looks good"})()]})
+    finalizer = _FakeAgent(
+        {"structured_response": ExecutionReviewResult(verdict="ACCEPT", summary="ok")}
+    )
+    captured = {}
+    monkeypatch.setattr(
+        "sweforge.reviewer.build_reviewer", lambda *args, **kwargs: inspector
+    )
+
+    def fake_finalizer(context, *, model, live_middleware):
+        captured["middleware"] = live_middleware
+        captured["tools"] = []
+        return finalizer
+
+    monkeypatch.setattr("sweforge.reviewer._build_finalizer", fake_finalizer)
+    result = review_execution(
+        context=ReviewerContext(worktree="/tmp/worktree"),
+        model="reviewer",
+        evidence=_review_evidence(),
+    )
+    assert result.verdict == "ACCEPT"
+    assert captured["tools"] == []
+    assert "Trusted execution evidence" in finalizer.calls[0]["messages"][0]["content"]
+    assert "Read-only inspection notes" in finalizer.calls[0]["messages"][0]["content"]
+
+
+@pytest.mark.parametrize("verdict", ["ACCEPT", "NEEDS_FIXES", "BLOCKED"])
+def test_inspection_budget_exhaustion_reaches_finalizer(monkeypatch, verdict):
+    from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
+
+    inspector = _FakeAgent(error=ModelCallLimitExceededError(8, 8, None, 8))
+    finalizer = _FakeAgent(
+        {
+            "structured_response": ExecutionReviewResult(
+                verdict=verdict, summary="result"
+            )
+        }
+    )
+    monkeypatch.setattr(
+        "sweforge.reviewer.build_reviewer", lambda *args, **kwargs: inspector
+    )
+    monkeypatch.setattr(
+        "sweforge.reviewer._build_finalizer", lambda *args, **kwargs: finalizer
+    )
+    result = review_execution(
+        context=ReviewerContext(worktree="/tmp/worktree"),
+        model="reviewer",
+        evidence=_review_evidence(),
+    )
+    assert result.verdict == verdict
+    prompt = finalizer.calls[0]["messages"][0]["content"]
+    assert '"budget_exhausted": true' in prompt
+    assert "edit src/main.py" in prompt
+
+
+def test_inspection_tool_budget_exhaustion_reaches_finalizer(monkeypatch):
+    from langchain.agents.middleware.tool_call_limit import ToolCallLimitExceededError
+
+    inspector = _FakeAgent(error=ToolCallLimitExceededError(24, 24, None, 24))
+    finalizer = _FakeAgent(
+        {
+            "structured_response": ExecutionReviewResult(
+                verdict="BLOCKED", summary="limited"
+            )
+        }
+    )
+    monkeypatch.setattr(
+        "sweforge.reviewer.build_reviewer", lambda *args, **kwargs: inspector
+    )
+    monkeypatch.setattr(
+        "sweforge.reviewer._build_finalizer", lambda *args, **kwargs: finalizer
+    )
+    result = review_execution(
+        context=ReviewerContext(worktree="/tmp/worktree"),
+        model="reviewer",
+        evidence=_review_evidence(),
+    )
+    assert result.verdict == "BLOCKED"
+    assert finalizer.calls
+
+
+def test_finalizer_budget_fails_closed(monkeypatch):
+    from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
+
+    inspector = _FakeAgent({"messages": []})
+    finalizer = _FakeAgent(error=ModelCallLimitExceededError(3, 3, None, 3))
+    monkeypatch.setattr(
+        "sweforge.reviewer.build_reviewer", lambda *args, **kwargs: inspector
+    )
+    monkeypatch.setattr(
+        "sweforge.reviewer._build_finalizer", lambda *args, **kwargs: finalizer
+    )
+    result = review_execution(
+        context=ReviewerContext(worktree="/tmp/worktree"),
+        model="reviewer",
+        evidence=_review_evidence(),
+    )
+    assert result.verdict == "BLOCKED"
+    assert result.repair_instructions == []
+
+
+def test_reviewer_provider_errors_remain_retryable(monkeypatch):
+    inspector = _FakeAgent(error=RuntimeError("provider unavailable"))
+    monkeypatch.setattr(
+        "sweforge.reviewer.build_reviewer", lambda *args, **kwargs: inspector
+    )
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        review_execution(
+            context=ReviewerContext(worktree="/tmp/worktree"),
+            model="reviewer",
+            evidence=_review_evidence(),
+        )

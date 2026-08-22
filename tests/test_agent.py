@@ -30,6 +30,39 @@ def test_live_input_middleware_injects_stable_deduplicated_messages():
     assert middleware.before_model({"messages": [message]}, None) is None
 
 
+def test_live_input_delivery_set_deduplicates_across_reviewer_stages():
+    delivered = set()
+
+    def pending():
+        return [("event-1", "first"), ("event-2", "second")]
+
+    inspector = LiveInputMiddleware(pending, delivered)
+    finalizer = LiveInputMiddleware(pending, delivered)
+
+    first = inspector.before_model({"messages": []}, None)
+    assert [message.content for message in first["messages"]] == ["first", "second"]
+    assert finalizer.before_model({"messages": []}, None) is None
+
+
+def test_live_input_arriving_between_reviewer_stages_is_not_suppressed():
+    delivered = set()
+    pending_events = [
+        [("event-1", "first")],
+        [("event-1", "first"), ("event-2", "new")],
+    ]
+
+    def pending():
+        return pending_events.pop(0)
+
+    inspector = LiveInputMiddleware(pending, delivered)
+    finalizer = LiveInputMiddleware(lambda: pending_events[0], delivered)
+
+    first = inspector.before_model({"messages": []}, None)
+    assert [message.content for message in first["messages"]] == ["first"]
+    second = finalizer.before_model({"messages": []}, None)
+    assert [message.content for message in second["messages"]] == ["new"]
+
+
 def test_normalize_response_text_handles_string_content():
     message = type("Message", (), {"content": "done"})()
     assert _normalize_response_text(message) == "done"

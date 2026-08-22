@@ -49,6 +49,11 @@ class LiveInputMiddleware(AgentMiddleware):
         }
         messages = []
         for event_key, body in self.pending():
+            if (
+                self.delivered_event_keys is not None
+                and event_key in self.delivered_event_keys
+            ):
+                continue
             message_id = _live_message_id(event_key)
             if message_id in existing:
                 if self.delivered_event_keys is not None:
