@@ -65,6 +65,44 @@ def test_thread_identity_and_event_idempotency_survive_reopen(tmp_path):
     reopened.close()
 
 
+def test_execution_review_coverage_column_is_additively_migrated(tmp_path):
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """CREATE TABLE execution_reviews(
+           review_id TEXT PRIMARY KEY,
+           thread_id TEXT NOT NULL,
+           cycle_id INTEGER NOT NULL,
+           plan_id TEXT NOT NULL,
+           plan_version INTEGER NOT NULL,
+           root_event_key TEXT NOT NULL,
+           attempt_id TEXT NOT NULL,
+           review_iteration INTEGER NOT NULL,
+           verdict TEXT NOT NULL,
+           summary TEXT NOT NULL,
+           findings_json TEXT NOT NULL,
+           repair_instructions_json TEXT NOT NULL,
+           created_at TEXT NOT NULL,
+           completed_at TEXT NOT NULL
+        )"""
+    )
+    connection.commit()
+    connection.close()
+
+    store = SQLiteGitHubStore(path)
+    columns = {
+        row[1]
+        for row in store.connection.execute("PRAGMA table_info(execution_reviews)")
+    }
+    assert {
+        "requirement_checks_json",
+        "inspection_json",
+        "challenge_json",
+        "read_ledger_json",
+    } <= columns
+    store.close()
+
+
 def test_pr_mapping_routes_existing_unrouted_events(tmp_path):
     store = SQLiteGitHubStore(tmp_path / "state.db")
     repo = RepositoryRef(12345, "example/repo")

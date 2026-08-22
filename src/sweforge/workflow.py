@@ -1173,6 +1173,10 @@ class WorkflowEngine:
         evidence["dirty"] = not inspection.is_clean()
         source = self.store.source_event(state.root_event_key)
         evidence["source"] = dict(source) if source else {}
+        if source:
+            evidence["source_request"] = format_source_context(
+                source, normalize_task(source["body"])
+            )
         if attempt.parent_review_id:
             previous = self.store.execution_review(attempt.parent_review_id)
             evidence["previous_review"] = previous.__dict__ if previous else {}
@@ -1216,6 +1220,27 @@ class WorkflowEngine:
                 repair_instructions_json=json.dumps(result.repair_instructions),
                 created_at=self.clock(),
                 completed_at=self.clock(),
+                requirement_checks_json=json.dumps(
+                    [item.model_dump() for item in result.requirement_checks],
+                    sort_keys=True,
+                ),
+                inspection_json=(
+                    result.inspection_report.model_dump_json()
+                    if result.inspection_report is not None
+                    else "{}"
+                ),
+                challenge_json=(
+                    result.challenge_report.model_dump_json()
+                    if result.challenge_report is not None
+                    else "{}"
+                ),
+                read_ledger_json=json.dumps(
+                    [
+                        {key: value for key, value in entry.items() if key != "excerpt"}
+                        for entry in result.read_ledger
+                    ],
+                    sort_keys=True,
+                ),
             )
         )
 

@@ -207,7 +207,11 @@ CREATE TABLE IF NOT EXISTS execution_reviews (
     findings_json TEXT NOT NULL,
     repair_instructions_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    completed_at TEXT NOT NULL
+    completed_at TEXT NOT NULL,
+    requirement_checks_json TEXT NOT NULL DEFAULT '[]',
+    inspection_json TEXT NOT NULL DEFAULT '{}',
+    challenge_json TEXT NOT NULL DEFAULT '{}',
+    read_ledger_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS review_repair_permits (
     permit_id TEXT PRIMARY KEY,
@@ -411,6 +415,10 @@ class ExecutionReviewRecord:
     repair_instructions_json: str
     created_at: str
     completed_at: str
+    requirement_checks_json: str = "[]"
+    inspection_json: str = "{}"
+    challenge_json: str = "{}"
+    read_ledger_json: str = "[]"
 
 
 @dataclass(frozen=True)
@@ -559,6 +567,31 @@ class SQLiteGitHubStore:
         }
         for column, statement in migrations.items():
             if column not in columns:
+                self.connection.execute(statement)
+        review_columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(execution_reviews)")
+        }
+        if "requirement_checks_json" not in review_columns:
+            self.connection.execute(
+                "ALTER TABLE execution_reviews ADD COLUMN "
+                "requirement_checks_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        for column, statement in {
+            "inspection_json": (
+                "ALTER TABLE execution_reviews ADD COLUMN inspection_json "
+                "TEXT NOT NULL DEFAULT '{}'"
+            ),
+            "challenge_json": (
+                "ALTER TABLE execution_reviews ADD COLUMN challenge_json "
+                "TEXT NOT NULL DEFAULT '{}'"
+            ),
+            "read_ledger_json": (
+                "ALTER TABLE execution_reviews ADD COLUMN read_ledger_json "
+                "TEXT NOT NULL DEFAULT '[]'"
+            ),
+        }.items():
+            if column not in review_columns:
                 self.connection.execute(statement)
         repair_columns = {
             row[1]
@@ -1388,7 +1421,13 @@ class SQLiteGitHubStore:
     ) -> ExecutionReviewRecord:
         with self.transaction() as db:
             db.execute(
-                "INSERT OR IGNORE INTO execution_reviews VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                """INSERT OR IGNORE INTO execution_reviews(
+                   review_id,thread_id,cycle_id,plan_id,plan_version,root_event_key,
+                   attempt_id,review_iteration,verdict,summary,findings_json,
+                   repair_instructions_json,created_at,completed_at,
+                   requirement_checks_json,inspection_json,challenge_json,
+                   read_ledger_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     review.review_id,
                     review.thread_id,
@@ -1404,6 +1443,10 @@ class SQLiteGitHubStore:
                     review.repair_instructions_json,
                     review.created_at,
                     review.completed_at,
+                    review.requirement_checks_json,
+                    review.inspection_json,
+                    review.challenge_json,
+                    review.read_ledger_json,
                 ),
             )
         return self.execution_review_for_attempt(review.attempt_id)  # type: ignore[return-value]

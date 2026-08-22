@@ -10,14 +10,30 @@ from sweforge.github_store import SQLiteGitHubStore, WorkflowPhase
 from sweforge.reviewer import (
     REVIEW_INSPECTION_MODEL_CALL_LIMIT,
     REVIEW_INSPECTION_TOOL_CALL_LIMIT,
+    ChallengeReport,
+    EvidenceKind,
+    EvidenceRef,
     ExecutionReviewResult,
+    InspectionObservation,
+    InspectionReport,
+    RequirementChallenge,
+    RequirementChallengeVerdict,
+    RequirementInspection,
     ReviewerContext,
     ReviewerReadError,
     ReviewFinding,
+    ReviewRequirementCheck,
+    ReviewRequirementClassification,
+    ReviewRequirementStatus,
+    _challenger_prompt,
+    _guard_accept_coverage,
     _resolve_reviewer_file,
+    _reviewer_read_tool,
+    build_review_requirement_contract,
     build_reviewer,
     render_review_evidence,
     review_execution,
+    review_requirement_contract,
 )
 from sweforge.workflow import WorkflowEngine
 
@@ -340,6 +356,62 @@ def test_repair_ready_executes_same_workspace_and_reaches_accept(tmp_path):
     assert store.publication_is_eligible(root.event_key)
 
 
+def test_execution_review_requirement_coverage_is_durable(tmp_path):
+    store, engine, repo, root, thread_id, execute_kwargs = execution_ready_fixture(
+        tmp_path, plan_text="Requirements:\n1. edit README\n2. run tests"
+    )
+    execute_kwargs["runner"] = lambda **kwargs: "executor response"
+    first = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert first.phase == WorkflowPhase.REVIEW_EXECUTION
+
+    def reviewer(**kwargs):
+        return ExecutionReviewResult(
+            verdict="NEEDS_FIXES",
+            summary="run tests is missing",
+            requirement_checks=[
+                ReviewRequirementCheck(
+                    requirement_id=item["requirement_id"],
+                    status=(
+                        ReviewRequirementStatus.UNSATISFIED
+                        if item["text"] == "run tests"
+                        else ReviewRequirementStatus.SATISFIED
+                    ),
+                    evidence="durable test evidence",
+                )
+                for item in review_requirement_contract(kwargs["evidence"])
+            ],
+        )
+
+    engine.reviewer = reviewer
+    reviewed = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        review_model="review-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert reviewed.phase == WorkflowPhase.REPAIR_READY
+    saved = store.execution_review_for_attempt(
+        store.latest_attempt(thread_id, 1).attempt_id
+    )
+    assert saved is not None
+    assert '"status": "UNSATISFIED"' in saved.requirement_checks_json
+    store.close()
+
+    reopened = SQLiteGitHubStore(tmp_path / "state.db")
+    persisted = reopened.execution_review(saved.review_id)
+    assert persisted is not None
+    assert persisted.requirement_checks_json == saved.requirement_checks_json
+    reopened.close()
+
+
 def test_repair_prompt_preserves_review_feedback_past_external_bound(tmp_path):
     long_plan = "approved step\n" * 550 + "PLAN_TAIL_SENTINEL"
     store, engine, repo, root, thread_id, execute_kwargs = execution_ready_fixture(
@@ -559,6 +631,310 @@ def test_reviewer_prompt_declares_bounded_authority(monkeypatch):
     assert "Absence of a commit, push, or PR is not itself a defect" in prompt
 
 
+def test_requirement_contract_is_deterministic_and_includes_validation():
+    source = (
+        "Requirements:\n"
+        "1. Preserve duplicate IDs\n"
+        "2. Interrupt running work\n"
+        "3. Do not modify build config\n"
+    )
+    plan = (
+        "Implementation steps:\n"
+        "1. Add atomic state\n"
+        "2. Track worker\n\n"
+        "Validation:\n"
+        "- verify interruption is observed\n"
+        "- run tests\n"
+    )
+    first = build_review_requirement_contract(source, plan)
+    second = build_review_requirement_contract(source, plan)
+    assert first == second
+    assert [item["requirement_id"] for item in first] == [
+        "source:req:1",
+        "source:req:2",
+        "source:req:3",
+        "plan:step:1",
+        "plan:step:2",
+        "plan:validation:1",
+        "plan:validation:2",
+    ]
+    assert first[-2]["text"] == "verify interruption is observed"
+    assert all(item["text"] for item in first)
+
+
+def test_requirement_contract_deduplicates_literal_restatements_and_bounds():
+    source = "Requirements:\n1. Preserve duplicate IDs\n2. Preserve duplicate IDs.\n"
+    plan = "Validation:\n- preserve duplicate IDs\n- run tests\n"
+    contract = build_review_requirement_contract(source, plan)
+    assert [item["text"] for item in contract] == [
+        "Preserve duplicate IDs",
+        "run tests",
+    ]
+    huge = "Requirements:\n" + "\n".join(
+        f"{index}. {'x' * 800}" for index in range(1, 200)
+    )
+    bounded = build_review_requirement_contract(huge, huge)
+    assert len(bounded) <= 80
+    assert all(len(item["text"]) <= 500 for item in bounded)
+
+
+def test_requirement_contract_has_bounded_fallback_and_ignores_source_tail():
+    contract = build_review_requirement_contract("plain request", "plain plan")
+    assert [(item["requirement_id"], item["text"]) for item in contract] == [
+        ("source:overall:1", "plain request"),
+        ("plan:overall:1", "plain plan"),
+    ]
+    assert all(item["classification"] == "BEHAVIORAL" for item in contract)
+    source = "Requirements:\n1. visible\n" + ("\nnoise" * 1_000)
+    contract = build_review_requirement_contract(source[:4_000], "plan")
+    assert all("noise" not in item["text"] for item in contract)
+
+
+def test_accept_guard_rejects_partial_unknown_duplicate_and_non_satisfied():
+    contract = [
+        {"requirement_id": "REQ-A", "text": "A"},
+        {"requirement_id": "REQ-B", "text": "B"},
+        {"requirement_id": "REQ-C", "text": "C"},
+    ]
+    partial = ExecutionReviewResult(
+        verdict="ACCEPT",
+        summary="partial",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id="REQ-A",
+                status=ReviewRequirementStatus.SATISFIED,
+                evidence="A",
+            )
+        ],
+    )
+    assert _guard_accept_coverage(partial, contract).verdict == "BLOCKED"
+    invalid = ExecutionReviewResult(
+        verdict="ACCEPT",
+        summary="invalid",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id="REQ-A",
+                status=ReviewRequirementStatus.SATISFIED,
+                evidence="A",
+            ),
+            ReviewRequirementCheck(
+                requirement_id="REQ-A",
+                status=ReviewRequirementStatus.SATISFIED,
+                evidence="A again",
+            ),
+            ReviewRequirementCheck(
+                requirement_id="REQ-C",
+                status=ReviewRequirementStatus.UNVERIFIED,
+                evidence="not enough",
+            ),
+        ],
+    )
+    guarded = _guard_accept_coverage(invalid, contract)
+    assert guarded.verdict == "BLOCKED"
+    assert guarded.findings[0].severity == "BLOCKING"
+
+
+def test_accept_guard_allows_exact_satisfied_coverage():
+    contract = [
+        {"requirement_id": "REQ-A", "text": "A"},
+        {"requirement_id": "REQ-B", "text": "B"},
+    ]
+    result = ExecutionReviewResult(
+        verdict="ACCEPT",
+        summary="complete",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id=item["requirement_id"],
+                status=ReviewRequirementStatus.SATISFIED,
+                evidence="verified",
+            )
+            for item in contract
+        ],
+    )
+    assert _guard_accept_coverage(result, contract).verdict == "ACCEPT"
+
+
+def test_requirement_classification_is_conservative_and_deterministic():
+    structural = build_review_requirement_contract(
+        "Requirements:\n1. Add enum value READY\n2. Create file src/new.py",
+        "",
+    )
+    behavioral = build_review_requirement_contract(
+        "Requirements:\n1. Callback occurs after state transition",
+        "",
+    )
+    assert all(
+        item["classification"] == ReviewRequirementClassification.STRUCTURAL.value
+        for item in structural
+    )
+    assert (
+        behavioral[0]["classification"]
+        == ReviewRequirementClassification.BEHAVIORAL.value
+    )
+
+
+def test_read_ledger_records_only_successful_bounded_reads(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "main.py").write_text("one\ntwo\nthree\n")
+    ledger = []
+    tool = _reviewer_read_tool(ReviewerContext(str(tmp_path), read_ledger=ledger))
+    assert tool.invoke({"path": "src/main.py", "offset": 1, "limit": 1}) == "two\n"
+    assert ledger[0]["normalized_path"] == "src/main.py"
+    assert ledger[0]["returned_lines"] == [2, 2]
+    assert ledger[0]["excerpt"] == "two\n"
+
+
+def test_accept_guard_rejects_unread_and_wrong_requirement_evidence():
+    contract = [
+        {
+            "requirement_id": "REQ-B",
+            "text": "callback follows state transition",
+            "classification": "BEHAVIORAL",
+        }
+    ]
+    inspection = InspectionReport(
+        inspections=[
+            RequirementInspection(
+                requirement_id="REQ-B",
+                classification="BEHAVIORAL",
+                status="VERIFIED",
+                observation_ids=["obs-1"],
+                evidence_refs=[
+                    EvidenceRef(
+                        ref_id="ref-1",
+                        requirement_id="REQ-B",
+                        kind=EvidenceKind.INSPECTED_FILE,
+                        path="src/missing.py",
+                    )
+                ],
+            )
+        ],
+        observations=[
+            InspectionObservation(
+                observation_id="obs-1",
+                requirement_id="REQ-B",
+                kind="CODE",
+                path="src/main.py",
+                fact="state transition precedes callback",
+            )
+        ],
+    )
+    challenge = ChallengeReport(
+        challenges=[
+            RequirementChallenge(
+                requirement_id="REQ-B",
+                verdict=RequirementChallengeVerdict.SUPPORTED,
+                challenge_summary="no contradiction found",
+            )
+        ]
+    )
+    result = ExecutionReviewResult(
+        verdict="ACCEPT",
+        summary="accepted",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id="REQ-B",
+                status="SATISFIED",
+                evidence="source fact",
+            )
+        ],
+    )
+    guarded = _guard_accept_coverage(
+        result,
+        contract,
+        inspection=inspection,
+        challenge=challenge,
+        ledger=[{"normalized_path": "src/main.py"}],
+    )
+    assert guarded.verdict == "BLOCKED"
+
+
+def test_challenger_prompt_contains_raw_resolved_evidence_not_only_summary():
+    evidence = {"execution": {"status": "SUCCEEDED"}}
+    contract = [
+        {
+            "requirement_id": "REQ-B",
+            "text": "callback follows state transition",
+            "classification": "BEHAVIORAL",
+        }
+    ]
+    prompt = _challenger_prompt(
+        evidence,
+        contract,
+        [
+            {
+                "requirement_id": "REQ-B",
+                "summary": "looks safe",
+                "observations": [],
+                "evidence": [{"path": "src/main.py", "excerpt": "state = RUNNING"}],
+            }
+        ],
+    )
+    assert "state = RUNNING" in prompt
+    assert "looks safe" in prompt
+
+
+def test_review_execution_partial_accept_fails_closed(monkeypatch):
+    evidence = _review_evidence()
+    evidence["source_request"] = "Requirements:\n1. A\n2. B\n3. C"
+    inspector = _FakeAgent({"messages": []})
+    finalizer = _FakeAgent(
+        {
+            "structured_response": ExecutionReviewResult(
+                verdict="ACCEPT",
+                summary="only repaired item checked",
+                requirement_checks=[
+                    ReviewRequirementCheck(
+                        requirement_id="source:req:1",
+                        status=ReviewRequirementStatus.SATISFIED,
+                        evidence="A",
+                    )
+                ],
+            )
+        }
+    )
+    monkeypatch.setattr("sweforge.reviewer.build_reviewer", lambda *a, **k: inspector)
+    monkeypatch.setattr("sweforge.reviewer._build_finalizer", lambda *a, **k: finalizer)
+    result = review_execution(
+        context=ReviewerContext(worktree="/tmp/worktree"),
+        model="reviewer",
+        evidence=evidence,
+    )
+    assert result.verdict == "BLOCKED"
+    assert result.repair_instructions == []
+
+
+def test_needs_fixes_with_incomplete_coverage_remains_needs_fixes(monkeypatch):
+    evidence = _review_evidence()
+    inspector = _FakeAgent({"messages": []})
+    finalizer = _FakeAgent(
+        {
+            "structured_response": ExecutionReviewResult(
+                verdict="NEEDS_FIXES", summary="B is not fixed"
+            )
+        }
+    )
+    monkeypatch.setattr("sweforge.reviewer.build_reviewer", lambda *a, **k: inspector)
+    monkeypatch.setattr("sweforge.reviewer._build_finalizer", lambda *a, **k: finalizer)
+    result = review_execution(
+        context=ReviewerContext(worktree="/tmp/worktree"),
+        model="reviewer",
+        evidence=evidence,
+    )
+    assert result.verdict == "NEEDS_FIXES"
+
+
+def test_reviewer_prompts_require_full_contract_semantics():
+    from sweforge.reviewer import FINALIZER_SYSTEM_PROMPT, INSPECTOR_SYSTEM_PROMPT
+
+    for prompt in (INSPECTOR_SYSTEM_PROMPT, FINALIZER_SYSTEM_PROMPT):
+        assert "complete" in prompt or "entire" in prompt
+        assert "previous" in prompt.lower()
+        assert "test name" in prompt.lower() or "test names" in prompt.lower()
+        assert "interleavings" in prompt or "behavioral" in prompt
+
+
 def test_finalizer_prompt_declares_uncommitted_worktree_authority():
     from sweforge.reviewer import FINALIZER_SYSTEM_PROMPT
 
@@ -695,10 +1071,27 @@ def _review_evidence():
     }
 
 
+def _complete_review_checks(evidence):
+    return [
+        ReviewRequirementCheck(
+            requirement_id=item["requirement_id"],
+            status=ReviewRequirementStatus.SATISFIED,
+            evidence="observable evidence",
+        )
+        for item in review_requirement_contract(evidence)
+    ]
+
+
 def test_review_finalizer_has_no_filesystem_tools_and_accepts(monkeypatch):
     inspector = _FakeAgent({"messages": [type("M", (), {"content": "looks good"})()]})
     finalizer = _FakeAgent(
-        {"structured_response": ExecutionReviewResult(verdict="ACCEPT", summary="ok")}
+        {
+            "structured_response": ExecutionReviewResult(
+                verdict="ACCEPT",
+                summary="ok",
+                requirement_checks=_complete_review_checks(_review_evidence()),
+            )
+        }
     )
     captured = {}
     monkeypatch.setattr(
@@ -716,10 +1109,10 @@ def test_review_finalizer_has_no_filesystem_tools_and_accepts(monkeypatch):
         model="reviewer",
         evidence=_review_evidence(),
     )
-    assert result.verdict == "ACCEPT"
+    assert result.verdict == "BLOCKED"
     assert captured["tools"] == []
     assert "Trusted execution evidence" in finalizer.calls[0]["messages"][0]["content"]
-    assert "Read-only inspection notes" in finalizer.calls[0]["messages"][0]["content"]
+    assert "Structured inspection" in finalizer.calls[0]["messages"][0]["content"]
 
 
 @pytest.mark.parametrize("verdict", ["ACCEPT", "NEEDS_FIXES", "BLOCKED"])
@@ -730,7 +1123,13 @@ def test_inspection_budget_exhaustion_reaches_finalizer(monkeypatch, verdict):
     finalizer = _FakeAgent(
         {
             "structured_response": ExecutionReviewResult(
-                verdict=verdict, summary="result"
+                verdict=verdict,
+                summary="result",
+                requirement_checks=(
+                    _complete_review_checks(_review_evidence())
+                    if verdict == "ACCEPT"
+                    else []
+                ),
             )
         }
     )
@@ -745,7 +1144,7 @@ def test_inspection_budget_exhaustion_reaches_finalizer(monkeypatch, verdict):
         model="reviewer",
         evidence=_review_evidence(),
     )
-    assert result.verdict == verdict
+    assert result.verdict == ("BLOCKED" if verdict == "ACCEPT" else verdict)
     prompt = finalizer.calls[0]["messages"][0]["content"]
     assert '"budget_exhausted": true' in prompt
     assert "edit src/main.py" in prompt
