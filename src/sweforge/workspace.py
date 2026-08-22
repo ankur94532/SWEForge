@@ -61,7 +61,16 @@ class ThreadWorkspace:
                 raise WorkspaceError(
                     "existing workspace does not match persisted metadata"
                 )
-            return cls(repo, path, expected_base or actual_base, branch, False)
+            base = expected_base or actual_base
+            result = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", base, "HEAD"],
+                cwd=path,
+                check=False,
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                raise WorkspaceError("persisted workspace base is not an ancestor")
+            return cls(repo, path, base, branch, False)
 
         if existing_path is not None:
             raise WorkspaceError("persisted workspace directory is missing")

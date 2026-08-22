@@ -4,7 +4,12 @@ import pytest
 
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import SQLiteGitHubStore, WorkflowPhase
-from sweforge.reviewer import ExecutionReviewResult, render_review_evidence
+from sweforge.reviewer import (
+    ExecutionReviewResult,
+    ReviewerContext,
+    build_reviewer,
+    render_review_evidence,
+)
 from sweforge.workflow import WorkflowEngine
 
 
@@ -163,3 +168,41 @@ def test_repair_ready_executes_same_workspace_and_reaches_accept(tmp_path):
 def test_review_result_verdicts_are_bounded(verdict):
     result = ExecutionReviewResult(verdict=verdict, summary="summary")
     assert result.verdict == verdict
+
+
+def test_reviewer_prompt_declares_bounded_authority(monkeypatch):
+    captured = {}
+
+    def fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("sweforge.reviewer.create_deep_agent", fake_create_deep_agent)
+    build_reviewer(ReviewerContext(worktree="/tmp/worktree"), model="reviewer")
+    prompt = captured["system_prompt"]
+    assert "exact approved plan" in prompt
+    assert "NEEDS_FIXES" in prompt
+    assert "BLOCKED" in prompt
+    assert "evidence" in prompt
+
+
+@pytest.mark.parametrize("path", ["/memories/AGENTS.md", "/memories/notes.md"])
+def test_reviewer_is_structurally_read_only(monkeypatch, path):
+    captured = {}
+
+    def fake_create_deep_agent(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("sweforge.reviewer.create_deep_agent", fake_create_deep_agent)
+    build_reviewer(
+        ReviewerContext(
+            worktree="/tmp/worktree",
+            memory_store=object(),
+            memory_namespace=("sweforge", "repo", "1"),
+        ),
+        model="reviewer",
+    )
+    permission = captured["permissions"][0]
+    assert permission.mode == "deny"
+    assert path.startswith("/memories/")

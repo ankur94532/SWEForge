@@ -86,6 +86,64 @@ def test_workspace_reports_staged_unstaged_and_untracked_changes(tmp_path):
         workspace.cleanup()
 
 
+def test_existing_thread_workspace_rejects_non_ancestor_base(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "file.txt").write_text("one\n")
+    git(repo, "add", "file.txt")
+    git(
+        repo,
+        "-c",
+        "user.name=SWEForge",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "one",
+    )
+    first = git(repo, "rev-parse", "HEAD")
+    (repo / "file.txt").write_text("two\n")
+    git(repo, "add", "file.txt")
+    git(
+        repo,
+        "-c",
+        "user.name=SWEForge",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "two",
+    )
+    from sweforge.workspace import ThreadWorkspace
+
+    thread = ThreadWorkspace.create(
+        repository=repo,
+        workspace_root=tmp_path / "workspaces",
+        repo_id=1,
+        issue_number=7,
+    )
+    try:
+        with pytest.raises(WorkspaceError, match="not an ancestor"):
+            ThreadWorkspace.create(
+                repository=repo,
+                workspace_root=tmp_path / "workspaces",
+                repo_id=1,
+                issue_number=7,
+                existing_path=str(thread.path),
+                expected_branch=thread.branch_name,
+                expected_base=git(repo, "rev-parse", "HEAD~1") + "-invalid",
+            )
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(thread.path)],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+        )
+    assert first != git(repo, "rev-parse", "HEAD")
+
+
 def test_workspace_reports_rename_target(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()

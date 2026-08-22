@@ -323,6 +323,10 @@ class PendingWorkflowInputError(ValueError):
         super().__init__(f"workflow input requires replanning: {event_key}")
 
 
+class PendingRepairInputError(PendingWorkflowInputError):
+    """A repair was prevented by new user input that must not be consumed."""
+
+
 RESUMABLE_PUBLICATION_STATUSES = (
     PublicationStatus.PENDING,
     PublicationStatus.COMMITTED,
@@ -1604,60 +1608,153 @@ class SQLiteGitHubStore:
     def begin_or_resume_repair_attempt(
         self, permit_id: str, *, now: str
     ) -> ExecutionAttemptRecord:
+        permit = self.repair_permit(permit_id)
+        if permit is None:
+            raise ValueError("repair permit is unavailable")
+        return self.bind_repair_execution(
+            permit_id, expected_thread_id=permit.thread_id, now=now
+        )
+
+    def bind_repair_execution(
+        self, permit_id: str, *, expected_thread_id: str, now: str
+    ) -> ExecutionAttemptRecord:
+        pending_event: str | None = None
         with self.transaction(immediate=True) as db:
             permit = db.execute(
                 "SELECT * FROM review_repair_permits WHERE permit_id=?", (permit_id,)
             ).fetchone()
+            if not permit or permit["root_event_key"] is None:
+                raise ValueError("repair permit has no reconstructable root event")
+            if permit["thread_id"] != expected_thread_id:
+                raise ValueError("repair permit belongs to another thread")
             state = db.execute(
                 "SELECT * FROM issue_workflow_state WHERE thread_id=?",
-                (permit["thread_id"],) if permit else (None,),
+                (expected_thread_id,),
             ).fetchone()
             if not permit or permit["invalidated_at"] or permit["consumed_at"]:
                 raise ValueError("repair permit is unavailable")
             if not state or state["phase"] != WorkflowPhase.REPAIR_READY.value:
                 raise ValueError("workflow is not repair-ready")
+            plan = db.execute(
+                "SELECT * FROM issue_plans WHERE plan_id=?", (permit["plan_id"],)
+            ).fetchone()
+            parent = db.execute(
+                "SELECT * FROM execution_reviews WHERE review_id=?",
+                (permit["parent_review_id"],),
+            ).fetchone()
             latest = db.execute(
                 "SELECT * FROM execution_attempts WHERE thread_id=? AND cycle_id=? ORDER BY attempt_number DESC LIMIT 1",
                 (permit["thread_id"], permit["cycle_id"]),
             ).fetchone()
-            if not latest or latest["status"] != AttemptStatus.SUCCEEDED.value:
-                raise ValueError("repair parent attempt is not successful")
-            attempt_id = f"attempt-{permit_id}"
-            existing = db.execute(
-                "SELECT * FROM execution_attempts WHERE attempt_id=?", (attempt_id,)
+            parent_attempt = db.execute(
+                "SELECT * FROM execution_attempts WHERE attempt_id=?",
+                (parent["attempt_id"],) if parent else (None,),
             ).fetchone()
-            if existing:
-                db.execute(
-                    "UPDATE execution_attempts SET status=?,retry_count=retry_count+1 WHERE attempt_id=?",
-                    (AttemptStatus.RUNNING.value, attempt_id),
-                )
+            if (
+                state["cycle_id"] != permit["cycle_id"]
+                or state["root_event_key"] != permit["root_event_key"]
+                or state["current_plan_id"] != permit["plan_id"]
+                or not plan
+                or plan["version"] != permit["plan_version"]
+                or plan["status"]
+                not in (PlanStatus.APPROVED.value, PlanStatus.AUTO_APPROVED.value)
+                or not parent
+                or parent["verdict"] != "NEEDS_FIXES"
+                or parent["thread_id"] != expected_thread_id
+                or parent["cycle_id"] != permit["cycle_id"]
+                or parent["root_event_key"] != permit["root_event_key"]
+                or parent["plan_id"] != permit["plan_id"]
+                or parent["plan_version"] != permit["plan_version"]
+                or not latest
+                or not parent_attempt
+                or latest["attempt_id"] != parent_attempt["attempt_id"]
+                or latest["status"] != AttemptStatus.SUCCEEDED.value
+                or (latest["repair_round"] or 0) + 1 != permit["repair_round"]
+            ):
+                raise ValueError("repair permit binding is stale")
+            pending = db.execute(
+                """SELECT event_key, body FROM source_events
+                   WHERE thread_id=? AND event_key != ? AND event_key NOT IN
+                   (SELECT event_key FROM thread_input_consumptions)
+                   ORDER BY source_updated_at, discovered_at, event_key""",
+                (expected_thread_id, permit["root_event_key"]),
+            ).fetchall()
+            for candidate in pending:
+                if is_exact_agent_approval(candidate["body"]):
+                    db.execute(
+                        """INSERT OR IGNORE INTO thread_input_consumptions(
+                           event_key,thread_id,cycle_id,purpose,status,claimed_at,consumed_at)
+                           VALUES(?,?,?,?,?,?,?)""",
+                        (
+                            candidate["event_key"],
+                            expected_thread_id,
+                            permit["cycle_id"],
+                            InputPurpose.STALE_PLAN_APPROVAL.value,
+                            "CONSUMED",
+                            now,
+                            now,
+                        ),
+                    )
+                    self._resolve_workflow_control(
+                        db,
+                        event_key=candidate["event_key"],
+                        thread_id=expected_thread_id,
+                        claimed_at=now,
+                        purpose=InputPurpose.STALE_PLAN_APPROVAL,
+                    )
+                elif starts_with_agent_invocation(candidate["body"]):
+                    db.execute(
+                        "UPDATE review_repair_permits SET invalidated_at=? WHERE permit_id=?",
+                        (now, permit_id),
+                    )
+                    db.execute(
+                        "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
+                        (WorkflowPhase.REVIEW_BLOCKED.value, now, expected_thread_id),
+                    )
+                    pending_event = candidate["event_key"]
+                    break
+            if pending_event:
+                pass
             else:
+                attempt_id = f"attempt-{permit_id}"
+                existing = db.execute(
+                    "SELECT * FROM execution_attempts WHERE attempt_id=?", (attempt_id,)
+                ).fetchone()
+                if existing:
+                    db.execute(
+                        "UPDATE execution_attempts SET status=?,retry_count=retry_count+1,completed_at=NULL WHERE attempt_id=?",
+                        (AttemptStatus.RUNNING.value, attempt_id),
+                    )
+                else:
+                    db.execute(
+                        """INSERT INTO execution_attempts(
+                           attempt_id,thread_id,cycle_id,plan_id,plan_version,root_event_key,
+                           attempt_number,kind,repair_round,parent_review_id,authorization_id,
+                           status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            attempt_id,
+                            expected_thread_id,
+                            permit["cycle_id"],
+                            permit["plan_id"],
+                            permit["plan_version"],
+                            permit["root_event_key"],
+                            latest["attempt_number"] + 1,
+                            AttemptKind.REVIEW_REPAIR.value,
+                            permit["repair_round"],
+                            permit["parent_review_id"],
+                            permit_id,
+                            AttemptStatus.RUNNING.value,
+                            now,
+                        ),
+                    )
                 db.execute(
-                    """INSERT INTO execution_attempts(
-                       attempt_id,thread_id,cycle_id,plan_id,plan_version,root_event_key,
-                       attempt_number,kind,repair_round,parent_review_id,authorization_id,
-                       status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        attempt_id,
-                        permit["thread_id"],
-                        permit["cycle_id"],
-                        permit["plan_id"],
-                        permit["plan_version"],
-                        permit["root_event_key"],
-                        latest["attempt_number"] + 1,
-                        AttemptKind.REVIEW_REPAIR.value,
-                        permit["repair_round"],
-                        permit["parent_review_id"],
-                        permit_id,
-                        AttemptStatus.RUNNING.value,
-                        now,
-                    ),
+                    "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
+                    (WorkflowPhase.EXECUTING.value, now, expected_thread_id),
                 )
-            db.execute(
-                "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
-                (WorkflowPhase.EXECUTING.value, now, permit["thread_id"]),
-            )
-        return self.execution_attempt(attempt_id)  # type: ignore[return-value]
+                bound_attempt_id = attempt_id
+        if pending_event:
+            raise PendingRepairInputError(pending_event)
+        return self.execution_attempt(bound_attempt_id)  # type: ignore[return-value]
 
     def finish_repair_attempt_success(
         self,
@@ -1714,7 +1811,7 @@ class SQLiteGitHubStore:
     def mark_repair_attempt_failed(self, attempt_id: str, *, now: str) -> None:
         with self.transaction() as db:
             db.execute(
-                "UPDATE execution_attempts SET status=?,completed_at=?,retry_count=retry_count+1 WHERE attempt_id=?",
+                "UPDATE execution_attempts SET status=?,completed_at=? WHERE attempt_id=?",
                 (AttemptStatus.FAILED.value, now, attempt_id),
             )
             db.execute(

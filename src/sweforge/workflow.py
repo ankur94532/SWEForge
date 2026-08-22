@@ -659,33 +659,18 @@ class WorkflowEngine:
         permit = self.store.repair_permit(permit_id)
         if permit is None:
             raise ValueError("repair permit is unavailable")
-        state = self.store.workflow_state(permit.thread_id)
-        plan = self.store.plan(permit.plan_id)
-        if state is None or plan is None or state.phase != WorkflowPhase.REPAIR_READY:
-            raise ValueError("repair workflow is not ready")
-        if any(
-            _is_actionable_feedback(row)
-            for row in self.store.unconsumed_inputs(
-                permit.thread_id, after_event_key=state.root_event_key
-            )
-        ):
-            self.store.invalidate_repair_permit(permit_id, now=self.clock())
-            self.store.save_workflow_state(
-                replace(
-                    state, phase=WorkflowPhase.REVIEW_BLOCKED, updated_at=self.clock()
-                )
-            )
-            raise ValueError("repair invalidated by new user feedback")
         source = self.store.source_event(permit.root_event_key)
         workspace = self.store.thread_workspace(permit.thread_id)
-        if source is None or workspace is None:
+        thread = self.store.issue_thread(permit.thread_id)
+        plan = self.store.plan(permit.plan_id)
+        if source is None or workspace is None or thread is None or plan is None:
             raise ValueError("repair workspace or root event is unavailable")
         event = ClaimedEvent(
             event_key=source["event_key"],
             thread_id=source["thread_id"],
             repo_id=source["repo_id"],
             repo_full_name=source["repo_full_name"],
-            issue_number=source["subject_number"],
+            issue_number=thread["issue_number"],
             body=source["body"],
             workspace_path=workspace.workspace_path,
             retrying=True,
@@ -702,11 +687,9 @@ class WorkflowEngine:
             pull_request_review_id=source["pull_request_review_id"],
             review_thread_root_id=source["review_thread_root_id"],
         )
-        attempt = self.store.begin_or_resume_repair_attempt(
-            permit_id, now=utc_timestamp((now or (lambda: datetime.now(UTC)))())
-        )
+        clock = now or (lambda: datetime.now(UTC))
         review_text = "No parent review available."
-        parent = self.store.execution_review(attempt.parent_review_id or "")
+        parent = self.store.execution_review(permit.parent_review_id)
         if parent:
             review_text = (
                 f"Review {parent.review_id}: {parent.summary}\n"
@@ -719,10 +702,19 @@ class WorkflowEngine:
             "Inspect the current cumulative workspace, make the smallest corrections, "
             "and validate them before finishing. Do not expand scope."
         )
-        clock = now or (lambda: datetime.now(UTC))
+        if live_input_provider is None:
+
+            def live_input_provider():
+                return self.pending_live_inputs(permit.thread_id)
+
         delivered: set[str] = set()
         try:
             with thread_lock(lock_root, permit.thread_id):
+                attempt = self.store.bind_repair_execution(
+                    permit_id,
+                    expected_thread_id=permit.thread_id,
+                    now=utc_timestamp(clock()),
+                )
                 result = _execute_claim(
                     store=self.store,
                     event=event,
@@ -766,6 +758,8 @@ class WorkflowEngine:
                         attempt.attempt_id, now=utc_timestamp(clock())
                     )
                 return result
+        except PendingWorkflowInputError:
+            return ExecutionResult(status="BLOCKED", event=event)
         except ThreadLockUnavailable:
             return ExecutionResult(status="BUSY", event=event)
 
@@ -1051,6 +1045,20 @@ class WorkflowEngine:
         """
         state = self.store.workflow_state(thread_id)
         self._drain_approval_controls(thread_id, state)
+        if state and state.phase == WorkflowPhase.REVIEW_BLOCKED:
+            latest = self.store.latest_attempt(thread_id, state.cycle_id)
+            review = (
+                self.store.execution_review_for_attempt(latest.attempt_id)
+                if latest
+                else None
+            )
+            self.post_blocked_review_comment(
+                thread_id,
+                summary=review.summary if review else "Execution review is blocked.",
+            )
+            return WorkflowAdvanceResult(
+                WorkflowPhase.REVIEW_BLOCKED, thread_id, message="blocked"
+            )
         if state and state.phase == WorkflowPhase.AWAITING_PUBLICATION:
             publication = self.store.publication_for_event(state.root_event_key)
             if publication is None or publication.status.value not in {
@@ -1207,11 +1215,19 @@ class WorkflowEngine:
                     message="execution accepted",
                 )
             if review.verdict == "NEEDS_FIXES":
-                repair = self.store.create_repair_permit(
-                    thread_id=thread_id,
-                    now=self.clock(),
-                    max_repairs=max_review_repairs,
-                )
+                try:
+                    repair = self.store.create_repair_permit(
+                        thread_id=thread_id,
+                        now=self.clock(),
+                        max_repairs=max_review_repairs,
+                    )
+                except ValueError as exc:
+                    if "maximum" not in str(exc):
+                        raise
+                    self.post_blocked_review_comment(thread_id, summary=review.summary)
+                    return WorkflowAdvanceResult(
+                        WorkflowPhase.REVIEW_BLOCKED, thread_id, message=str(exc)
+                    )
                 return WorkflowAdvanceResult(
                     WorkflowPhase.REPAIR_READY,
                     thread_id,
