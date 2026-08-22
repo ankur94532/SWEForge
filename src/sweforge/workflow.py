@@ -27,6 +27,7 @@ from .github_models import (
     starts_with_agent_invocation,
 )
 from .github_store import (
+    AttemptKind,
     AttemptStatus,
     ClaimedEvent,
     ExecutionPermit,
@@ -966,12 +967,13 @@ class WorkflowEngine:
                 purpose=purpose,
             )
 
-    def _recover_execution_review(self, state: WorkflowStateRecord):
-        """Recover a successful execution into the durable review gate."""
-        if state.phase != WorkflowPhase.EXECUTING:
-            return state
+    def _recover_initial_execution(self, state: WorkflowStateRecord):
+        """Recover only an INITIAL attempt from root execution evidence."""
         execution = self.store.execution_for_event(state.root_event_key)
         if not execution or execution["status"] != "SUCCEEDED":
+            return state
+        latest = self.store.latest_attempt(state.thread_id, state.cycle_id)
+        if latest and latest.kind is not AttemptKind.INITIAL:
             return state
         plan = self.store.current_plan(state.thread_id)
         permit = self.store.permit_for_plan(plan.plan_id) if plan else None
@@ -1025,11 +1027,48 @@ class WorkflowEngine:
         )
         return self.store.workflow_state(state.thread_id)
 
+    def _recover_executing_state(
+        self, state: WorkflowStateRecord, *, lock_root: str | Path
+    ) -> tuple[WorkflowStateRecord, bool]:
+        """Recover EXECUTING without treating repair work as root success."""
+        if state.phase != WorkflowPhase.EXECUTING:
+            return state, False
+        latest = self.store.latest_attempt(state.thread_id, state.cycle_id)
+        if latest and latest.kind is AttemptKind.REVIEW_REPAIR:
+            try:
+                with thread_lock(lock_root, state.thread_id):
+                    fresh = self.store.workflow_state(state.thread_id)
+                    current = (
+                        self.store.latest_attempt(state.thread_id, state.cycle_id)
+                        if fresh
+                        else None
+                    )
+                    if fresh is None or fresh.phase != WorkflowPhase.EXECUTING:
+                        return fresh or state, False
+                    if current is None or current.kind is not AttemptKind.REVIEW_REPAIR:
+                        return fresh, False
+                    if current.status is AttemptStatus.RUNNING:
+                        self.store.recover_orphaned_repair_attempt(
+                            current.attempt_id, now=self.clock()
+                        )
+                        return self.store.workflow_state(state.thread_id), False
+                    if current.status is AttemptStatus.SUCCEEDED:
+                        self.store.fail_closed_repair_recovery(
+                            current.attempt_id, now=self.clock()
+                        )
+                        return self.store.workflow_state(state.thread_id), False
+                    return fresh, False
+            except ThreadLockUnavailable:
+                return state, True
+        return self._recover_initial_execution(state), False
+
     def next_root(self, thread_id: str) -> str | None:
         state = self.store.workflow_state(thread_id)
         self._drain_approval_controls(thread_id, state)
         if state:
-            state = self._recover_execution_review(state)
+            state, _ = self._recover_executing_state(
+                state, lock_root=Path("~/.sweforge/locks").expanduser()
+            )
         after = state.root_event_key if state else None
         candidates = self.store.unconsumed_inputs(thread_id, after_event_key=after)
         for row in candidates:
@@ -1151,7 +1190,23 @@ class WorkflowEngine:
         state = self.store.workflow_state(thread_id)
         self._drain_approval_controls(thread_id, state)
         if state:
-            state = self._recover_execution_review(state)
+            was_executing = state.phase == WorkflowPhase.EXECUTING
+            recovery_lock_root = (execute_kwargs or {}).get(
+                "lock_root", Path("~/.sweforge/locks").expanduser()
+            )
+            state, busy = self._recover_executing_state(
+                state, lock_root=recovery_lock_root
+            )
+            if busy:
+                return WorkflowAdvanceResult(
+                    WorkflowPhase.EXECUTING, thread_id, message="busy"
+                )
+            if was_executing and state.phase == WorkflowPhase.REPAIR_READY:
+                return WorkflowAdvanceResult(
+                    WorkflowPhase.REPAIR_READY,
+                    thread_id,
+                    message="orphaned repair recovered",
+                )
         if state and state.phase == WorkflowPhase.REVIEW_BLOCKED:
             latest = self.store.latest_attempt(thread_id, state.cycle_id)
             review = (

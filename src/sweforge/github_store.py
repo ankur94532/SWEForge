@@ -1876,6 +1876,96 @@ class SQLiteGitHubStore:
                 (WorkflowPhase.REPAIR_READY.value, now, attempt_id),
             )
 
+    def recover_orphaned_repair_attempt(self, attempt_id: str, *, now: str) -> None:
+        """Fail a lock-free running repair without consuming its permit."""
+        with self.transaction(immediate=True) as db:
+            attempt = db.execute(
+                "SELECT * FROM execution_attempts WHERE attempt_id=?", (attempt_id,)
+            ).fetchone()
+            permit = db.execute(
+                "SELECT * FROM review_repair_permits WHERE permit_id=?",
+                (attempt["authorization_id"],) if attempt else (None,),
+            ).fetchone()
+            state = db.execute(
+                "SELECT * FROM issue_workflow_state WHERE thread_id=?",
+                (attempt["thread_id"],) if attempt else (None,),
+            ).fetchone()
+            plan = db.execute(
+                "SELECT * FROM issue_plans WHERE plan_id=?",
+                (attempt["plan_id"],) if attempt else (None,),
+            ).fetchone()
+            parent = db.execute(
+                "SELECT * FROM execution_reviews WHERE review_id=?",
+                (attempt["parent_review_id"],) if attempt else (None,),
+            ).fetchone()
+            latest = db.execute(
+                "SELECT attempt_id FROM execution_attempts WHERE thread_id=? AND cycle_id=? "
+                "ORDER BY attempt_number DESC LIMIT 1",
+                (attempt["thread_id"], attempt["cycle_id"])
+                if attempt
+                else (None, None),
+            ).fetchone()
+            if (
+                not attempt
+                or not permit
+                or not state
+                or not plan
+                or not parent
+                or not latest
+                or attempt["kind"] != AttemptKind.REVIEW_REPAIR.value
+                or attempt["status"] != AttemptStatus.RUNNING.value
+                or permit["consumed_at"] is not None
+                or permit["invalidated_at"] is not None
+                or state["phase"] != WorkflowPhase.EXECUTING.value
+                or state["cycle_id"] != attempt["cycle_id"]
+                or state["root_event_key"] != attempt["root_event_key"]
+                or state["current_plan_id"] != attempt["plan_id"]
+                or permit["thread_id"] != attempt["thread_id"]
+                or permit["cycle_id"] != attempt["cycle_id"]
+                or permit["plan_id"] != attempt["plan_id"]
+                or permit["plan_version"] != attempt["plan_version"]
+                or permit["root_event_key"] != attempt["root_event_key"]
+                or plan["version"] != attempt["plan_version"]
+                or plan["status"]
+                not in (PlanStatus.APPROVED.value, PlanStatus.AUTO_APPROVED.value)
+                or parent["verdict"] != "NEEDS_FIXES"
+                or parent["thread_id"] != attempt["thread_id"]
+                or parent["cycle_id"] != attempt["cycle_id"]
+                or parent["root_event_key"] != attempt["root_event_key"]
+                or parent["plan_id"] != attempt["plan_id"]
+                or parent["plan_version"] != attempt["plan_version"]
+                or parent["attempt_id"] != latest["attempt_id"]
+                or latest["attempt_id"] != attempt["attempt_id"]
+            ):
+                raise ValueError("orphaned repair attempt binding is stale")
+            db.execute(
+                "UPDATE execution_attempts SET status=?,completed_at=? WHERE attempt_id=?",
+                (AttemptStatus.FAILED.value, now, attempt_id),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
+                (WorkflowPhase.REPAIR_READY.value, now, attempt["thread_id"]),
+            )
+
+    def fail_closed_repair_recovery(self, attempt_id: str, *, now: str) -> None:
+        """Quarantine impossible EXECUTING/repair state without claiming success."""
+        with self.transaction(immediate=True) as db:
+            attempt = db.execute(
+                "SELECT * FROM execution_attempts WHERE attempt_id=?", (attempt_id,)
+            ).fetchone()
+            if not attempt or attempt["kind"] != AttemptKind.REVIEW_REPAIR.value:
+                raise ValueError("repair recovery attempt is invalid")
+            db.execute(
+                "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=? "
+                "AND phase=?",
+                (
+                    WorkflowPhase.REVIEW_BLOCKED.value,
+                    now,
+                    attempt["thread_id"],
+                    WorkflowPhase.EXECUTING.value,
+                ),
+            )
+
     def publication_is_eligible(self, event_key: str) -> bool:
         row = self.connection.execute(
             "SELECT ee.status execution_status, s.thread_id, s.cycle_id, s.root_event_key, s.current_plan_id, s.phase, "
