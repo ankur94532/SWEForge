@@ -244,6 +244,7 @@ CREATE TABLE IF NOT EXISTS repo_memory_learning (
     status TEXT NOT NULL,
     accepted_candidates INTEGER NOT NULL DEFAULT 0,
     rejected_candidates INTEGER NOT NULL DEFAULT 0,
+    proposal_json TEXT NOT NULL DEFAULT '{}',
     error_message TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -545,6 +546,7 @@ class RepoMemoryLearningRecord:
     error_message: str | None
     created_at: str
     updated_at: str
+    proposal_json: str = "{}"
 
 
 @dataclass(frozen=True)
@@ -639,6 +641,17 @@ class SQLiteGitHubStore:
             row[1]
             for row in self.connection.execute("PRAGMA table_info(execution_permits)")
         }
+        memory_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(repo_memory_learning)"
+            )
+        }
+        if "proposal_json" not in memory_columns:
+            self.connection.execute(
+                "ALTER TABLE repo_memory_learning ADD COLUMN proposal_json "
+                "TEXT NOT NULL DEFAULT '{}'"
+            )
         if "root_event_key" not in permit_columns:
             self.connection.execute(
                 "ALTER TABLE execution_permits ADD COLUMN root_event_key TEXT"
@@ -2403,12 +2416,13 @@ class SQLiteGitHubStore:
                 """INSERT INTO repo_memory_learning(
                    event_key, thread_id, cycle_id, repo_id, status,
                    accepted_candidates, rejected_candidates, error_message,
-                   created_at, updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)
+                   proposal_json, created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(event_key) DO UPDATE SET status=excluded.status,
                    accepted_candidates=excluded.accepted_candidates,
                    rejected_candidates=excluded.rejected_candidates,
                    error_message=excluded.error_message,
+                   proposal_json=excluded.proposal_json,
                    updated_at=excluded.updated_at""",
                 (
                     record.event_key,
@@ -2419,6 +2433,7 @@ class SQLiteGitHubStore:
                     record.accepted_candidates,
                     record.rejected_candidates,
                     record.error_message,
+                    record.proposal_json,
                     record.created_at,
                     record.updated_at,
                 ),

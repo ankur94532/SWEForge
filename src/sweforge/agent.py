@@ -13,7 +13,7 @@ from deepagents.backends import (
     StateBackend,
     StoreBackend,
 )
-from deepagents.backends.protocol import BackendProtocol
+from deepagents.backends.protocol import SandboxBackendProtocol
 from deepagents.middleware.permissions import FilesystemPermission
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
@@ -118,7 +118,7 @@ def _build_backend(
     repo_context: RepoAgentContext | None = None,
     memory_namespace: tuple[str, ...] | None = None,
     skills_store: BaseStore | None = None,
-    sandbox_backend: BackendProtocol | None = None,
+    sandbox_backend: SandboxBackendProtocol | None = None,
 ) -> CompositeBackend:
     local = sandbox_backend or LocalShellBackend(
         root_dir=worktree,

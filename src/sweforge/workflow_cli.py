@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .capabilities import load_capability_registry
 from .execution import SQLiteCheckpointer
+from .execution_security import resolve_sandbox_provider
 from .github_auth import DEFAULT_API_VERSION, GitHubAppAuthenticator
 from .github_client import HttpxGitHubClient
 from .github_store import SQLiteGitHubStore
@@ -53,6 +54,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--unsafe-local-shell",
         action="store_true",
         help="development-only; disables the strict sandbox boundary",
+    )
+    parser.add_argument(
+        "--sandbox-provider",
+        help="trusted installed sandbox provider entry-point name",
     )
     parser.add_argument(
         "--api-url",
@@ -140,6 +145,9 @@ def main(argv: list[str] | None = None) -> int:
                 "capability_registry": capability_registry,
                 "secure_execution": not args.unsafe_local_shell,
                 "unsafe_local_shell": args.unsafe_local_shell,
+                "sandbox_backend_provider": resolve_sandbox_provider(
+                    args.sandbox_provider
+                ),
             },
         )
     except (OSError, RuntimeError, ValueError) as exc:

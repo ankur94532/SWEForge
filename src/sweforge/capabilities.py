@@ -85,13 +85,9 @@ def repo_scope_interceptor(registry: RepoCapabilityRegistry):
                 tool_call_id=getattr(runtime, "tool_call_id", "unknown"),
             )
         args = dict(request.args)
-        for field in (
-            "repo_id",
-            "repo_full_name",
-            "workspace_root",
-            "repo_path",
-            "tenant",
-        ):
+        args["repo_id"] = context.repo_id
+        args["repo_full_name"] = context.repo_full_name
+        for field in ("workspace_root", "repo_path", "tenant"):
             args.pop(field, None)
         return await handler(request.override(args=args))
 

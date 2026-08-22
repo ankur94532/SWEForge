@@ -2,6 +2,7 @@
 
 import fcntl
 import hashlib
+import json
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -22,6 +23,8 @@ SECRET_RE = re.compile(
 MAX_CANDIDATES = 20
 MAX_FACT_CHARS = 1_000
 MAX_EXCERPT_CHARS = 2_000
+MAX_CATALOG_LINES_PER_FILE = 80
+MAX_CATALOG_FILES = 100
 
 
 class MemoryLearningStatus(StrEnum):
@@ -39,6 +42,13 @@ class RepoMemoryEvidence(BaseModel):
     excerpt: str = Field(min_length=1, max_length=MAX_EXCERPT_CHARS)
 
 
+class RepoMemoryProposal(BaseModel):
+    category: str = Field(min_length=1, max_length=40)
+    fact: str = Field(min_length=1, max_length=MAX_FACT_CHARS)
+    evidence_ids: list[str] = Field(min_length=1, max_length=10)
+    durability_reason: str = Field(min_length=1, max_length=500)
+
+
 class RepoMemoryCandidate(BaseModel):
     candidate_id: str = Field(min_length=1, max_length=120)
     category: str = Field(min_length=1, max_length=40)
@@ -48,7 +58,23 @@ class RepoMemoryCandidate(BaseModel):
 
 
 class RepoMemoryCuratorResponse(BaseModel):
-    candidates: list[RepoMemoryCandidate] = Field(default_factory=list, max_length=20)
+    proposals: list[RepoMemoryProposal] = Field(default_factory=list, max_length=20)
+
+
+@dataclass(frozen=True)
+class RepoMemoryEvidenceItem:
+    evidence_id: str
+    path: str
+    start_line: int
+    end_line: int
+    content_hash: str
+    excerpt: str
+
+
+@dataclass(frozen=True)
+class CuratorOutput:
+    candidates: list[RepoMemoryCandidate]
+    proposal_json: str
 
 
 @dataclass(frozen=True)
@@ -68,39 +94,109 @@ def curate_repository_memory(
     diff: str,
     existing_memory: str,
     plan_text: str,
-) -> list[RepoMemoryCandidate]:
+) -> CuratorOutput:
     """Ask a bounded read-only model for structured, evidence-backed candidates."""
-    del repo_id
     root = Path(worktree).resolve()
-    file_sections: list[str] = []
-    for relative in changed_files[:100]:
+    catalog: list[RepoMemoryEvidenceItem] = []
+    for relative in sorted(set(changed_files))[:MAX_CATALOG_FILES]:
         path = _safe_path(root, relative)
         try:
-            text = path.read_text(encoding="utf-8")[:8_000]
+            lines = path.read_text(encoding="utf-8").splitlines()
         except (OSError, UnicodeError):
             continue
-        file_sections.append(f"\n[FILE {relative}]\n{text}")
+        for start in range(0, min(len(lines), MAX_CATALOG_LINES_PER_FILE), 20):
+            selected = lines[start : start + 20]
+            if not selected:
+                continue
+            excerpt = "\n".join(selected)
+            identity = f"{relative}:{start + 1}:{start + len(selected)}:{excerpt}"
+            catalog.append(
+                RepoMemoryEvidenceItem(
+                    evidence_id=hashlib.sha256(identity.encode()).hexdigest()[:20],
+                    path=relative,
+                    start_line=start + 1,
+                    end_line=start + len(selected),
+                    content_hash=hashlib.sha256(excerpt.encode()).hexdigest(),
+                    excerpt=excerpt[:MAX_EXCERPT_CHARS],
+                )
+            )
+    catalog_text = "\n".join(
+        f"[{item.evidence_id}] {item.path}:{item.start_line}-{item.end_line}\n"
+        + "\n".join(
+            f"{number}: {line}"
+            for number, line in zip(
+                range(item.start_line, item.end_line + 1), item.excerpt.splitlines()
+            )
+        )
+        for item in catalog
+    )
     prompt = (
-        "You are a repository-memory curator. Return only structured candidates. "
+        "You are a repository-memory curator. Return only structured proposals. "
         "Propose durable knowledge useful to future tasks in this same repository. "
         "Return zero candidates when evidence is temporary, generic, uncertain, "
         "issue-specific, secret-like, or duplicated. Every candidate must cite an "
-        "exact supplied file path, line range, excerpt, and SHA-256 hash. Never use "
+        "one or more evidence_ids from the supplied catalog. Never invent IDs, paths, "
+        "line ranges, excerpts, or hashes; the application resolves evidence IDs. "
+        "Never use "
         "issue text or model assertions as sole evidence. Do not write files.\n\n"
         f"Existing repository memory:\n{existing_memory[:12_000]}\n\n"
         f"Accepted plan (supplemental only):\n{plan_text[:12_000]}\n\n"
         f"Changed files:\n{', '.join(changed_files[:100])}\n\n"
-        f"Cumulative diff:\n{diff[:40_000]}\n" + "".join(file_sections)[:60_000]
+        f"Cumulative diff:\n{diff[:40_000]}\n\nEvidence catalog (line-numbered):\n"
+        + catalog_text[:60_000]
     )
     curator = init_chat_model(model, max_retries=0, timeout=120).with_structured_output(
         RepoMemoryCuratorResponse
     )
     response = curator.invoke(prompt)
     if isinstance(response, RepoMemoryCuratorResponse):
-        return response.candidates
-    if isinstance(response, dict):
-        return RepoMemoryCuratorResponse.model_validate(response).candidates
-    raise ValueError("memory curator did not return structured candidates")
+        parsed = response
+    elif isinstance(response, dict):
+        parsed = RepoMemoryCuratorResponse.model_validate(response)
+    else:
+        raise ValueError("memory curator did not return structured proposals")
+    by_id = {item.evidence_id: item for item in catalog}
+    candidates: list[RepoMemoryCandidate] = []
+    for proposal in parsed.proposals:
+        evidence_items = [by_id.get(item_id) for item_id in proposal.evidence_ids]
+        if any(item is None for item in evidence_items):
+            raise ValueError("memory curator referenced an unknown evidence ID")
+        evidence = [
+            RepoMemoryEvidence(
+                path=item.path,
+                start_line=item.start_line,
+                end_line=item.end_line,
+                content_hash=item.content_hash,
+                excerpt=item.excerpt,
+            )
+            for item in evidence_items
+            if item is not None
+        ]
+        material = "\0".join(
+            [
+                str(repo_id),
+                proposal.category.casefold(),
+                proposal.fact.casefold(),
+                *sorted(
+                    item.content_hash for item in evidence_items if item is not None
+                ),
+            ]
+        )
+        candidates.append(
+            RepoMemoryCandidate(
+                candidate_id=hashlib.sha256(material.encode()).hexdigest()[:24],
+                category=proposal.category,
+                fact=proposal.fact,
+                evidence=evidence,
+                durability_reason=proposal.durability_reason,
+            )
+        )
+    return CuratorOutput(
+        candidates=candidates,
+        proposal_json=json.dumps(
+            [candidate.model_dump() for candidate in candidates], sort_keys=True
+        ),
+    )
 
 
 @contextmanager
@@ -182,10 +278,12 @@ def apply_memory_candidates(
     with repo_memory_lock(lock_root, repo_id):
         current = read_repo_memory(store, namespace) or "# SWEForge Repository Memory\n"
         existing = {line.strip().casefold() for line in current.splitlines()}
+        existing_ids = set(re.findall(r"sweforge-memory-entry:([0-9a-f]+)", current))
         novel = [
             candidate
             for candidate in accepted
-            if not any(candidate.fact.strip().casefold() in line for line in existing)
+            if candidate.candidate_id not in existing_ids
+            and not any(candidate.fact.strip().casefold() in line for line in existing)
         ]
         if not novel:
             return MemoryLearningResult(
@@ -193,7 +291,9 @@ def apply_memory_candidates(
                 rejected_candidates=rejected,
             )
         sections = [
-            f"- [{candidate.category}] {candidate.fact.strip()}" for candidate in novel
+            f"- [{candidate.category}] {candidate.fact.strip()}\n"
+            f"<!-- sweforge-memory-entry:{candidate.candidate_id} -->"
+            for candidate in novel
         ]
         append_repo_memory(store, namespace, "\n".join(sections))
     return MemoryLearningResult(

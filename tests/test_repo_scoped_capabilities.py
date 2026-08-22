@@ -14,7 +14,10 @@ from sweforge.capabilities import (
     repo_scope_interceptor,
 )
 from sweforge.context import RepoAgentContext
-from sweforge.execution_security import SecureExecutionUnavailable
+from sweforge.execution_security import (
+    SecureExecutionUnavailable,
+    require_secure_backend,
+)
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import (
     RepoMemoryLearningRecord,
@@ -230,14 +233,15 @@ def test_mcp_same_named_tools_are_server_prefixed_and_pair_filtered(monkeypatch)
     assert [tool.name for tool in tools] == ["a_search", "b_deploy"]
 
 
-def test_real_stdio_mcp_adapter_reaches_interceptor_and_strips_authority(tmp_path):
+def test_real_stdio_mcp_adapter_reaches_interceptor_and_overwrites_authority(tmp_path):
     server = tmp_path / "server.py"
     server.write_text(
         "from mcp.server.fastmcp import FastMCP\n"
         "m = FastMCP('fixture')\n"
         "@m.tool()\n"
-        "def read_repo(repo_id: int = 0, repo_path: str = '') -> str:\n"
-        "    return f'{repo_id}:{repo_path}'\n"
+        "def read_repo(repo_id: int = 0, repo_full_name: str = '', "
+        "repo_path: str = '') -> str:\n"
+        "    return f'{repo_id}:{repo_full_name}:{repo_path}'\n"
         "m.run()\n"
     )
     registry = RepoCapabilityRegistry()
@@ -258,7 +262,8 @@ def test_real_stdio_mcp_adapter_reaches_interceptor_and_strips_authority(tmp_pat
         )
 
     result = asyncio.run(invoke())
-    assert "0:" in str(result)
+    assert "101:owner/repo:" in str(result)
+    assert "/other/repo" not in str(result)
 
 
 def test_strict_repo_execution_fails_closed_without_sandbox(tmp_path):
@@ -270,6 +275,33 @@ def test_strict_repo_execution_fails_closed_without_sandbox(tmp_path):
             task="inspect",
             repo_context=context,
             secure_execution=True,
+        )
+
+
+def test_configured_sandbox_provider_is_wired_and_shell_capable(tmp_path):
+    context = RepoAgentContext(101, "owner/repo", "thread-a")
+    backend = SimpleNamespace(execute=lambda *_args, **_kwargs: None)
+
+    def provider(*, context, worktree):
+        assert context.repo_id == 101
+        assert worktree == str(tmp_path)
+        return backend
+
+    assert (
+        require_secure_backend(
+            context=context,
+            worktree=str(tmp_path),
+            provider=provider,
+            unsafe_local_shell=False,
+        )
+        is backend
+    )
+    with pytest.raises(SecureExecutionUnavailable):
+        require_secure_backend(
+            context=context,
+            worktree=str(tmp_path),
+            provider=lambda **_: SimpleNamespace(),
+            unsafe_local_shell=False,
         )
 
 
@@ -365,6 +397,7 @@ def test_workflow_learning_pending_retry_updates_memory_and_is_idempotent(tmp_pa
         repo_paths={},
         workspace_root=tmp_path,
         memory_store=memory.store,
+        execute_kwargs={"memory_lock_root": tmp_path / "locks"},
     )
     assert result.phase is WorkflowPhase.IDLE
     assert store.repo_memory_learning(event.event_key).status == "UPDATED"

@@ -985,6 +985,7 @@ class WorkflowEngine:
                 error_message=None,
                 created_at=learning_now,
                 updated_at=learning_now,
+                proposal_json="{}",
             )
         )
         self.store.save_workflow_state(
@@ -1017,16 +1018,25 @@ class WorkflowEngine:
     ) -> None:
         now = self.clock()
         existing = self.store.repo_memory_learning(state.root_event_key)
+        proposal_json = existing.proposal_json if existing else "{}"
         if existing is not None and existing.status in {
             MemoryLearningStatus.UPDATED.value,
             MemoryLearningStatus.NO_UPDATE.value,
         }:
             return
         try:
-            if self.memory_learner and workspace_path:
+            if proposal_json != "{}":
+                candidates = [
+                    RepoMemoryCandidate.model_validate(item)
+                    for item in json.loads(proposal_json)
+                ]
+            elif self.memory_learner and workspace_path:
                 candidates = self.memory_learner(
                     state=state,
                     worktree=workspace_path,
+                )
+                proposal_json = json.dumps(
+                    [candidate.model_dump() for candidate in candidates], sort_keys=True
                 )
             elif memory_model and workspace_path and memory_store is not None:
                 workspace_record = self.store.thread_workspace(state.thread_id)
@@ -1040,7 +1050,7 @@ class WorkflowEngine:
                 )
                 from .repo_memory import read_repo_memory, repo_memory_namespace
 
-                candidates = curate_repository_memory(
+                curator_output = curate_repository_memory(
                     model=memory_model,
                     repo_id=state.repo_id,
                     worktree=workspace_path,
@@ -1052,8 +1062,26 @@ class WorkflowEngine:
                     or "",
                     plan_text=plan.plan_text if plan else "",
                 )
+                candidates = curator_output.candidates
+                proposal_json = curator_output.proposal_json
             else:
                 candidates = []
+                proposal_json = "[]"
+            self.store.save_repo_memory_learning(
+                RepoMemoryLearningRecord(
+                    event_key=state.root_event_key,
+                    thread_id=state.thread_id,
+                    cycle_id=state.cycle_id,
+                    repo_id=state.repo_id,
+                    status=MemoryLearningStatus.PENDING.value,
+                    accepted_candidates=0,
+                    rejected_candidates=0,
+                    error_message=None,
+                    created_at=existing.created_at if existing else now,
+                    updated_at=now,
+                    proposal_json=proposal_json,
+                )
+            )
             if memory_store is None or not workspace_path:
                 result = MemoryLearningResult(
                     MemoryLearningStatus.NO_UPDATE,
@@ -1082,8 +1110,9 @@ class WorkflowEngine:
                 accepted_candidates=result.accepted_candidates,
                 rejected_candidates=result.rejected_candidates,
                 error_message=result.error,
-                created_at=now,
+                created_at=existing.created_at if existing else now,
                 updated_at=now,
+                proposal_json=proposal_json,
             )
         )
 
