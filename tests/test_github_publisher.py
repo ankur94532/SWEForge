@@ -3,6 +3,8 @@ import subprocess
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_publisher import GitHubPublisher, expected_github_remote
 from sweforge.github_store import (
+    ExecutionPermit,
+    PermitSource,
     PublicationStatus,
     SQLiteGitHubStore,
     ThreadWorkspaceRecord,
@@ -197,6 +199,22 @@ def setup_publication(tmp_path):
             "now",
             "now",
         ),
+    )
+    store.connection.commit()
+    store.insert_permit(
+        ExecutionPermit(
+            permit_id="permit-reviewed",
+            thread_id=claim.thread_id,
+            cycle_id=1,
+            plan_id=plan_id,
+            plan_version=1,
+            root_event_key=claim.event_key,
+            source=PermitSource.USER,
+            source_event_key=None,
+            created_at="now",
+            consumed_at="now",
+            invalidated_at=None,
+        )
     )
     store.connection.commit()
     return store, event.event_key, remote

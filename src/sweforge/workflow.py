@@ -966,45 +966,70 @@ class WorkflowEngine:
                 purpose=purpose,
             )
 
+    def _recover_execution_review(self, state: WorkflowStateRecord):
+        """Recover a successful execution into the durable review gate."""
+        if state.phase != WorkflowPhase.EXECUTING:
+            return state
+        execution = self.store.execution_for_event(state.root_event_key)
+        if not execution or execution["status"] != "SUCCEEDED":
+            return state
+        plan = self.store.current_plan(state.thread_id)
+        permit = self.store.permit_for_plan(plan.plan_id) if plan else None
+        if (
+            plan is None
+            or permit is None
+            or permit.thread_id != state.thread_id
+            or permit.cycle_id != state.cycle_id
+            or permit.plan_id != plan.plan_id
+            or permit.plan_version != plan.version
+            or permit.root_event_key != state.root_event_key
+            or plan.status not in (PlanStatus.APPROVED, PlanStatus.AUTO_APPROVED)
+        ):
+            self.store.save_workflow_state(
+                replace(
+                    state,
+                    phase=WorkflowPhase.REVIEW_BLOCKED,
+                    updated_at=self.clock(),
+                )
+            )
+            return self.store.workflow_state(state.thread_id)
+        attempt = self.store.latest_attempt(state.thread_id, state.cycle_id)
+        if attempt is None:
+            attempt = self.store.ensure_execution_attempt(
+                attempt_id=f"attempt-{permit.permit_id}",
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                plan_id=plan.plan_id,
+                plan_version=plan.version,
+                root_event_key=state.root_event_key,
+                authorization_id=permit.permit_id,
+                created_at=self.clock(),
+                attempt_number=1,
+            )
+        if attempt.status != AttemptStatus.SUCCEEDED:
+            self.store.finish_execution_attempt(
+                attempt.attempt_id,
+                status=AttemptStatus.SUCCEEDED,
+                completed_at=execution["completed_at"] or self.clock(),
+                response_text=execution["response_text"],
+                start_head_sha=execution["start_head_sha"],
+                end_head_sha=execution["end_head_sha"],
+                end_dirty=bool(execution["end_dirty"]),
+            )
+        self.store.save_workflow_state(
+            replace(
+                state,
+                phase=WorkflowPhase.REVIEW_EXECUTION,
+                updated_at=self.clock(),
+            )
+        )
+        return self.store.workflow_state(state.thread_id)
+
     def next_root(self, thread_id: str) -> str | None:
         state = self.store.workflow_state(thread_id)
         self._drain_approval_controls(thread_id, state)
-        if state and state.phase == WorkflowPhase.EXECUTING:
-            execution = self.store.execution_for_event(state.root_event_key)
-            attempt = self.store.latest_attempt(thread_id, state.cycle_id)
-            plan = self.store.current_plan(thread_id)
-            if execution and execution["status"] == "SUCCEEDED" and plan:
-                if attempt is None:
-                    permit = self.store.permit_for_plan(plan.plan_id)
-                    if permit:
-                        attempt = self.store.ensure_execution_attempt(
-                            attempt_id=f"attempt-{permit.permit_id}",
-                            thread_id=thread_id,
-                            cycle_id=state.cycle_id,
-                            plan_id=plan.plan_id,
-                            plan_version=plan.version,
-                            root_event_key=state.root_event_key,
-                            authorization_id=permit.permit_id,
-                            created_at=self.clock(),
-                        )
-                if attempt and attempt.status != AttemptStatus.SUCCEEDED:
-                    self.store.finish_execution_attempt(
-                        attempt.attempt_id,
-                        status=AttemptStatus.SUCCEEDED,
-                        completed_at=execution["completed_at"] or self.clock(),
-                        response_text=execution["response_text"],
-                        start_head_sha=execution["start_head_sha"],
-                        end_head_sha=execution["end_head_sha"],
-                        end_dirty=bool(execution["end_dirty"]),
-                    )
-                self.store.save_workflow_state(
-                    replace(
-                        state,
-                        phase=WorkflowPhase.REVIEW_EXECUTION,
-                        updated_at=self.clock(),
-                    )
-                )
-                state = self.store.workflow_state(thread_id)
+        if state:
+            state = self._recover_execution_review(state)
         after = state.root_event_key if state else None
         candidates = self.store.unconsumed_inputs(thread_id, after_event_key=after)
         for row in candidates:
@@ -1024,6 +1049,86 @@ class WorkflowEngine:
             if self.store.execution_for_event(row["event_key"]) is None:
                 return self.plan_event(event_key=row["event_key"], **plan_kwargs)
         return None
+
+    def _run_review_locked(
+        self,
+        *,
+        state: WorkflowStateRecord,
+        attempt,
+        plan: PlanRecord,
+        memory_store: BaseStore | None,
+        model: str,
+    ) -> ExecutionReviewRecord:
+        workspace = self.store.thread_workspace(state.thread_id)
+        execution = self.store.execution_for_event(state.root_event_key)
+        if execution is None or workspace is None:
+            raise ValueError("review evidence is unavailable")
+        evidence = {
+            "plan": {
+                "id": plan.plan_id,
+                "version": plan.version,
+                "text": plan.plan_text,
+            },
+            "execution": dict(execution),
+            "attempt": attempt.__dict__,
+            "current_head": execution["end_head_sha"],
+            "base_head": workspace.base_commit,
+        }
+        inspection = Workspace(
+            Path(workspace.workspace_path),
+            Path(workspace.workspace_path),
+            workspace.base_commit,
+        )
+        evidence["changed_files"] = inspection.changed_files()[:500]
+        evidence["diff"] = inspection.diff()[:60_000]
+        evidence["dirty"] = not inspection.is_clean()
+        source = self.store.source_event(state.root_event_key)
+        evidence["source"] = dict(source) if source else {}
+        if attempt.parent_review_id:
+            previous = self.store.execution_review(attempt.parent_review_id)
+            evidence["previous_review"] = previous.__dict__ if previous else {}
+        review_delivered: set[str] = set()
+        result = self.reviewer(
+            context=ReviewerContext(
+                worktree=workspace.workspace_path,
+                memory_store=memory_store,
+                memory_namespace=repo_memory_namespace(state.repo_id),
+                live_input_provider=lambda: self.pending_live_inputs(state.thread_id),
+                live_delivered_event_keys=review_delivered,
+            ),
+            model=model,
+            evidence=evidence,
+        )
+        for event_key in review_delivered:
+            self._acknowledge_delivered(
+                event_key,
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                purpose=InputPurpose.LIVE_REVIEW_INPUT,
+            )
+        review_id = "review-" + _stable_id(
+            attempt.attempt_id, json.dumps(result.model_dump(), sort_keys=True)
+        )
+        return self.store.save_execution_review(
+            ExecutionReviewRecord(
+                review_id=review_id,
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                plan_id=plan.plan_id,
+                plan_version=plan.version,
+                root_event_key=state.root_event_key,
+                attempt_id=attempt.attempt_id,
+                review_iteration=attempt.attempt_number,
+                verdict=result.verdict,
+                summary=result.summary,
+                findings_json=json.dumps(
+                    [item.model_dump() for item in result.findings]
+                ),
+                repair_instructions_json=json.dumps(result.repair_instructions),
+                created_at=self.clock(),
+                completed_at=self.clock(),
+            )
+        )
 
     def advance(
         self,
@@ -1045,6 +1150,8 @@ class WorkflowEngine:
         """
         state = self.store.workflow_state(thread_id)
         self._drain_approval_controls(thread_id, state)
+        if state:
+            state = self._recover_execution_review(state)
         if state and state.phase == WorkflowPhase.REVIEW_BLOCKED:
             latest = self.store.latest_attempt(thread_id, state.cycle_id)
             review = (
@@ -1132,81 +1239,57 @@ class WorkflowEngine:
                         permit_id=repair.permit_id,
                         message="repair authorized by execution review",
                     )
+                if existing_review.verdict == "BLOCKED":
+                    try:
+                        self.store.block_execution_review(
+                            existing_review.review_id, now=self.clock()
+                        )
+                    except ValueError:
+                        raise
+                    self.post_blocked_review_comment(
+                        thread_id, summary=existing_review.summary
+                    )
+                    return WorkflowAdvanceResult(
+                        WorkflowPhase.REVIEW_BLOCKED,
+                        thread_id,
+                        message=existing_review.verdict,
+                    )
                 return WorkflowAdvanceResult(
                     WorkflowPhase.REVIEW_BLOCKED,
                     thread_id,
                     message=existing_review.verdict,
                 )
-            execution = self.store.execution_for_event(state.root_event_key)
-            workspace = self.store.thread_workspace(thread_id)
-            if execution is None or workspace is None:
-                raise ValueError("review evidence is unavailable")
-            evidence = {
-                "plan": {
-                    "id": plan.plan_id,
-                    "version": plan.version,
-                    "text": plan.plan_text,
-                },
-                "execution": dict(execution),
-                "attempt": attempt.__dict__,
-                "current_head": execution["end_head_sha"],
-                "base_head": workspace.base_commit,
-            }
-            inspection = Workspace(
-                Path(workspace.workspace_path),
-                Path(workspace.workspace_path),
-                workspace.base_commit,
+            lock_root = (execute_kwargs or {}).get(
+                "lock_root", Path("~/.sweforge/locks").expanduser()
             )
-            evidence["changed_files"] = inspection.changed_files()[:500]
-            evidence["diff"] = inspection.diff()[:60_000]
-            evidence["dirty"] = not inspection.is_clean()
-            source = self.store.source_event(state.root_event_key)
-            evidence["source"] = dict(source) if source else {}
-            if attempt.parent_review_id:
-                previous = self.store.execution_review(attempt.parent_review_id)
-                evidence["previous_review"] = previous.__dict__ if previous else {}
-            review_delivered: set[str] = set()
-            result = self.reviewer(
-                context=ReviewerContext(
-                    worktree=workspace.workspace_path,
-                    memory_store=memory_store,
-                    memory_namespace=repo_memory_namespace(state.repo_id),
-                    live_input_provider=lambda: self.pending_live_inputs(thread_id),
-                    live_delivered_event_keys=review_delivered,
-                ),
-                model=review_model or model,
-                evidence=evidence,
-            )
-            for event_key in review_delivered:
-                self._acknowledge_delivered(
-                    event_key,
-                    thread_id=thread_id,
-                    cycle_id=state.cycle_id,
-                    purpose=InputPurpose.LIVE_REVIEW_INPUT,
+            try:
+                with thread_lock(lock_root, thread_id):
+                    state = self.store.workflow_state(thread_id)
+                    if state is None or state.phase != WorkflowPhase.REVIEW_EXECUTION:
+                        return WorkflowAdvanceResult(
+                            state.phase if state else WorkflowPhase.IDLE,
+                            thread_id,
+                            message="review state changed",
+                        )
+                    attempt = self.store.latest_attempt(thread_id, state.cycle_id)
+                    plan = self.store.current_plan(thread_id)
+                    if attempt is None or plan is None:
+                        raise ValueError(
+                            "review workflow is missing its attempt or plan"
+                        )
+                    review = self.store.execution_review_for_attempt(attempt.attempt_id)
+                    if review is None:
+                        review = self._run_review_locked(
+                            state=state,
+                            attempt=attempt,
+                            plan=plan,
+                            memory_store=memory_store,
+                            model=review_model or model,
+                        )
+            except ThreadLockUnavailable:
+                return WorkflowAdvanceResult(
+                    WorkflowPhase.REVIEW_EXECUTION, thread_id, message="busy"
                 )
-            review_id = "review-" + _stable_id(
-                attempt.attempt_id, json.dumps(result.model_dump(), sort_keys=True)
-            )
-            review = self.store.save_execution_review(
-                ExecutionReviewRecord(
-                    review_id=review_id,
-                    thread_id=thread_id,
-                    cycle_id=state.cycle_id,
-                    plan_id=plan.plan_id,
-                    plan_version=plan.version,
-                    root_event_key=state.root_event_key,
-                    attempt_id=attempt.attempt_id,
-                    review_iteration=attempt.attempt_number,
-                    verdict=result.verdict,
-                    summary=result.summary,
-                    findings_json=json.dumps(
-                        [item.model_dump() for item in result.findings]
-                    ),
-                    repair_instructions_json=json.dumps(result.repair_instructions),
-                    created_at=self.clock(),
-                    completed_at=self.clock(),
-                )
-            )
             if review.verdict == "ACCEPT":
                 self.store.accept_execution_review(review.review_id, now=self.clock())
                 return WorkflowAdvanceResult(

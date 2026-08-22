@@ -590,15 +590,47 @@ class SQLiteGitHubStore:
                    WHERE issue_plans.plan_id=execution_permits.plan_id)"""
             )
         # Successful executions created before the review gate must never be
-        # published implicitly after an upgrade.
+        # published implicitly after an upgrade.  Only an exact permit/plan
+        # binding is recoverable; all other legacy rows fail closed.
+        exact_recovery = """
+            EXISTS (
+                SELECT 1 FROM execution_permits p
+                JOIN issue_plans pplan ON pplan.plan_id = p.plan_id
+                JOIN event_executions e ON e.event_key = p.root_event_key
+                WHERE p.thread_id = issue_workflow_state.thread_id
+                  AND p.cycle_id = issue_workflow_state.cycle_id
+                  AND p.plan_id = issue_workflow_state.current_plan_id
+                  AND p.root_event_key = issue_workflow_state.root_event_key
+                  AND p.plan_version = pplan.version
+                  AND pplan.status IN ('APPROVED', 'AUTO_APPROVED')
+                  AND e.status = 'SUCCEEDED'
+            )
+        """
         self.connection.execute(
-            """UPDATE issue_workflow_state SET phase = ?
-               WHERE phase = ? AND NOT EXISTS (
-                 SELECT 1 FROM execution_reviews r
-                 WHERE r.thread_id = issue_workflow_state.thread_id
-                   AND r.verdict = 'ACCEPT')""",
+            f"""UPDATE issue_workflow_state SET phase = ?
+                WHERE phase = ? AND NOT EXISTS (
+                    SELECT 1 FROM execution_reviews r
+                    WHERE r.thread_id = issue_workflow_state.thread_id
+                      AND r.cycle_id = issue_workflow_state.cycle_id
+                      AND r.root_event_key = issue_workflow_state.root_event_key
+                      AND r.verdict = 'ACCEPT'
+                ) AND {exact_recovery}""",
             (
                 WorkflowPhase.REVIEW_EXECUTION.value,
+                WorkflowPhase.AWAITING_PUBLICATION.value,
+            ),
+        )
+        self.connection.execute(
+            f"""UPDATE issue_workflow_state SET phase = ?
+                WHERE phase = ? AND NOT EXISTS (
+                    SELECT 1 FROM execution_reviews r
+                    WHERE r.thread_id = issue_workflow_state.thread_id
+                      AND r.cycle_id = issue_workflow_state.cycle_id
+                      AND r.root_event_key = issue_workflow_state.root_event_key
+                      AND r.verdict = 'ACCEPT'
+                ) AND NOT ({exact_recovery})""",
+            (
+                WorkflowPhase.REVIEW_BLOCKED.value,
                 WorkflowPhase.AWAITING_PUBLICATION.value,
             ),
         )
@@ -1460,20 +1492,45 @@ class SQLiteGitHubStore:
                 "SELECT * FROM execution_attempts WHERE attempt_id=?",
                 (row["attempt_id"],) if row else (None,),
             ).fetchone()
+            plan = db.execute(
+                "SELECT * FROM issue_plans WHERE plan_id=?",
+                (row["plan_id"],) if row else (None,),
+            ).fetchone()
+            latest = db.execute(
+                "SELECT * FROM execution_attempts WHERE thread_id=? AND cycle_id=? "
+                "ORDER BY attempt_number DESC LIMIT 1",
+                (state["thread_id"], state["cycle_id"]) if state else (None, None),
+            ).fetchone()
             if (
                 not row
                 or not state
                 or not attempt
+                or not plan
+                or not latest
                 or row["verdict"] != "BLOCKED"
                 or state["phase"] != WorkflowPhase.REVIEW_EXECUTION.value
+                or row["thread_id"] != state["thread_id"]
+                or row["cycle_id"] != state["cycle_id"]
                 or attempt["status"] != AttemptStatus.SUCCEEDED.value
                 or state["root_event_key"] != row["root_event_key"]
                 or state["current_plan_id"] != row["plan_id"]
+                or row["plan_version"] != plan["version"]
+                or plan["status"]
+                not in (PlanStatus.APPROVED.value, PlanStatus.AUTO_APPROVED.value)
+                or attempt["thread_id"] != state["thread_id"]
+                or attempt["cycle_id"] != state["cycle_id"]
+                or attempt["root_event_key"] != state["root_event_key"]
+                or attempt["plan_id"] != plan["plan_id"]
+                or attempt["plan_version"] != plan["version"]
+                or latest["attempt_id"] != attempt["attempt_id"]
+                or row["attempt_id"] != latest["attempt_id"]
             ):
                 raise ValueError("execution review is stale or not blockable")
             db.execute(
-                "UPDATE review_repair_permits SET invalidated_at=? WHERE thread_id=? AND consumed_at IS NULL",
-                (now, row["thread_id"]),
+                "UPDATE review_repair_permits SET invalidated_at=? "
+                "WHERE thread_id=? AND cycle_id=? AND plan_id=? "
+                "AND consumed_at IS NULL AND invalidated_at IS NULL",
+                (now, row["thread_id"], state["cycle_id"], plan["plan_id"]),
             )
             db.execute(
                 "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
