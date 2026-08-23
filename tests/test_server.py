@@ -15,6 +15,7 @@ from sweforge.github_store import (
     WorkflowMode,
     WorkflowPhase,
 )
+from sweforge.reviewer import ReviewFinalizationError
 from sweforge.server import (
     ServerConfig,
     ServerInstanceLock,
@@ -89,6 +90,105 @@ def test_runnable_query_is_stable_and_persisted_backoff_excludes_thread(tmp_path
         "github:1:issue:7"
     ]
     reopened.clear_dispatcher_failure("github:1:issue:7")
+    reopened.close()
+
+
+def test_server_review_failure_records_backoff_without_hot_loop(monkeypatch, tmp_path):
+    store = _store(tmp_path)
+    repo = RepositoryRef(1, "owner/repo")
+    approval = replace(
+        _event(repo, "approval", "@agent approve"),
+        source_updated_at="2026-01-01T00:02:00Z",
+        source_created_at="2026-01-01T00:02:00Z",
+    )
+    store.record_batch(
+        1,
+        "issue_comments",
+        [approval],
+        since="now",
+        etag=None,
+        polled_at="2026-01-01T00:00:01Z",
+    )
+    root_key = store.events()[0]["event_key"]
+    engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:00:01Z")
+    engine.start_cycle(event_key=root_key, plan_text="do work", posted_comment_id=1)
+    engine.approve(event_key=approval.event_key)
+    state = store.workflow_state("github:1:issue:7")
+    plan = store.current_plan("github:1:issue:7")
+    permit = store.permit_for_plan(plan.plan_id)
+    attempt = store.ensure_execution_attempt(
+        attempt_id="attempt-1",
+        thread_id="github:1:issue:7",
+        cycle_id=1,
+        plan_id=plan.plan_id,
+        plan_version=plan.version,
+        root_event_key=state.root_event_key,
+        authorization_id=permit.permit_id,
+        created_at="2026-01-01T00:00:01Z",
+    )
+    store.finish_execution_attempt(
+        attempt.attempt_id,
+        status=AttemptStatus.SUCCEEDED,
+        completed_at="2026-01-01T00:00:02Z",
+        response_text="done",
+        start_head_sha="base",
+        end_head_sha="head",
+    )
+    store.save_workflow_state(
+        replace(state, phase=WorkflowPhase.REVIEW_EXECUTION, updated_at="now")
+    )
+    attempt_id = attempt.attempt_id
+    store.close()
+
+    calls = []
+
+    class FailingEngine:
+        def __init__(self, **_kwargs):
+            pass
+
+        def advance(self, **_kwargs):
+            calls.append(True)
+            raise ReviewFinalizationError("finalizer unavailable")
+
+    monkeypatch.setattr("sweforge.server.WorkflowEngine", FailingEngine)
+    monkeypatch.setattr(
+        "sweforge.server.build_clarification_classifier", lambda _: None
+    )
+
+    class Client:
+        def close(self):
+            pass
+
+    config = ServerConfig(
+        repositories=("owner/repo",),
+        repo_paths={"owner/repo": tmp_path},
+        db=tmp_path / "state.db",
+        checkpoints=tmp_path / "checkpoints.sqlite",
+        memory_db=tmp_path / "memory.sqlite",
+        workspace_root=tmp_path / "workspaces",
+        lock_root=tmp_path / "locks",
+        model="model",
+        max_ticks=20,
+    )
+    server = SWEForgeServer(config, client_factory=lambda _: (Client(), None))
+    with pytest.raises(ReviewFinalizationError):
+        server._worker_entry("github:1:issue:7")
+
+    reopened = SQLiteGitHubStore(tmp_path / "state.db")
+    assert len(calls) == 1
+    assert (
+        reopened.workflow_state("github:1:issue:7").phase
+        is WorkflowPhase.REVIEW_EXECUTION
+    )
+    assert reopened.latest_attempt("github:1:issue:7", 1).attempt_id == attempt_id
+    assert reopened.execution_review_for_attempt(attempt_id) is None
+    failure = reopened.dispatcher_failure("github:1:issue:7")
+    assert failure is not None
+    assert failure["failure_count"] == 1
+    assert reopened.runnable_thread_ids(now="2026-01-01T00:00:02Z") == []
+    assert reopened.runnable_thread_ids(now="9999-01-01T00:00:00Z") == [
+        "github:1:issue:7"
+    ]
     reopened.close()
 
 

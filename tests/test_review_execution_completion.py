@@ -35,6 +35,7 @@ from sweforge.reviewer import (
     ResolvedRequirementEvidence,
     ReviewerContext,
     ReviewerReadError,
+    ReviewFinalizationError,
     ReviewFinding,
     ReviewRequirementCheck,
     ReviewRequirementClassification,
@@ -172,6 +173,116 @@ def test_advance_execution_uses_durable_default_runner(monkeypatch, tmp_path):
     attempt = store.latest_attempt(thread_id, 1)
     assert attempt is not None
     assert attempt.status.value == "SUCCEEDED"
+
+
+def test_operational_review_failure_retries_same_successful_attempt(tmp_path):
+    store, engine, repo, root, thread_id, execute_kwargs = execution_ready_fixture(
+        tmp_path
+    )
+    execution_calls = []
+
+    def runner(**kwargs):
+        execution_calls.append(kwargs)
+        Path(kwargs["worktree"], "fixed.txt").write_text("fixed\n")
+        return "executor response"
+
+    execute_kwargs["runner"] = runner
+    first = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert first.phase is WorkflowPhase.REVIEW_EXECUTION
+    attempt = store.latest_attempt(thread_id, 1)
+    assert attempt is not None
+    attempt_id = attempt.attempt_id
+
+    def unavailable_reviewer(**_kwargs):
+        raise ReviewFinalizationError("finalizer unavailable")
+
+    engine.reviewer = unavailable_reviewer
+    with pytest.raises(ReviewFinalizationError):
+        engine.advance(
+            thread_id=thread_id,
+            model="planning-sonnet",
+            review_model="review-sonnet",
+            repo_paths=execute_kwargs["repo_paths"],
+            workspace_root=execute_kwargs["workspace_root"],
+            execute_kwargs=execute_kwargs,
+        )
+    assert store.workflow_state(thread_id).phase is WorkflowPhase.REVIEW_EXECUTION
+    assert store.execution_review_for_attempt(attempt_id) is None
+    assert store.repair_permit_for_thread(thread_id) is None
+    assert store.eligible_publication_id(thread_id) is None
+
+    engine.reviewer = lambda **_: ExecutionReviewResult(
+        verdict="ACCEPT", summary="accepted"
+    )
+    accepted = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        review_model="review-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert accepted.phase is WorkflowPhase.AWAITING_PUBLICATION
+    assert store.latest_attempt(thread_id, 1).attempt_id == attempt_id
+    assert len(execution_calls) == 1
+    assert store.execution_review_for_attempt(attempt_id).verdict == "ACCEPT"
+    assert store.eligible_publication_id(thread_id) is not None
+
+
+def test_semantic_blocked_review_remains_terminal(tmp_path):
+    store, engine, repo, root, thread_id, execute_kwargs = execution_ready_fixture(
+        tmp_path
+    )
+    execute_kwargs["runner"] = lambda **_: "executor response"
+    first = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert first.phase is WorkflowPhase.REVIEW_EXECUTION
+    review_calls = []
+
+    def semantic_block(**_kwargs):
+        review_calls.append(True)
+        return ExecutionReviewResult(
+            verdict="BLOCKED", summary="required evidence is insufficient"
+        )
+
+    engine.reviewer = semantic_block
+    blocked = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        review_model="review-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert blocked.phase is WorkflowPhase.REVIEW_BLOCKED
+    assert len(review_calls) == 1
+    assert (
+        store.execution_review_for_attempt(
+            store.latest_attempt(thread_id, 1).attempt_id
+        ).verdict
+        == "BLOCKED"
+    )
+    terminal = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert terminal.phase is WorkflowPhase.REVIEW_BLOCKED
+    assert len(review_calls) == 1
+    assert store.eligible_publication_id(thread_id) is None
 
 
 def test_execute_authorized_required_arguments_fail_before_mutation(tmp_path):
@@ -2124,7 +2235,7 @@ def test_inspection_tool_budget_exhaustion_reaches_finalizer(monkeypatch):
     assert finalizer.calls
 
 
-def test_finalizer_budget_fails_closed(monkeypatch):
+def test_finalizer_budget_is_operationally_recoverable(monkeypatch):
     from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
 
     inspector = _FakeAgent({"messages": []})
@@ -2135,13 +2246,12 @@ def test_finalizer_budget_fails_closed(monkeypatch):
     monkeypatch.setattr(
         "sweforge.reviewer._build_finalizer", lambda *args, **kwargs: finalizer
     )
-    result = review_execution(
-        context=ReviewerContext(worktree="/tmp/worktree"),
-        model="reviewer",
-        evidence=_review_evidence(),
-    )
-    assert result.verdict == "BLOCKED"
-    assert result.repair_instructions == []
+    with pytest.raises(ReviewFinalizationError):
+        review_execution(
+            context=ReviewerContext(worktree="/tmp/worktree"),
+            model="reviewer",
+            evidence=_review_evidence(),
+        )
 
 
 def test_reviewer_provider_errors_remain_retryable(monkeypatch):

@@ -380,6 +380,10 @@ class EvidencePackingError(ValueError):
     """Authority-critical evidence could not fit deterministic prompt bounds."""
 
 
+class ReviewFinalizationError(RuntimeError):
+    """A review could not produce a structured semantic verdict."""
+
+
 REVIEW_INSPECTION_MODEL_CALL_LIMIT = 8
 REVIEW_INSPECTION_TOOL_CALL_LIMIT = 24
 REVIEW_FINALIZER_MODEL_CALL_LIMIT = 3
@@ -2865,16 +2869,30 @@ def review_execution(
                 ]
             }
         )
-    except (ModelCallLimitExceededError, EvidencePackingError):
+    except EvidencePackingError:
+        # The trusted evidence cannot be represented within the deterministic
+        # bound.  This is an authority-critical, semantic fail-closed result.
         return _blocked_finalization_result()
+    except Exception as exc:
+        # Provider, call-budget, tool-strategy, and transport failures are
+        # operational.  Let the durable dispatcher backoff retry this same
+        # successful execution; they are not semantic review decisions.
+        raise ReviewFinalizationError(
+            "execution review finalization failed operationally"
+        ) from exc
 
-    structured = result.get("structured_response")
-    if isinstance(structured, ExecutionReviewResult):
-        parsed = structured
-    elif isinstance(structured, dict):
-        parsed = ExecutionReviewResult.model_validate(structured)
-    else:
-        raise ValueError("reviewer did not return a structured review")
+    try:
+        structured = result.get("structured_response")
+        if isinstance(structured, ExecutionReviewResult):
+            parsed = structured
+        elif isinstance(structured, dict):
+            parsed = ExecutionReviewResult.model_validate(structured)
+        else:
+            raise ValueError("reviewer did not return a structured review")
+    except Exception as exc:
+        raise ReviewFinalizationError(
+            "execution review returned an invalid structured verdict"
+        ) from exc
     guarded = _guard_accept_coverage(
         parsed,
         contract,
