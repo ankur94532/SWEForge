@@ -212,6 +212,7 @@ class WorkflowEngine:
         *,
         event_key: str,
         plan_text: str,
+        root_input_id: str | None = None,
         mode: WorkflowMode = WorkflowMode.INTERACTIVE,
         posted_comment_id: int | None = None,
     ) -> PlanRecord:
@@ -246,6 +247,7 @@ class WorkflowEngine:
             approved_at=None,
             approved_by=None,
             approval_event_key=None,
+            root_input_id=root_input_id,
         )
         workflow_state = WorkflowStateRecord(
             thread_id=thread_id,
@@ -268,6 +270,7 @@ class WorkflowEngine:
             response_comment_id=event["source_id"],
             response_url=event["html_url"],
             review_thread_root_id=event["review_thread_root_id"],
+            root_input_id=root_input_id,
         )
         self.store.begin_workflow_cycle(record, workflow_state, claimed_at=timestamp)
         return self.store.plan(plan_id)  # type: ignore[return-value]
@@ -281,6 +284,7 @@ class WorkflowEngine:
         workspace_root: str | Path,
         memory_store: BaseStore | None = None,
         planner: Callable[..., str] | None = None,
+        root_input_id: str | None = None,
     ) -> PlanRecord:
         """Create a plan after proving the planner workspace stayed untouched."""
         event = self.store.source_event(event_key)
@@ -321,6 +325,11 @@ class WorkflowEngine:
                 )
             )
         before_head = workspace.head_sha()
+        selected_text = (
+            self.store.deferred_text_for_event(event_key, deferred_id=root_input_id)
+            if root_input_id and root_input_id.startswith("deferred-")
+            else None
+        )
         mode = WorkflowMode.INTERACTIVE
         if self.client is not None:
             repo = self.client.repository(thread["repo_full_name"])
@@ -333,6 +342,7 @@ class WorkflowEngine:
             and existing_state.phase == WorkflowPhase.PLANNING
             and existing_plan is not None
             and existing_plan.root_event_key == event_key
+            and existing_plan.root_input_id == root_input_id
         ):
             draft = existing_plan
         else:
@@ -340,6 +350,7 @@ class WorkflowEngine:
                 event_key=event_key,
                 plan_text="Planning in progress",
                 mode=mode,
+                root_input_id=root_input_id,
             )
         delivered: set[str] = set()
         context = PlannerContext(
@@ -359,7 +370,9 @@ class WorkflowEngine:
         plan_text = (planner or self.planner)(
             context=context,
             model=model,
-            task=format_source_context(event, normalize_task(event["body"])),
+            task=format_source_context(
+                event, normalize_task(selected_text or event["body"])
+            ),
         )
         if workspace.head_sha() != before_head or not workspace.is_clean():
             raise WorkspaceError("planner changed the workspace")
@@ -542,6 +555,7 @@ class WorkflowEngine:
             approved_at=None,
             approved_by=None,
             approval_event_key=None,
+            root_input_id=current.root_input_id,
         )
         self.store.begin_plan_revision(event_key, now=timestamp)
         return self.store.finish_plan_revision(
@@ -698,6 +712,9 @@ class WorkflowEngine:
                     approved_plan_text=plan.plan_text,
                     approved_plan_id=plan.plan_id,
                     approved_plan_version=plan.version,
+                    deferred_id=plan.root_input_id
+                    if plan.root_input_id and plan.root_input_id.startswith("deferred-")
+                    else None,
                     now=clock,
                     model=model,
                     repo_paths=repo_paths,
@@ -976,18 +993,28 @@ class WorkflowEngine:
 
     def _acknowledge_delivered(
         self,
-        event_key: str,
+        input_id: str,
         *,
         thread_id: str,
         cycle_id: int,
         purpose: InputPurpose = InputPurpose.DEFERRED_FOLLOWUP,
     ) -> None:
-        if purpose == InputPurpose.PLANNING_INPUT:
+        if purpose == InputPurpose.PLANNING_INPUT and not input_id.startswith(
+            "deferred-"
+        ):
+            legacy = self.store.deferred_followup(input_id)
+            if legacy is not None:
+                input_id = legacy.deferred_id
+        if purpose == InputPurpose.PLANNING_INPUT and input_id.startswith("deferred-"):
             self.store.consume_deferred_followup(
-                event_key, cycle_id=cycle_id, consumed_at=self.clock()
+                self.store.deferred_followup_by_id(input_id)["event_key"],
+                deferred_id=input_id,
+                cycle_id=cycle_id,
+                consumed_at=self.clock(),
             )
+            return
         self.store.consume_input(
-            event_key,
+            input_id,
             thread_id=thread_id,
             cycle_id=cycle_id,
             purpose=purpose,
@@ -1022,16 +1049,19 @@ class WorkflowEngine:
         seen: set[str] = set()
         result: list[tuple[str, str]] = []
         for row in rows:
+            logical_id = (
+                row["deferred_id"] if "deferred_id" in row.keys() else row["event_key"]
+            )
             if (
-                row["event_key"] in seen
+                logical_id in seen
                 or not starts_with_agent_invocation(row["body"])
                 or is_exact_approval(row["body"])
             ):
                 continue
-            seen.add(row["event_key"])
+            seen.add(logical_id)
             result.append(
                 (
-                    row["event_key"],
+                    logical_id,
                     format_source_context(row, normalize_task(row["body"])),
                 )
             )
@@ -1593,8 +1623,13 @@ class WorkflowEngine:
             )
         )
         for row in candidates:
-            if self.store.execution_for_event(row["event_key"]) is None:
-                return self.plan_event(event_key=row["event_key"], **plan_kwargs)
+            logical_id = row["deferred_id"] if "deferred_id" in row.keys() else None
+            if logical_id or self.store.execution_for_event(row["event_key"]) is None:
+                return self.plan_event(
+                    event_key=row["event_key"],
+                    root_input_id=logical_id,
+                    **plan_kwargs,
+                )
         return None
 
     def _run_review_locked(

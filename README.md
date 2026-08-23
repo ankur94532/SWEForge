@@ -292,3 +292,12 @@ answer resumes the same checkpoint and cycle. A scope-changing or ambiguous
 answer does not reuse the old authorization. Mixed answers retain a distinct,
 durable residual follow-up identity for the next planning cycle. Repair runs do
 not expose the clarification tool; review findings remain internal repair input.
+
+`SourceEvent` is immutable external GitHub provenance, while a logical workflow
+input is the application-owned actionable unit consumed by planning and a
+cycle. Ordinary inputs use their event key as their logical identity; residual
+follow-ups use their durable `deferred_id`. One SourceEvent may therefore
+produce multiple logical inputs, such as a clarification answer and a residual
+task. Each cycle persists both the originating `root_event_key` and the
+selected logical root identity so restart and later execution retain the same
+provenance and input selection.

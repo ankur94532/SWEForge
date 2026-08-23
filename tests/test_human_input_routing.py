@@ -87,6 +87,39 @@ def test_active_followup_is_durable_and_not_an_unconsumed_active_input(tmp_path)
     store.close()
 
 
+def test_planning_delivers_and_acknowledges_sibling_deferred_ids_exactly(tmp_path):
+    store, _repo, events = _store_with_cycle(tmp_path)
+    thread_id = store.source_event(events[0].event_key)["thread_id"]
+    first = store.defer_followup(
+        source_event_key=events[1].event_key,
+        thread_id=thread_id,
+        originating_cycle_id=1,
+        queued_at="one",
+        residual_text="update README",
+    )
+    second = store.defer_followup(
+        source_event_key=events[1].event_key,
+        thread_id=thread_id,
+        originating_cycle_id=1,
+        queued_at="two",
+        residual_text="add tests",
+    )
+    state = store.workflow_state(thread_id)
+    store.save_workflow_state(replace(state, phase=WorkflowPhase.EXECUTING))
+    engine = WorkflowEngine(store=store)
+    delivered = engine.pending_planning_inputs(thread_id)
+    assert {item[0] for item in delivered} == {first.deferred_id, second.deferred_id}
+    engine._acknowledge_delivered(
+        first.deferred_id,
+        thread_id=thread_id,
+        cycle_id=1,
+        purpose=InputPurpose.PLANNING_INPUT,
+    )
+    remaining = engine.pending_planning_inputs(thread_id)
+    assert [item[0] for item in remaining] == [second.deferred_id]
+    store.close()
+
+
 def test_clarification_answer_and_replay_state_are_durable(tmp_path):
     store, _repo, events = _store_with_cycle(tmp_path)
     thread_id = store.source_event(events[0].event_key)["thread_id"]

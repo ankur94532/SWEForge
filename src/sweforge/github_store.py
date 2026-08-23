@@ -128,6 +128,7 @@ CREATE TABLE IF NOT EXISTS issue_workflow_state (
     phase TEXT NOT NULL,
     cycle_id INTEGER NOT NULL,
     root_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    root_input_id TEXT,
     current_plan_id TEXT,
     mode TEXT NOT NULL,
     response_surface TEXT NOT NULL DEFAULT 'ISSUE',
@@ -148,6 +149,7 @@ CREATE TABLE IF NOT EXISTS issue_plans (
     cycle_id INTEGER NOT NULL,
     version INTEGER NOT NULL,
     root_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    root_input_id TEXT,
     plan_text TEXT NOT NULL,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -530,6 +532,7 @@ class WorkflowStateRecord:
     response_url: str | None = None
     review_thread_root_id: str | None = None
     planning_feedback_event_key: str | None = None
+    root_input_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -550,6 +553,7 @@ class PlanRecord:
     approved_at: str | None
     approved_by: str | None
     approval_event_key: str | None
+    root_input_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -738,6 +742,23 @@ class SQLiteGitHubStore:
                 "PRAGMA table_info(clarification_requests)"
             )
         }
+        workflow_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(issue_workflow_state)"
+            )
+        }
+        if "root_input_id" not in workflow_columns:
+            self.connection.execute(
+                "ALTER TABLE issue_workflow_state ADD COLUMN root_input_id TEXT"
+            )
+        plan_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(issue_plans)")
+        }
+        if "root_input_id" not in plan_columns:
+            self.connection.execute(
+                "ALTER TABLE issue_plans ADD COLUMN root_input_id TEXT"
+            )
         if "occurrence_key" not in clarification_columns:
             self.connection.execute(
                 "ALTER TABLE clarification_requests ADD COLUMN occurrence_key "
@@ -2838,12 +2859,14 @@ class SQLiteGitHubStore:
                 """INSERT INTO issue_workflow_state(
                    thread_id, repo_id, repo_full_name, issue_number, phase,
                    cycle_id, root_event_key, current_plan_id, mode, created_at,
+                   root_input_id,
                    updated_at, response_surface, response_subject_number,
                    response_comment_id, response_url, review_thread_root_id,
                    planning_feedback_event_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(thread_id) DO UPDATE SET phase=excluded.phase,
                    cycle_id=excluded.cycle_id, root_event_key=excluded.root_event_key,
+                   root_input_id=excluded.root_input_id,
                    current_plan_id=excluded.current_plan_id, mode=excluded.mode,
                    updated_at=excluded.updated_at,
                    response_surface=excluded.response_surface,
@@ -2863,6 +2886,7 @@ class SQLiteGitHubStore:
                     record.current_plan_id,
                     record.mode.value,
                     record.created_at,
+                    record.root_input_id,
                     record.updated_at,
                     record.response_surface,
                     record.response_subject_number,
@@ -2902,19 +2926,25 @@ class SQLiteGitHubStore:
                     claimed_at,
                 ),
             )
-            db.execute(
-                """UPDATE deferred_followups SET status='CONSUMED',
-                   consumed_cycle_id=?, consumed_at=?
-                   WHERE source_event_key=? AND status='QUEUED'""",
-                (plan.cycle_id, claimed_at, plan.root_event_key),
-            )
+            if plan.root_input_id and plan.root_input_id.startswith("deferred-"):
+                db.execute(
+                    """UPDATE deferred_followups SET status='CONSUMED',
+                       consumed_cycle_id=?, consumed_at=?
+                       WHERE deferred_id=? AND source_event_key=? AND status='QUEUED'""",
+                    (
+                        plan.cycle_id,
+                        claimed_at,
+                        plan.root_input_id,
+                        plan.root_event_key,
+                    ),
+                )
             db.execute(
                 """INSERT INTO issue_plans(
                    plan_id, thread_id, repo_id, repo_full_name, issue_number,
-                   cycle_id, version, root_event_key, plan_text, status,
+                   cycle_id, version, root_event_key, root_input_id, plan_text, status,
                    created_at, posted_at, posted_comment_id, approved_at,
                    approved_by, approval_event_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     plan.plan_id,
                     plan.thread_id,
@@ -2924,6 +2954,7 @@ class SQLiteGitHubStore:
                     plan.cycle_id,
                     plan.version,
                     plan.root_event_key,
+                    plan.root_input_id,
                     plan.plan_text,
                     plan.status.value,
                     plan.created_at,
@@ -2937,15 +2968,16 @@ class SQLiteGitHubStore:
             db.execute(
                 """INSERT INTO issue_workflow_state(
                    thread_id, repo_id, repo_full_name, issue_number, phase,
-                   cycle_id, root_event_key, current_plan_id, mode, created_at,
+                   cycle_id, root_event_key, root_input_id, current_plan_id, mode, created_at,
                    updated_at, response_surface, response_subject_number,
                    response_comment_id, response_url, review_thread_root_id,
                    planning_feedback_event_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(thread_id) DO UPDATE SET
                    repo_id=excluded.repo_id, repo_full_name=excluded.repo_full_name,
                    issue_number=excluded.issue_number, phase=excluded.phase,
                    cycle_id=excluded.cycle_id, root_event_key=excluded.root_event_key,
+                   root_input_id=excluded.root_input_id,
                    current_plan_id=excluded.current_plan_id, mode=excluded.mode,
                    updated_at=excluded.updated_at,
                    response_surface=excluded.response_surface,
@@ -2962,6 +2994,7 @@ class SQLiteGitHubStore:
                     state.phase.value,
                     state.cycle_id,
                     state.root_event_key,
+                    state.root_input_id,
                     state.current_plan_id,
                     state.mode.value,
                     state.created_at,
@@ -3214,10 +3247,10 @@ class SQLiteGitHubStore:
             db.execute(
                 """INSERT INTO issue_plans(
                    plan_id, thread_id, repo_id, repo_full_name, issue_number,
-                   cycle_id, version, root_event_key, plan_text, status,
+                   cycle_id, version, root_event_key, root_input_id, plan_text, status,
                    created_at, posted_at, posted_comment_id, approved_at,
                    approved_by, approval_event_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     plan.plan_id,
                     plan.thread_id,
@@ -3227,6 +3260,7 @@ class SQLiteGitHubStore:
                     plan.cycle_id,
                     plan.version,
                     plan.root_event_key,
+                    plan.root_input_id,
                     plan.plan_text,
                     plan.status.value,
                     plan.created_at,
@@ -3304,10 +3338,10 @@ class SQLiteGitHubStore:
             db.execute(
                 """INSERT INTO issue_plans(
                    plan_id, thread_id, repo_id, repo_full_name, issue_number,
-                   cycle_id, version, root_event_key, plan_text, status,
+                   cycle_id, version, root_event_key, root_input_id, plan_text, status,
                    created_at, posted_at, posted_comment_id, approved_at,
                    approved_by, approval_event_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     plan.plan_id,
                     plan.thread_id,
@@ -3317,6 +3351,7 @@ class SQLiteGitHubStore:
                     plan.cycle_id,
                     plan.version,
                     plan.root_event_key,
+                    plan.root_input_id,
                     plan.plan_text,
                     plan.status.value,
                     plan.created_at,
@@ -3425,10 +3460,10 @@ class SQLiteGitHubStore:
             db.execute(
                 """INSERT INTO issue_plans(
                    plan_id, thread_id, repo_id, repo_full_name, issue_number,
-                   cycle_id, version, root_event_key, plan_text, status,
+                   cycle_id, version, root_event_key, root_input_id, plan_text, status,
                    created_at, posted_at, posted_comment_id, approved_at,
                    approved_by, approval_event_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     record.plan_id,
                     record.thread_id,
@@ -3438,6 +3473,7 @@ class SQLiteGitHubStore:
                     record.cycle_id,
                     record.version,
                     record.root_event_key,
+                    record.root_input_id,
                     record.plan_text,
                     record.status.value,
                     record.created_at,
@@ -3812,6 +3848,14 @@ class SQLiteGitHubStore:
                 (deferred_id, source_event_key),
             ).fetchone()
         return DeferredFollowupRecord(**dict(row)) if row else None
+
+    def deferred_followup_by_id(self, deferred_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """SELECT df.deferred_id, df.source_event_key AS event_key,
+                      df.thread_id, df.status, df.residual_text
+               FROM deferred_followups df WHERE df.deferred_id=?""",
+            (deferred_id,),
+        ).fetchone()
 
     def deferred_text_for_event(
         self, source_event_key: str, *, deferred_id: str | None = None

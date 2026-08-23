@@ -289,6 +289,7 @@ def _execute_claim(
     approved_plan_text: str | None,
     approved_plan_id: str | None,
     approved_plan_version: int | None,
+    deferred_id: str | None = None,
     now: Callable[[], datetime],
     persist_execution: bool = True,
     allow_dirty_workspace: bool = False,
@@ -304,7 +305,9 @@ def _execute_claim(
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
     try:
-        deferred_text = store.deferred_text_for_event(event.event_key)
+        deferred_text = store.deferred_text_for_event(
+            event.event_key, deferred_id=deferred_id
+        )
         task = (
             prepared_task
             if prepared_task is not None
