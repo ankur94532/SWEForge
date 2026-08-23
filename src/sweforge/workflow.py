@@ -923,7 +923,7 @@ class WorkflowEngine:
                         if result.status == "SUCCEEDED"
                         else WorkflowPhase.WAITING_FOR_INPUT
                         if result.status == "CLARIFICATION"
-                        else WorkflowPhase.EXECUTION_READY
+                        else WorkflowPhase.EXECUTION_FAILED
                     )
                     self.store.save_workflow_state(
                         WorkflowStateRecord(

@@ -273,43 +273,15 @@ class SWEForgeServer:
                     self.config.sandbox_provider
                 ),
             }
-            for _ in range(self.config.max_ticks):
-                result = engine.advance(
-                    thread_id=thread_id,
-                    model=self.config.planning,
-                    review_model=self.config.review,
-                    memory_model=self.config.memory,
-                    resolution_model=self.config.resolution,
-                    repo_paths=self.config.repo_paths,
-                    workspace_root=self.config.workspace_root,
-                    memory_store=memory.store,
-                    execute_kwargs=execute_kwargs,
-                )
-                if result.phase == WorkflowPhase.AWAITING_PUBLICATION:
-                    publication_id = store.eligible_publication_id(thread_id)
-                    if not publication_id:
-                        break
-                    publication_record = store.publication_for_id(publication_id)
-                    if (
-                        publication_record is not None
-                        and publication_record.status.value == "FAILED"
-                    ):
-                        break
-                    publication = GitHubPublisher(
-                        store=store,
-                        client=client,
-                        token_provider=authenticator,
-                        lock_root=self.config.lock_root,
-                        api_url=self.config.api_url,
-                    ).publish_one(publication_id)
-                    if publication.status not in {"COMPLETED", "NO_CHANGES"}:
-                        raise RuntimeError(f"publication {publication.status.lower()}")
-                if result.message == "busy":
-                    break
-                if result.phase != WorkflowPhase.AWAITING_PUBLICATION:
-                    now = self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
-                    if not store.is_thread_runnable(thread_id, now=now):
-                        break
+            self._drain_workflow(
+                thread_id=thread_id,
+                store=store,
+                engine=engine,
+                client=client,
+                token_provider=authenticator,
+                memory_store=memory.store,
+                execute_kwargs=execute_kwargs,
+            )
             store.clear_dispatcher_failure(thread_id)
         except Exception as exc:
             now = self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
@@ -321,6 +293,56 @@ class SWEForgeServer:
             for resource in (memory, checkpoints, store, client, authenticator):
                 if resource is not None and hasattr(resource, "close"):
                     resource.close()
+
+    def _drain_workflow(
+        self,
+        *,
+        thread_id: str,
+        store: SQLiteGitHubStore,
+        engine: WorkflowEngine,
+        client: GitHubClient,
+        token_provider: object,
+        memory_store: object,
+        execute_kwargs: dict,
+    ) -> None:
+        """Drain bounded authoritative workflow ticks for one IssueThread."""
+        for _ in range(self.config.max_ticks):
+            result = engine.advance(
+                thread_id=thread_id,
+                model=self.config.planning,
+                review_model=self.config.review,
+                memory_model=self.config.memory,
+                resolution_model=self.config.resolution,
+                repo_paths=self.config.repo_paths,
+                workspace_root=self.config.workspace_root,
+                memory_store=memory_store,
+                execute_kwargs=execute_kwargs,
+            )
+            if result.phase == WorkflowPhase.AWAITING_PUBLICATION:
+                publication_id = store.eligible_publication_id(thread_id)
+                if not publication_id:
+                    break
+                publication_record = store.publication_for_id(publication_id)
+                if (
+                    publication_record is not None
+                    and publication_record.status.value == "FAILED"
+                ):
+                    break
+                publication = GitHubPublisher(
+                    store=store,
+                    client=client,
+                    token_provider=token_provider,
+                    lock_root=self.config.lock_root,
+                    api_url=self.config.api_url,
+                ).publish_one(publication_id)
+                if publication.status not in {"COMPLETED", "NO_CHANGES"}:
+                    raise RuntimeError(f"publication {publication.status.lower()}")
+            if result.message == "busy":
+                break
+            if result.phase != WorkflowPhase.AWAITING_PUBLICATION:
+                now = self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
+                if not store.is_thread_runnable(thread_id, now=now):
+                    break
 
     def run(self) -> None:
         instance_lock = ServerInstanceLock(self.config.db)

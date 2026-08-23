@@ -1,3 +1,6 @@
+import subprocess
+from dataclasses import replace
+
 import pytest
 
 from sweforge.github_models import (
@@ -6,7 +9,12 @@ from sweforge.github_models import (
     SourceKind,
     SubjectKind,
 )
-from sweforge.github_store import SQLiteGitHubStore, WorkflowMode, WorkflowPhase
+from sweforge.github_store import (
+    AttemptStatus,
+    SQLiteGitHubStore,
+    WorkflowMode,
+    WorkflowPhase,
+)
 from sweforge.server import (
     ServerConfig,
     ServerInstanceLock,
@@ -298,3 +306,120 @@ def test_once_surfaces_poll_failure(tmp_path):
             client_factory=lambda _: (Client(), None),
             poller_factory=Poller,
         ).run()
+
+
+def test_hard_execution_failure_is_terminal_for_server_drain(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    (source / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=source, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        cwd=source,
+        check=True,
+    )
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(1, "owner/repo")
+    root = replace(
+        _event(repo, "root", "@agent fail safely"),
+        source_created_at="2026-01-01T00:00:00Z",
+    )
+    approval = replace(
+        _event_for(
+            repo,
+            "approval",
+            7,
+            "@agent approve",
+            SourceKind.ISSUE_COMMENT,
+        ),
+        source_updated_at="2026-01-01T01:00:00Z",
+        source_created_at="2026-01-01T01:00:00Z",
+    )
+    store.upsert_repository(1, repo.full_name, "2026-01-01T00:00:00Z")
+    store.record_batch(
+        1,
+        "issues",
+        [root],
+        since="now",
+        etag=None,
+        polled_at="2026-01-01T00:00:01Z",
+    )
+    store.record_batch(
+        1,
+        "issue_comments",
+        [approval],
+        since="now",
+        etag=None,
+        polled_at="2026-01-01T01:00:01Z",
+    )
+    engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:00:30Z")
+    plan = engine.start_cycle(
+        event_key=root.event_key, plan_text="fail safely", posted_comment_id=1
+    )
+    engine.approve(event_key=approval.event_key)
+    runs = 0
+
+    def failing_runner(**kwargs):
+        nonlocal runs
+        runs += 1
+        raise RuntimeError("ACCEPTANCE_DETERMINISTIC_EXECUTION_FAILURE")
+
+    config = ServerConfig(
+        repositories=(repo.full_name,),
+        repo_paths={repo.full_name: source},
+        db=store.path,
+        workspace_root=tmp_path / "workspaces",
+        lock_root=tmp_path / "locks",
+        model="test-model",
+        max_ticks=20,
+    )
+    server = SWEForgeServer(config, client_factory=lambda _: (None, None))
+    server._drain_workflow(
+        thread_id="github:1:issue:7",
+        store=store,
+        engine=engine,
+        client=object(),
+        token_provider=object(),
+        memory_store=None,
+        execute_kwargs={
+            "model": "test-model",
+            "repo_paths": {repo.full_name: source},
+            "workspace_root": tmp_path / "workspaces",
+            "lock_root": tmp_path / "locks",
+            "checkpointer": object(),
+            "runner": failing_runner,
+            "secure_execution": False,
+            "unsafe_local_shell": True,
+        },
+    )
+    state = store.workflow_state("github:1:issue:7")
+    assert runs == 1
+    assert state.phase is WorkflowPhase.EXECUTION_FAILED
+    assert not store.is_thread_runnable(state.thread_id, now="2026-01-01T00:01:00Z")
+    assert store.latest_attempt(state.thread_id, state.cycle_id).status is (
+        AttemptStatus.FAILED
+    )
+    assert store.eligible_publication_id(state.thread_id) is None
+    assert store.pending_memory_learning(state.thread_id) is None
+    assert store.pending_issue_resolution(state.thread_id) is None
+    assert (
+        store.publication_for_cycle(
+            thread_id=state.thread_id,
+            cycle_id=state.cycle_id,
+            root_event_key=state.root_event_key,
+            root_input_id=state.root_input_id,
+        )
+        is None
+    )
+    assert store.current_plan(state.thread_id).plan_id == plan.plan_id
+    store.close()
