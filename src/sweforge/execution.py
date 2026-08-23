@@ -55,6 +55,7 @@ class TaskRunner(Protocol):
         unsafe_local_shell: bool = False,
         clarification_request_sink: Callable[[dict], None] | None = None,
         resume_value: object | None = None,
+        resume_resolver: Callable[[tuple[dict, ...]], object] | None = None,
     ) -> str: ...
 
 
@@ -227,6 +228,7 @@ def execute_one(
     unsafe_local_shell: bool = False,
     clarification_request_sink: Callable[[dict], None] | None = None,
     resume_value: object | None = None,
+    resume_resolver: Callable[[tuple[dict, ...]], object] | None = None,
     clarification_enabled: bool = True,
 ) -> ExecutionResult:
     clock = now or (lambda: datetime.now(UTC))
@@ -256,6 +258,7 @@ def execute_one(
                 unsafe_local_shell=unsafe_local_shell,
                 clarification_request_sink=clarification_request_sink,
                 resume_value=resume_value,
+                resume_resolver=resume_resolver,
                 clarification_enabled=clarification_enabled,
                 now=clock,
             )
@@ -303,6 +306,7 @@ def _execute_claim(
     unsafe_local_shell: bool = False,
     clarification_request_sink: Callable[[dict], None] | None = None,
     resume_value: object | None = None,
+    resume_resolver: Callable[[tuple[dict, ...]], object] | None = None,
     clarification_enabled: bool = True,
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
@@ -401,13 +405,17 @@ def _execute_claim(
             "sandbox_backend_provider": sandbox_backend_provider,
             "secure_execution": secure_execution,
             "unsafe_local_shell": unsafe_local_shell,
-            "interrupt_result_sink": capture_interrupt,
             "resume_value": resume_value,
+            "resume_resolver": resume_resolver,
         }
-        if not clarification_enabled:
-            runner_kwargs.pop("clarification_request_sink", None)
+        if clarification_enabled:
+            # The sink is what registers request_clarification, so withholding
+            # it is what actually keeps the tool out of a repair run.
+            runner_kwargs["interrupt_result_sink"] = capture_interrupt
         if resume_value is None:
             runner_kwargs.pop("resume_value", None)
+        if resume_resolver is None:
+            runner_kwargs.pop("resume_resolver", None)
         if live_input_provider is not None:
             runner_kwargs["live_input_provider"] = live_input_provider
         if live_delivered_event_keys is not None:

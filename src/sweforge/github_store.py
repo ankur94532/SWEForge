@@ -4503,6 +4503,44 @@ class SQLiteGitHubStore:
         ).fetchone()
         return ClarificationRequestRecord(**dict(row)) if row else None
 
+    def answered_clarification_for_occurrence(
+        self, *, thread_id: str, cycle_id: int, occurrence_key: str
+    ) -> ClarificationRequestRecord | None:
+        """Return the answer for one exact interrupt occurrence.
+
+        Clarification identity is (thread, cycle, occurrence_key), so this is
+        the only lookup that may drive a checkpoint resume.  Selecting by
+        thread/cycle alone would hand one interrupt another interrupt's answer.
+        """
+        if not occurrence_key:
+            return None
+        row = self.connection.execute(
+            """SELECT * FROM clarification_requests
+               WHERE thread_id = ? AND cycle_id = ? AND occurrence_key = ?
+                 AND status = ?""",
+            (thread_id, cycle_id, occurrence_key, ClarificationStatus.ANSWERED.value),
+        ).fetchone()
+        return ClarificationRequestRecord(**dict(row)) if row else None
+
+    def sole_answered_legacy_clarification(
+        self, *, thread_id: str, cycle_id: int
+    ) -> ClarificationRequestRecord | None:
+        """Pre-occurrence-key compatibility for one in-flight legacy answer.
+
+        Rows written before occurrence keys existed carry an empty key and can
+        never match a live interrupt.  They are only resumable while exactly
+        one such answer exists for the cycle; anything ambiguous fails closed.
+        """
+        rows = self.connection.execute(
+            """SELECT * FROM clarification_requests
+               WHERE thread_id = ? AND cycle_id = ? AND occurrence_key = ''
+                 AND status = ?""",
+            (thread_id, cycle_id, ClarificationStatus.ANSWERED.value),
+        ).fetchall()
+        if len(rows) != 1:
+            return None
+        return ClarificationRequestRecord(**dict(rows[0]))
+
     def clarification(self, clarification_id: str) -> ClarificationRequestRecord | None:
         row = self.connection.execute(
             "SELECT * FROM clarification_requests WHERE clarification_id = ?",

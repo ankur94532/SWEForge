@@ -104,6 +104,26 @@ def _normalize_response_text(message: Any) -> str:
     return "\n".join(text_blocks)
 
 
+def pending_interrupt_values(agent, config) -> tuple[dict[str, Any], ...]:
+    """Read the checkpoint's live pending interrupt payloads, if any.
+
+    This is the only structural link between a persisted clarification and the
+    interrupt that is actually waiting, so resume selection can be driven by
+    occurrence identity rather than by ordering heuristics.
+    """
+    reader = getattr(agent, "get_state", None)
+    if not callable(reader):
+        return ()
+    snapshot = reader(config)
+    values: list[dict[str, Any]] = []
+    for task in getattr(snapshot, "tasks", ()) or ():
+        for item in getattr(task, "interrupts", ()) or ():
+            value = getattr(item, "value", None)
+            if isinstance(value, Mapping):
+                values.append(dict(value))
+    return tuple(values)
+
+
 def _invoke_agent(agent, state, *, config=None, durability=None, context=None):
     kwargs = {"config": config} if config is not None else {}
     if durability is not None:
@@ -183,6 +203,7 @@ def run_task(
     clarification_request_sink: Callable[[dict[str, Any]], None] | None = None,
     interrupt_result_sink: Callable[[dict[str, Any]], None] | None = None,
     resume_value: Any | None = None,
+    resume_resolver: Callable[[tuple[dict[str, Any], ...]], Any] | None = None,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
@@ -299,6 +320,20 @@ def run_task(
     }
     if thread_id:
         config = {"configurable": {"thread_id": thread_id}}
+        if resume_resolver is not None and checkpointer is not None:
+            # Resolve the answer against the interrupt that is actually pending
+            # so one occurrence can never consume another's answer.
+            pending = pending_interrupt_values(agent, config)
+            resume_value = resume_resolver(pending) if pending else None
+            if pending and resume_value is None:
+                # Fail closed without touching the checkpoint.  Invoking a
+                # graph that has a pending interrupt does NOT re-raise it:
+                # LangGraph reuses the previous Command(resume=...) value, so
+                # running here would hand this interrupt a stale answer.
+                if interrupt_result_sink is not None:
+                    for payload in pending:
+                        interrupt_result_sink(dict(payload))
+                return ""
         if resume_value is not None:
             result: dict[str, Any] = _invoke_agent(
                 agent,

@@ -707,13 +707,30 @@ class WorkflowEngine:
                     authorization_id=permit.permit_id,
                     created_at=utc_timestamp(clock()),
                 )
-                answered = self.store.clarification_for_thread(
-                    permit.thread_id, status=ClarificationStatus.ANSWERED.value
-                )
-                resume_value = None
-                if answered and answered.cycle_id == permit.cycle_id:
-                    answer_payload = json.loads(answered.answer_json or "{}")
-                    resume_value = answer_payload.get("answer")
+
+                def resolve_resume(pending: tuple[dict, ...]):
+                    """Answer the interrupt that is pending, or nothing at all.
+
+                    Resume selection is driven by the live interrupt occurrence
+                    so one clarification can never be resumed with another
+                    occurrence's answer.  Returning nothing fails closed: the
+                    runner leaves the checkpoint untouched and re-reports the
+                    pending occurrence instead of resuming it.
+                    """
+                    for payload in pending:
+                        occurrence = str(payload.get("occurrence_key") or "")
+                        answered = self.store.answered_clarification_for_occurrence(
+                            thread_id=permit.thread_id,
+                            cycle_id=permit.cycle_id,
+                            occurrence_key=occurrence,
+                        ) or self.store.sole_answered_legacy_clarification(
+                            thread_id=permit.thread_id,
+                            cycle_id=permit.cycle_id,
+                        )
+                        if answered is None:
+                            continue
+                        return json.loads(answered.answer_json or "{}").get("answer")
+                    return None
 
                 def persist_request(payload: dict) -> None:
                     current_state = self.store.workflow_state(permit.thread_id)
@@ -738,7 +755,7 @@ class WorkflowEngine:
                     live_input_provider=None,
                     live_delivered_event_keys=delivered,
                     clarification_request_sink=persist_request,
-                    resume_value=resume_value,
+                    resume_resolver=resolve_resume,
                     approved_plan_text=plan.plan_text,
                     approved_plan_id=plan.plan_id,
                     approved_plan_version=plan.version,

@@ -288,7 +288,18 @@ before the answer. SWEForge persists the request, enters `WAITING_FOR_INPUT`,
 and routes the question back to its issue, PR conversation, or inline review
 thread. A restart reconciles an open request with the interrupted execution and
 retries clarification posting idempotently. An unambiguous, provenance-matched
-answer resumes the same checkpoint and cycle. A scope-changing or ambiguous
+answer resumes the same checkpoint and cycle.
+
+Resume is selected by interrupt occurrence, not by clarification ordering. Each
+`request_clarification` call carries its tool-call id as an `occurrence_key`,
+and the answer handed back to LangGraph is the one persisted for the occurrence
+that is actually pending in the checkpoint. Two clarifications in one cycle
+therefore each receive their own answer. When the pending occurrence has no
+answer, SWEForge does not invoke the graph at all: invoking a graph that holds
+a pending interrupt makes LangGraph reuse the previous `Command(resume=...)`
+value, so running would feed that interrupt a stale answer. Review repairs are
+not given the clarification sink, so the tool is never registered for a repair
+run and a repair cannot strand a pending interrupt on the shared checkpoint. A scope-changing or ambiguous
 answer does not reuse the old authorization. Mixed answers retain a distinct,
 durable residual follow-up identity for the next planning cycle. Repair runs do
 not expose the clarification tool; review findings remain internal repair input.
