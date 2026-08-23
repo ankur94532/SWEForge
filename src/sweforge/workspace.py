@@ -8,8 +8,11 @@ import os
 import shutil
 import subprocess
 import tempfile
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+
+from .execution_locks import repo_git_lock
 
 
 class WorkspaceError(RuntimeError):
@@ -37,11 +40,49 @@ class ThreadWorkspace:
         existing_path: str | None = None,
         expected_branch: str | None = None,
         expected_base: str | None = None,
+        lock_root: str | Path | None = None,
     ) -> "ThreadWorkspace":
+        """Open or create one IssueThread's persistent worktree.
+
+        Creation is check-then-create over state shared with every other thread
+        in the repository, so callers that can run concurrently pass
+        `lock_root` and the whole section runs under the repository Git lock.
+        Without it two workers racing the same worktree both fail and the
+        loser's cleanup deletes the winner's directory, leaving a branch with
+        no worktree and a permanently unusable thread.
+        """
         repo = _repository_root(repository)
         root = Path(workspace_root).expanduser().resolve()
         path = root / str(repo_id) / f"issue-{issue_number}"
         branch = expected_branch or f"sweforge/issue-{issue_number}"
+        guard = (
+            repo_git_lock(lock_root, repo_id)
+            if lock_root is not None
+            else nullcontext()
+        )
+        with guard:
+            return cls._open_or_create(
+                repo=repo,
+                path=path,
+                branch=branch,
+                issue_number=issue_number,
+                existing_path=existing_path,
+                expected_branch=expected_branch,
+                expected_base=expected_base,
+            )
+
+    @classmethod
+    def _open_or_create(
+        cls,
+        *,
+        repo: Path,
+        path: Path,
+        branch: str,
+        issue_number: int,
+        existing_path: str | None,
+        expected_branch: str | None,
+        expected_base: str | None,
+    ) -> "ThreadWorkspace":
         if existing_path is not None and Path(existing_path).resolve() != path:
             raise WorkspaceError(
                 "persisted workspace path does not match expected path"
@@ -75,9 +116,19 @@ class ThreadWorkspace:
         if existing_path is not None:
             raise WorkspaceError("persisted workspace directory is missing")
         path.parent.mkdir(parents=True, exist_ok=True)
-        base = _git(repo, "rev-parse", "HEAD")
+        # A crash between creating the branch and finishing the worktree leaves
+        # the branch behind, and `worktree add -b` then fails forever.  Drop the
+        # dead registration and reattach to the orphan instead of recreating it.
+        _prune_worktrees(repo)
+        orphan = _orphan_branch(repo, branch)
+        base = _git(repo, "rev-parse", branch if orphan else "HEAD")
+        add_args = (
+            ["worktree", "add", str(path), branch]
+            if orphan
+            else ["worktree", "add", "-b", branch, str(path), base]
+        )
         try:
-            _git(repo, "worktree", "add", "-b", branch, str(path), base)
+            _git(repo, *add_args)
         except WorkspaceError:
             shutil.rmtree(path, ignore_errors=True)
             raise
@@ -114,6 +165,40 @@ def _git(repo: Path, *args: str) -> str:
         message = result.stderr.strip() or result.stdout.strip()
         raise WorkspaceError(f"git {' '.join(args)} failed: {message}")
     return result.stdout.strip()
+
+
+def _prune_worktrees(repo: Path) -> None:
+    """Drop registrations whose directories no longer exist; never touch live ones."""
+    subprocess.run(
+        ["git", "worktree", "prune"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+    )
+
+
+def _orphan_branch(repo: Path, branch: str) -> bool:
+    """True when `branch` exists but no worktree currently holds it."""
+    exists = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+    )
+    if exists.returncode != 0:
+        return False
+    listing = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo,
+        check=False,
+        capture_output=True,
+        text=True,
+    ).stdout
+    if f"branch refs/heads/{branch}" in listing:
+        raise WorkspaceError(
+            f"branch {branch} is already checked out in another worktree"
+        )
+    return True
 
 
 def _repository_root(repository: str | Path) -> Path:

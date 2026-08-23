@@ -1,12 +1,10 @@
 """Durable one-shot execution for routed GitHub source events."""
 
-import fcntl
 import hashlib
 import os
 import re
 import sqlite3
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,6 +17,13 @@ from langgraph.store.base import BaseStore
 from .agent import run_task
 from .capabilities import RepoCapabilityRegistry
 from .context import RepoAgentContext
+from .execution_locks import (
+    LockOrderError,
+    ThreadLockUnavailable,
+    held_repo_git_locks,
+    repo_git_lock,
+    thread_lock,
+)
 from .execution_security import SandboxBackendProvider
 from .github_models import format_source_context
 from .github_store import (
@@ -29,6 +34,14 @@ from .github_store import (
 )
 from .repo_memory import ensure_repo_memory, repo_memory_namespace
 from .workspace import ThreadWorkspace, WorkspaceError
+
+__all__ = [
+    "LockOrderError",
+    "ThreadLockUnavailable",
+    "held_repo_git_locks",
+    "repo_git_lock",
+    "thread_lock",
+]
 
 _MENTION_RE = re.compile(r"(?<![A-Za-z0-9_])@agent(?![A-Za-z0-9_])", re.IGNORECASE)
 
@@ -63,10 +76,6 @@ class TaskRunner(Protocol):
 
 class EmptyTaskError(ValueError):
     """Raised when an @agent event has no task after mention removal."""
-
-
-class ThreadLockUnavailable(RuntimeError):
-    """Raised when another process currently owns a thread lock."""
 
 
 def normalize_task(body: str) -> str:
@@ -104,25 +113,6 @@ def _review_context(worktree: Path, event: ClaimedEvent) -> str | None:
     start = max(0, int(line) - 6)
     end = min(len(lines), int(line) + 5)
     return "\n".join(f"{index + 1}: {lines[index]}" for index in range(start, end))
-
-
-@contextmanager
-def thread_lock(root: str | Path, thread_id: str) -> Iterator[None]:
-    """Acquire a non-blocking cross-process lock for exactly one thread."""
-    lock_root = Path(root).expanduser().resolve()
-    lock_root.mkdir(parents=True, exist_ok=True)
-    lock_path = lock_root / f"{hashlib.sha256(thread_id.encode()).hexdigest()}.lock"
-    with lock_path.open("a+") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ThreadLockUnavailable(
-                "IssueThread is already being executed"
-            ) from exc
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 class SQLiteCheckpointer:
@@ -245,6 +235,7 @@ def execute_one(
             return _execute_claim(
                 store=store,
                 event=event,
+                lock_root=lock_root,
                 model=model,
                 repo_paths=repo_paths,
                 workspace_root=workspace_root,
@@ -302,6 +293,7 @@ def _execute_claim(
     approved_plan_version: int | None,
     deferred_id: str | None = None,
     now: Callable[[], datetime],
+    lock_root: str | Path | None = None,
     persist_execution: bool = True,
     allow_dirty_workspace: bool = False,
     message_id: str | None = None,
@@ -344,6 +336,7 @@ def _execute_claim(
             existing_path=metadata.workspace_path if metadata else None,
             expected_branch=metadata.branch_name if metadata else None,
             expected_base=metadata.base_commit if metadata else None,
+            lock_root=lock_root,
         )
         if metadata is None:
             timestamp = utc_timestamp(now())

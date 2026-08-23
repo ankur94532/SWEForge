@@ -513,6 +513,13 @@ MEMORY_LEARNING_PENDING = "PENDING"
 # curator that keeps failing must not hold an IssueThread at IDLE forever.
 MAX_MEMORY_LEARNING_ATTEMPTS = 3
 
+# `execution_attempts.retry_count` counts executions STARTED for one attempt:
+# bind_authorized_execution inserts the row and ensure_execution_attempt bumps
+# it immediately before each run, so the first execution leaves it at 1.  An
+# INITIAL attempt therefore gets at most this many executions in total before
+# recovery fails closed, which bounds the spend of a permanently crashing run.
+MAX_INITIAL_EXECUTION_RECOVERIES = 3
+
 # Historical case generation is model-dependent, so it is bounded the same way.
 MAX_ISSUE_RESOLUTION_ATTEMPTS = 3
 
@@ -3435,6 +3442,127 @@ class SQLiteGitHubStore:
                 "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
                 (WorkflowPhase.REPAIR_READY.value, now, attempt["thread_id"]),
             )
+
+    def recover_orphaned_initial_attempt(
+        self, attempt_id: str, *, now: str, max_recoveries: int
+    ) -> str:
+        """Reclaim an INITIAL execution whose worker died, or fail closed.
+
+        Only the caller's IssueThread lock proves the previous worker is gone,
+        so this is called under it.  The attempt keeps its identity: the same
+        cycle, plan, permit and workspace are reused, and nothing here claims
+        the dead attempt succeeded.  Returns "RETRY" or "EXHAUSTED".
+        """
+        with self.transaction(immediate=True) as db:
+            attempt = db.execute(
+                "SELECT * FROM execution_attempts WHERE attempt_id = ?", (attempt_id,)
+            ).fetchone()
+            if attempt is None or attempt["kind"] != AttemptKind.INITIAL.value:
+                raise ValueError("attempt is not a recoverable initial execution")
+            if attempt["status"] != AttemptStatus.RUNNING.value:
+                raise ValueError("initial attempt is not running")
+            state = db.execute(
+                "SELECT * FROM issue_workflow_state WHERE thread_id = ?",
+                (attempt["thread_id"],),
+            ).fetchone()
+            plan = db.execute(
+                "SELECT * FROM issue_plans WHERE plan_id = ?", (attempt["plan_id"],)
+            ).fetchone()
+            permit = db.execute(
+                "SELECT * FROM execution_permits WHERE permit_id = ?",
+                (attempt["authorization_id"],),
+            ).fetchone()
+            if (
+                state is None
+                or plan is None
+                or permit is None
+                or state["phase"] != WorkflowPhase.EXECUTING.value
+                or state["cycle_id"] != attempt["cycle_id"]
+                or state["current_plan_id"] != attempt["plan_id"]
+                or plan["version"] != attempt["plan_version"]
+                or plan["status"]
+                not in (PlanStatus.APPROVED.value, PlanStatus.AUTO_APPROVED.value)
+                or permit["invalidated_at"] is not None
+            ):
+                # Authorization no longer proves this execution may resume.
+                db.execute(
+                    "UPDATE execution_attempts SET status = ?, completed_at = ? "
+                    "WHERE attempt_id = ?",
+                    (AttemptStatus.FAILED.value, now, attempt_id),
+                )
+                db.execute(
+                    "UPDATE issue_workflow_state SET phase = ?, updated_at = ? "
+                    "WHERE thread_id = ? AND phase = ?",
+                    (
+                        WorkflowPhase.REVIEW_BLOCKED.value,
+                        now,
+                        attempt["thread_id"],
+                        WorkflowPhase.EXECUTING.value,
+                    ),
+                )
+                return "EXHAUSTED"
+            # `retry_count` is bumped by ensure_execution_attempt immediately
+            # before each model run, so it already counts executions durably --
+            # including ones lost to a hard crash.  No parallel counter.
+            if attempt["retry_count"] >= max_recoveries:
+                db.execute(
+                    "UPDATE execution_attempts SET status = ?, completed_at = ? "
+                    "WHERE attempt_id = ?",
+                    (AttemptStatus.FAILED.value, now, attempt_id),
+                )
+                db.execute(
+                    "UPDATE issue_workflow_state SET phase = ?, updated_at = ? "
+                    "WHERE thread_id = ? AND phase = ?",
+                    (
+                        WorkflowPhase.REVIEW_BLOCKED.value,
+                        now,
+                        attempt["thread_id"],
+                        WorkflowPhase.EXECUTING.value,
+                    ),
+                )
+                return "EXHAUSTED"
+            db.execute(
+                "UPDATE execution_attempts SET status = ?, completed_at = ? "
+                "WHERE attempt_id = ?",
+                (AttemptStatus.INTERRUPTED.value, now, attempt_id),
+            )
+            target = self._execution_target(
+                db,
+                thread_id=attempt["thread_id"],
+                cycle_id=attempt["cycle_id"],
+                root_event_key=attempt["root_event_key"],
+            )
+            table = (
+                "logical_executions"
+                if target.startswith("execution-")
+                else "event_executions"
+            )
+            key = "execution_id" if table == "logical_executions" else "event_key"
+            db.execute(
+                f"UPDATE {table} SET status = ?, completed_at = NULL, "
+                f"error_message = ? WHERE {key} = ? AND status = ?",
+                (
+                    ExecutionStatus.RETRY_PENDING.value,
+                    "executor died while the initial execution was running",
+                    target,
+                    ExecutionStatus.RUNNING.value,
+                ),
+            )
+            db.execute(
+                "UPDATE execution_permits SET consumed_at = NULL WHERE permit_id = ?",
+                (attempt["authorization_id"],),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase = ?, updated_at = ? "
+                "WHERE thread_id = ? AND phase = ?",
+                (
+                    WorkflowPhase.EXECUTION_READY.value,
+                    now,
+                    attempt["thread_id"],
+                    WorkflowPhase.EXECUTING.value,
+                ),
+            )
+            return "RETRY"
 
     def fail_closed_repair_recovery(self, attempt_id: str, *, now: str) -> None:
         """Quarantine impossible EXECUTING/repair state without claiming success."""

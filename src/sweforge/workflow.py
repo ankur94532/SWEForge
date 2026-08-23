@@ -31,6 +31,7 @@ from .github_models import (
     starts_with_agent_invocation,
 )
 from .github_store import (
+    MAX_INITIAL_EXECUTION_RECOVERIES,
     AttemptKind,
     AttemptStatus,
     ClaimedEvent,
@@ -140,6 +141,7 @@ def _is_actionable_feedback(event: dict) -> bool:
     )
 
 
+DEFAULT_LOCK_ROOT = Path("~/.sweforge/locks").expanduser()
 UNCONFIGURED_MEMORY_LEARNING = "no repository memory curator was configured"
 UNCONFIGURED_ISSUE_RESOLUTION = "no issue resolution curator was configured"
 
@@ -324,6 +326,7 @@ class WorkflowEngine:
         memory_store: BaseStore | None = None,
         planner: Callable[..., str] | None = None,
         root_input_id: str | None = None,
+        lock_root: str | Path = DEFAULT_LOCK_ROOT,
     ) -> PlanRecord:
         """Create a plan after proving the planner workspace stayed untouched."""
         event = self.store.source_event(event_key)
@@ -344,6 +347,7 @@ class WorkflowEngine:
             existing_path=existing.workspace_path if existing else None,
             expected_branch=existing.branch_name if existing else None,
             expected_base=existing.base_commit if existing else None,
+            lock_root=lock_root,
         )
         if not workspace.is_clean():
             raise WorkspaceError("planner workspace was dirty before planning")
@@ -839,6 +843,7 @@ class WorkflowEngine:
                 result = _execute_claim(
                     store=self.store,
                     event=event,
+                    lock_root=lock_root,
                     live_input_provider=None,
                     live_delivered_event_keys=delivered,
                     clarification_request_sink=persist_request,
@@ -1084,6 +1089,7 @@ class WorkflowEngine:
                 result = _execute_claim(
                     store=self.store,
                     event=event,
+                    lock_root=lock_root,
                     model=model,
                     repo_paths=repo_paths,
                     workspace_root=workspace_root,
@@ -1913,7 +1919,7 @@ class WorkflowEngine:
             )
 
     def _recover_initial_execution(self, state: WorkflowStateRecord):
-        """Recover only an INITIAL attempt from root execution evidence."""
+        """Reconstruct an INITIAL attempt from durable success evidence only."""
         if hasattr(self.store, "execution_for_cycle"):
             execution = self.store.execution_for_cycle(
                 thread_id=state.thread_id,
@@ -2013,15 +2019,49 @@ class WorkflowEngine:
                     return fresh, False
             except ThreadLockUnavailable:
                 return state, True
-        return self._recover_initial_execution(state), False
+        return self._recover_orphaned_initial(state, lock_root=lock_root)
+
+    def _recover_orphaned_initial(
+        self, state: WorkflowStateRecord, *, lock_root: str | Path
+    ) -> tuple[WorkflowStateRecord, bool]:
+        """Resolve an EXECUTING thread whose INITIAL worker may have died.
+
+        Holding the IssueThread lock is the only trustworthy proof that no
+        worker is still running, so an unavailable lock means BUSY and nothing
+        is mutated.  Durable success is reconstructed; an orphan is handed back
+        for a bounded retry under the same lifecycle identity.
+        """
+        try:
+            with thread_lock(lock_root, state.thread_id):
+                fresh = self.store.workflow_state(state.thread_id)
+                if fresh is None or fresh.phase is not WorkflowPhase.EXECUTING:
+                    return fresh or state, False
+                recovered = self._recover_initial_execution(fresh)
+                if recovered.phase is not WorkflowPhase.EXECUTING:
+                    return recovered, False
+                attempt = self.store.latest_attempt(fresh.thread_id, fresh.cycle_id)
+                if (
+                    attempt is None
+                    or attempt.kind is not AttemptKind.INITIAL
+                    or attempt.status is not AttemptStatus.RUNNING
+                ):
+                    return recovered, False
+                if not hasattr(self.store, "recover_orphaned_initial_attempt"):
+                    return recovered, False
+                self.store.recover_orphaned_initial_attempt(
+                    attempt.attempt_id,
+                    now=self.clock(),
+                    max_recoveries=MAX_INITIAL_EXECUTION_RECOVERIES,
+                )
+                return self.store.workflow_state(state.thread_id), False
+        except ThreadLockUnavailable:
+            return state, True
 
     def next_workflow_input(self, thread_id: str) -> WorkflowInputRef | None:
         state = self.store.workflow_state(thread_id)
         self._drain_approval_controls(thread_id, state)
         if state:
-            state, _ = self._recover_executing_state(
-                state, lock_root=Path("~/.sweforge/locks").expanduser()
-            )
+            state, _ = self._recover_executing_state(state, lock_root=DEFAULT_LOCK_ROOT)
         after = state.root_event_key if state else None
         candidates = list(self.store.deferred_followups(thread_id))
         candidates.extend(
@@ -2198,7 +2238,7 @@ class WorkflowEngine:
         if state:
             was_executing = state.phase == WorkflowPhase.EXECUTING
             recovery_lock_root = (execute_kwargs or {}).get(
-                "lock_root", Path("~/.sweforge/locks").expanduser()
+                "lock_root", DEFAULT_LOCK_ROOT
             )
             state, busy = self._recover_executing_state(
                 state, lock_root=recovery_lock_root
@@ -2389,9 +2429,7 @@ class WorkflowEngine:
                     thread_id,
                     message=existing_review.verdict,
                 )
-            lock_root = (execute_kwargs or {}).get(
-                "lock_root", Path("~/.sweforge/locks").expanduser()
-            )
+            lock_root = (execute_kwargs or {}).get("lock_root", DEFAULT_LOCK_ROOT)
             try:
                 with thread_lock(lock_root, thread_id):
                     state = self.store.workflow_state(thread_id)

@@ -363,6 +363,56 @@ lifecycle: it is only ever written through its own `learning_id`, and the
 next logical input is selected, so a stalled record from an earlier cycle can
 neither block nor overwrite a newer one and can never mutate workflow state.
 
+## Locking and crash recovery
+
+Three cross-process locks, all `flock`-based so a crashed holder releases them:
+
+| Lock | Key | Guards | Duration |
+| --- | --- | --- | --- |
+| IssueThread | `thread_id` | one thread's execution, review, repair, recovery and publication | a whole run, including model calls |
+| Repository Git | authoritative `repo_id` | shared Git administration: creating a thread's worktree and its branch | a few local Git commands |
+| Repository memory | authoritative `repo_id` | appending to one repository's `AGENTS.md` | one read-modify-write |
+
+**The one legal order is IssueThread lock → repository Git lock → release.** No
+path may take an IssueThread lock while holding a repository Git lock;
+`thread_lock` raises `LockOrderError` rather than deadlocking, so an inversion
+is a test failure instead of a hang.
+
+The repository Git lock is deliberately narrow. Per-worktree work — `status`,
+`diff`, `commit` on the thread's own branch — is not shared state, and each
+thread owns a distinct branch, so Git's own per-ref locking already covers it.
+Only `ThreadWorkspace.create` needs serialization, because it is check-then-
+create over the repository's worktree registry and branch namespace. Two
+workers racing the same thread's worktree used to leave *both* failed, with the
+loser's cleanup deleting the winner's directory and a branch surviving with no
+worktree — a permanently unusable thread. Creation now runs whole under the
+lock: one winner, and the loser gets the ordinary fail-closed error. A branch
+left behind by a crash mid-`worktree add` is reattached rather than recreated,
+so a crash no longer wedges the thread either.
+
+The lock never spans a model call, a test run, review, memory learning or
+GitHub API traffic, so long-running work in different IssueThreads of the same
+repository stays fully concurrent. Publication takes only the IssueThread lock —
+it performs no shared Git administration — so publishing is never serialized
+behind another thread's worktree setup and cannot participate in a lock cycle.
+
+### Orphaned executions
+
+If a worker dies mid-execution the thread is left `EXECUTING` with a `RUNNING`
+attempt. Recovery runs under the IssueThread lock, because holding it is the
+only trustworthy proof that no worker is still alive; if the lock is taken the
+answer is BUSY and nothing is mutated. With the lock held: a durably `SUCCEEDED`
+execution is reconstructed into review without re-running anything, and a
+genuine orphan is handed back for retry under the *same* cycle, plan, permit,
+branch, workspace and logical execution identity. Nothing ever infers success
+from a dirty worktree, and partial work is preserved rather than reset.
+
+Retries are bounded by the attempt's existing `retry_count`, which is committed
+immediately before each run — so a hard crash consumes budget instead of
+resetting it. After three executions of one INITIAL attempt the cycle fails
+closed to `REVIEW_BLOCKED` with the attempt `FAILED`: no publication, no plan
+completion, no solved-issue record, and no further model spend.
+
 ## Two kinds of memory
 
 SWEForge keeps two deliberately separate forms of durable knowledge. They
