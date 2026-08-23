@@ -1,8 +1,16 @@
 import asyncio
+import inspect
 
 import pytest
-from deepagents.backends.protocol import ExecuteResponse
+from deepagents.backends.protocol import (
+    BackendProtocol,
+    ExecuteResponse,
+    GrepResult,
+    SandboxBackendProtocol,
+)
+from deepagents.middleware.filesystem import FilesystemMiddleware
 
+from sweforge.agent import _build_backend
 from sweforge.execution_evidence import RecordingSandboxBackend
 
 
@@ -20,6 +28,37 @@ class FakeBackend:
 
     async def aexecute(self, command, *, timeout=None):
         return self.execute(command, timeout=timeout)
+
+
+class ForwardingBackend(FakeBackend):
+    id = "forwarding"
+
+    def __getattr__(self, name):
+        if name.startswith("a"):
+
+            async def async_operation(*args, **kwargs):
+                return (name, args, kwargs)
+
+            return async_operation
+
+        def operation(*args, **kwargs):
+            return (name, args, kwargs)
+
+        return operation
+
+    def grep(self, pattern, path=None, glob=None, *, max_count=None):
+        return GrepResult(matches=[], error=None)
+
+    async def agrep(self, pattern, path=None, glob=None, *, max_count=None):
+        return self.grep(pattern, path, glob, max_count=max_count)
+
+
+class LegacyGrepBackend(FakeBackend):
+    def grep(self, pattern, path=None, glob=None):
+        return type("Result", (), {"matches": [pattern], "error": None})()
+
+    async def agrep(self, pattern, path=None, glob=None):
+        return self.grep(pattern, path, glob)
 
 
 def response(output="ok", exit_code=0, truncated=False):
@@ -88,3 +127,65 @@ def test_async_completed_command_is_recorded():
     asyncio.run(backend.aexecute("async-command"))
 
     assert observations[0]["output"] == "async"
+
+
+def test_class_level_protocol_inspection_and_grep_capability():
+    assert list(inspect.signature(RecordingSandboxBackend.grep).parameters) == list(
+        inspect.signature(BackendProtocol.grep).parameters
+    )
+    assert list(inspect.signature(RecordingSandboxBackend.agrep).parameters) == list(
+        inspect.signature(BackendProtocol.agrep).parameters
+    )
+    from deepagents.backends.protocol import _method_accepts_max_count
+
+    assert _method_accepts_max_count(RecordingSandboxBackend, "grep") is True
+
+
+def test_wrapper_exposes_complete_installed_protocol_surface():
+    expected = {
+        name
+        for cls in (BackendProtocol, SandboxBackendProtocol)
+        for name, member in cls.__dict__.items()
+        if not name.startswith("_") and callable(member)
+    }
+    assert expected <= set(dir(RecordingSandboxBackend))
+
+
+def test_filesystem_operations_forward_without_recording_shell_evidence():
+    observations = []
+    backend = ForwardingBackend([])
+    wrapper = RecordingSandboxBackend(backend, lambda **item: observations.append(item))
+
+    assert wrapper.ls(".")[0] == "ls"
+    assert asyncio.run(wrapper.aread("file"))[0] == "aread"
+    assert wrapper.grep("needle", max_count=2).matches == []
+    assert asyncio.run(wrapper.agrep("needle", max_count=2)).matches == []
+    assert wrapper.glob("*.java")[0] == "glob"
+    assert wrapper.write("file", "body")[0] == "write"
+    assert wrapper.edit("file", "old", "new")[0] == "edit"
+    assert wrapper.delete("file")[0] == "delete"
+    assert wrapper.upload_files([])[0] == "upload_files"
+    assert wrapper.download_files([])[0] == "download_files"
+    assert observations == []
+
+
+def test_legacy_grep_signature_is_supported_without_forwarding_max_count():
+    wrapper = RecordingSandboxBackend(LegacyGrepBackend([]), lambda **_: None)
+    result = wrapper.grep("needle", max_count=1)
+    assert result.matches == ["needle"]
+
+
+def test_build_backend_with_recorder_has_inspectable_filesystem_surface():
+    backend = _build_backend(
+        ".",
+        sandbox_backend=ForwardingBackend([]),
+        execution_evidence_sink=lambda **_: None,
+    )
+    assert hasattr(type(backend.default), "grep")
+    assert inspect.signature(type(backend.default).grep).parameters["max_count"]
+
+
+def test_filesystem_middleware_accepts_wrapped_backend():
+    backend = RecordingSandboxBackend(ForwardingBackend([]), lambda **_: None)
+    middleware = FilesystemMiddleware(backend=backend)
+    assert {tool.name for tool in middleware.tools} >= {"grep", "read_file"}
