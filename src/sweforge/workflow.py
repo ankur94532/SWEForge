@@ -126,6 +126,9 @@ def _is_actionable_feedback(event: dict) -> bool:
     )
 
 
+UNCONFIGURED_MEMORY_LEARNING = "no repository memory curator was configured"
+
+
 def execution_summary_markers(target: PublicationTarget) -> tuple[str, ...]:
     """Execution-summary markers owned by one exact publication lifecycle.
 
@@ -1391,6 +1394,11 @@ class WorkflowEngine:
             MemoryLearningStatus.NO_UPDATE.value,
         }:
             return
+        # Count this run before doing any work so a crash still consumes budget
+        # and a permanently failing curator cannot hold the thread at IDLE.
+        attempt = (existing.attempt_count if existing else learning.attempt_count) + 1
+        learning = replace(learning, attempt_count=attempt)
+        unconfigured = False
         try:
             if proposal_json != "{}":
                 candidates = [
@@ -1434,6 +1442,7 @@ class WorkflowEngine:
             else:
                 candidates = []
                 proposal_json = "[]"
+                unconfigured = True
             self.store.save_repo_memory_learning(
                 replace(
                     learning,
@@ -1469,7 +1478,10 @@ class WorkflowEngine:
                 status=result.status.value,
                 accepted_candidates=result.accepted_candidates,
                 rejected_candidates=result.rejected_candidates,
-                error_message=result.error,
+                # A lifecycle that ran without a curator must stay
+                # distinguishable from one that curated and found nothing.
+                error_message=result.error
+                or (UNCONFIGURED_MEMORY_LEARNING if unconfigured else None),
                 updated_at=now,
                 proposal_json=proposal_json,
             )

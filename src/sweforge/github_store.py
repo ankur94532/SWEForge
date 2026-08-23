@@ -311,6 +311,7 @@ CREATE TABLE IF NOT EXISTS repo_memory_learning (
     rejected_candidates INTEGER NOT NULL DEFAULT 0,
     proposal_json TEXT NOT NULL DEFAULT '{}',
     error_message TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(thread_id, cycle_id, root_input_id)
@@ -429,6 +430,10 @@ class AmbiguousLifecycleError(ValueError):
 # Mirrors memory_learning.MemoryLearningStatus.PENDING without importing the
 # model-dependent learning module into the persistence layer.
 MEMORY_LEARNING_PENDING = "PENDING"
+
+# Repository memory is an optimization, never an authorization input, so a
+# curator that keeps failing must not hold an IssueThread at IDLE forever.
+MAX_MEMORY_LEARNING_ATTEMPTS = 3
 
 
 RESUMABLE_PUBLICATION_STATUSES = (
@@ -723,6 +728,7 @@ class RepoMemoryLearningRecord:
     created_at: str
     updated_at: str
     proposal_json: str = "{}"
+    attempt_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1221,8 +1227,8 @@ class SQLiteGitHubStore:
                        learning_id, source_event_key, thread_id, cycle_id,
                        root_input_id, repo_id, status, accepted_candidates,
                        rejected_candidates, proposal_json, error_message,
-                       created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       attempt_count, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?)""",
                     (
                         memory_learning_id_for(
                             thread_id=row["thread_id"],
@@ -1243,6 +1249,16 @@ class SQLiteGitHubStore:
                         row["updated_at"],
                     ),
                 )
+        if "attempt_count" not in {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(repo_memory_learning)"
+            )
+        }:
+            self.connection.execute(
+                "ALTER TABLE repo_memory_learning ADD COLUMN "
+                "attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_repo_memory_learning_source "
             "ON repo_memory_learning(source_event_key)"
@@ -3264,8 +3280,8 @@ class SQLiteGitHubStore:
                    learning_id, source_event_key, thread_id, cycle_id,
                    root_input_id, repo_id, status, accepted_candidates,
                    rejected_candidates, proposal_json, error_message,
-                   created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, '{}', NULL, ?, ?)
+                   attempt_count, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, '{}', NULL, 0, ?, ?)
                    ON CONFLICT(learning_id) DO NOTHING""",
                 (
                     learning_id,
@@ -3509,8 +3525,9 @@ class SQLiteGitHubStore:
         row = self.connection.execute(
             """SELECT * FROM repo_memory_learning
                WHERE thread_id = ? AND status IN ('PENDING', 'FAILED')
+                 AND attempt_count < ?
                ORDER BY cycle_id, created_at, learning_id LIMIT 1""",
-            (thread_id,),
+            (thread_id, MAX_MEMORY_LEARNING_ATTEMPTS),
         ).fetchone()
         return RepoMemoryLearningRecord(**dict(row)) if row else None
 
@@ -3530,13 +3547,14 @@ class SQLiteGitHubStore:
                    learning_id, source_event_key, thread_id, cycle_id,
                    root_input_id, repo_id, status, accepted_candidates,
                    rejected_candidates, error_message, proposal_json,
-                   created_at, updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   attempt_count, created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(learning_id) DO UPDATE SET status=excluded.status,
                    accepted_candidates=excluded.accepted_candidates,
                    rejected_candidates=excluded.rejected_candidates,
                    error_message=excluded.error_message,
                    proposal_json=excluded.proposal_json,
+                   attempt_count=excluded.attempt_count,
                    updated_at=excluded.updated_at""",
                 (
                     record.learning_id,
@@ -3550,6 +3568,7 @@ class SQLiteGitHubStore:
                     record.rejected_candidates,
                     record.error_message,
                     record.proposal_json,
+                    record.attempt_count,
                     record.created_at,
                     record.updated_at,
                 ),

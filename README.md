@@ -363,6 +363,24 @@ lifecycle: it is only ever written through its own `learning_id`, and the
 next logical input is selected, so a stalled record from an earlier cycle can
 neither block nor overwrite a newer one and can never mutate workflow state.
 
+Repository-memory learning curates after publication from the cumulative diff,
+so the evidence it may cite is bounded by what the task changed: only changed
+files enter the evidence catalog, and only their first window of lines.
+Durable knowledge discovered in files the task did not modify — build and test
+commands, conventions, configuration locations, dependency relationships — is
+therefore not citable today, and a proposal that cites anything outside the
+catalog is rejected. Closing that gap needs an application-controlled
+`propose_repo_memory` tool that records candidate evidence during execution
+without mutating memory; the existing post-publication validator would still
+decide what is durable, evidence-backed, non-secret, novel and repo-scoped.
+
+Learning never gates delivery. Repository memory is an optimization, not an
+authorization input, so a curator that keeps failing is retried a bounded
+number of times and then left FAILED with its error for diagnosis while the
+thread proceeds to its next logical input. A lifecycle that completed with no
+curator configured is recorded explicitly rather than as an ordinary
+"nothing durable found" result.
+
 Databases written before this model are migrated in place. An event-keyed
 publication or learning row is an ordinary lifecycle, so its logical input is
 its event key; every field, status, SHA, PR, comment id and proposal is
