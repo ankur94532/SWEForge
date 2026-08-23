@@ -337,6 +337,15 @@ CREATE TABLE IF NOT EXISTS issue_metadata (
     observed_at TEXT NOT NULL,
     PRIMARY KEY(repo_id, issue_number)
 );
+CREATE TABLE IF NOT EXISTS issue_content_observations (
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    source_id TEXT NOT NULL,
+    issue_number INTEGER NOT NULL,
+    body_hash TEXT NOT NULL,
+    body TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY(repo_id, source_id)
+);
 CREATE TABLE IF NOT EXISTS repo_memory_candidates (
     candidate_id TEXT PRIMARY KEY,
     repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
@@ -1876,6 +1885,13 @@ class SQLiteGitHubStore:
                     (event.event_key,),
                 ).fetchone():
                     continue
+                if not self._is_new_issue_content(db, event):
+                    continue
+                if (
+                    event.source_kind.value == "issue"
+                    and not is_actionable_source_event(event.source_kind, event.body)
+                ):
+                    continue
                 if self._has_resolved_issue_snapshot(db, event):
                     continue
                 thread_id = self._resolve_thread(db, event, polled_at, result)
@@ -1932,6 +1948,116 @@ class SQLiteGitHubStore:
                 (repo_id, stream, since, etag, polled_at),
             )
         return result
+
+    def observe_issue_content(
+        self,
+        *,
+        repo_id: int,
+        source_id: str,
+        issue_number: int,
+        body: str | None,
+        observed_at: str,
+    ) -> None:
+        """Record a non-actionable issue body as the latest content version."""
+        with self.transaction() as db:
+            self._upsert_issue_content_observation(
+                db,
+                repo_id=repo_id,
+                source_id=source_id,
+                issue_number=issue_number,
+                body=body,
+                observed_at=observed_at,
+            )
+
+    @staticmethod
+    def _issue_body_hash(body: str | None) -> str:
+        return hashlib.sha256((body or "").encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _upsert_issue_content_observation(
+        cls,
+        db: sqlite3.Connection,
+        *,
+        repo_id: int,
+        source_id: str,
+        issue_number: int,
+        body: str | None,
+        observed_at: str,
+    ) -> None:
+        normalized = body or ""
+        db.execute(
+            """INSERT INTO issue_content_observations(
+               repo_id, source_id, issue_number, body_hash, body, observed_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(repo_id, source_id) DO UPDATE SET
+                 issue_number=excluded.issue_number,
+                 body_hash=excluded.body_hash,
+                 body=excluded.body,
+                 observed_at=excluded.observed_at""",
+            (
+                repo_id,
+                source_id,
+                issue_number,
+                cls._issue_body_hash(normalized),
+                normalized,
+                observed_at,
+            ),
+        )
+
+    @classmethod
+    def _is_new_issue_content(cls, db: sqlite3.Connection, event: SourceEvent) -> bool:
+        if event.source_kind.value != "issue":
+            return True
+        body_hash = cls._issue_body_hash(event.body)
+        row = db.execute(
+            """SELECT body_hash FROM issue_content_observations
+               WHERE repo_id = ? AND source_id = ?""",
+            (event.repo_id, event.source_id),
+        ).fetchone()
+        if row is None:
+            # Bootstrap upgrades from databases that predate observations.  A
+            # newer generic issue timestamp must not replay the latest known
+            # body as a new logical task.
+            historical = db.execute(
+                """SELECT body FROM source_events
+                   WHERE repo_id = ? AND source_kind = 'issue'
+                     AND source_id = ?
+                   ORDER BY source_updated_at DESC, discovered_at DESC
+                   LIMIT 1""",
+                (event.repo_id, event.source_id),
+            ).fetchone()
+            if (
+                historical is not None
+                and cls._issue_body_hash(historical[0]) == body_hash
+            ):
+                cls._upsert_issue_content_observation(
+                    db,
+                    repo_id=event.repo_id,
+                    source_id=event.source_id,
+                    issue_number=event.subject_number,
+                    body=event.body,
+                    observed_at=event.source_updated_at,
+                )
+                return False
+        elif row[0] == body_hash:
+            cls._upsert_issue_content_observation(
+                db,
+                repo_id=event.repo_id,
+                source_id=event.source_id,
+                issue_number=event.subject_number,
+                body=event.body,
+                observed_at=event.source_updated_at,
+            )
+            return False
+        cls._upsert_issue_content_observation(
+            db,
+            repo_id=event.repo_id,
+            source_id=event.source_id,
+            issue_number=event.subject_number,
+            body=event.body,
+            observed_at=event.source_updated_at,
+        )
+        return True
 
     @staticmethod
     def _has_resolved_issue_snapshot(

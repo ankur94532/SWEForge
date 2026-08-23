@@ -154,16 +154,25 @@ class GitHubPoller:
     ) -> Iterable[SourceEvent]:
         for item in items:
             body = item.get("body")
+            if stream == "issues":
+                if item.get("pull_request"):
+                    continue
+                self._snapshot_issue(repo, item, item["number"], observed)
             actionable = is_actionable_source_event(
                 SourceKind.ISSUE if stream == "issues" else SourceKind.ISSUE_COMMENT,
                 body,
             )
             if not actionable:
+                if stream == "issues":
+                    self.store.observe_issue_content(
+                        repo_id=repo.repo_id,
+                        source_id=str(item["id"]),
+                        issue_number=item["number"],
+                        body=body,
+                        observed_at=str(item.get("updated_at") or observed),
+                    )
                 continue
             if stream == "issues":
-                if item.get("pull_request"):
-                    continue
-                self._snapshot_issue(repo, item, item["number"], observed)
                 yield self._event(
                     repo,
                     SourceKind.ISSUE,

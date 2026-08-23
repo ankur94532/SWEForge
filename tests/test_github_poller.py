@@ -101,6 +101,80 @@ def test_issue_event_is_persisted_once_and_thread_is_deterministic(tmp_path):
     store.close()
 
 
+def test_issue_activity_does_not_re_root_unchanged_body(tmp_path):
+    repo = RepositoryRef(123, "example/repo")
+    fake = FakeGitHub(
+        {repo.full_name: repo},
+        {(123, "issues"): PollResponse((issue_item(updated="2026-01-01T00:00:00Z"),))},
+    )
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    poller(fake, store).poll([repo.full_name])
+
+    fake.responses[(123, "issues")] = PollResponse(
+        (issue_item(updated="2026-01-01T00:00:01Z"),)
+    )
+    fake.responses[(123, "issue_comments")] = PollResponse(
+        (comment_item(comment_id=90, updated="2026-01-01T00:00:02Z"),)
+    )
+    result = poller(fake, store).poll([repo.full_name])
+
+    issue_events = [row for row in store.events() if row["source_kind"] == "issue"]
+    comment_events = [
+        row for row in store.events() if row["source_kind"] == "issue_comment"
+    ]
+    assert result.events_persisted == 1
+    assert len(issue_events) == 1
+    assert len(comment_events) == 1
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("bodies", "expected_events"),
+    [
+        (("@agent do X", "@agent do X and Y", "@agent do X"), 3),
+        (("@agent do X", "do X", "@agent do X"), 2),
+        (("@agent do X", "do X", "do X"), 1),
+    ],
+)
+def test_issue_content_transitions_use_last_observation(
+    tmp_path, bodies, expected_events
+):
+    repo = RepositoryRef(123, "example/repo")
+    fake = FakeGitHub({repo.full_name: repo})
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    for index, body in enumerate(bodies):
+        fake.responses[(123, "issues")] = PollResponse(
+            (
+                issue_item(
+                    updated=f"2026-01-01T00:00:0{index}Z",
+                    body=body,
+                ),
+            )
+        )
+        poller(fake, store).poll([repo.full_name])
+
+    issue_events = [row for row in store.events() if row["source_kind"] == "issue"]
+    assert len(issue_events) == expected_events
+    store.close()
+
+
+def test_issue_metadata_updates_without_new_task_event(tmp_path):
+    repo = RepositoryRef(123, "example/repo")
+    first = issue_item(updated="2026-01-01T00:00:00Z")
+    first["title"] = "Original"
+    second = issue_item(updated="2026-01-01T00:00:01Z")
+    second["title"] = "Renamed"
+    fake = FakeGitHub({repo.full_name: repo}, {(123, "issues"): PollResponse((first,))})
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    poller(fake, store).poll([repo.full_name])
+    fake.responses[(123, "issues")] = PollResponse((second,))
+    assert poller(fake, store).poll([repo.full_name]).events_persisted == 0
+    metadata = store.issue_metadata(repo_id=123, issue_number=7)
+    assert metadata and metadata.title == "Renamed"
+    assert len(store.events()) == 1
+    store.close()
+
+
 def test_edited_comment_creates_one_new_event(tmp_path):
     repo = RepositoryRef(123, "example/repo")
     fake = FakeGitHub(

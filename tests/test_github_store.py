@@ -146,7 +146,7 @@ def test_pr_mapping_routes_existing_unrouted_events(tmp_path):
     store.close()
 
 
-def test_duplicate_event_does_not_update_thread_activity(tmp_path):
+def test_unchanged_issue_content_does_not_update_thread_activity(tmp_path):
     store = SQLiteGitHubStore(tmp_path / "state.db")
     repo = RepositoryRef(12345, "example/repo")
     store.upsert_repository(repo.repo_id, repo.full_name, "now")
@@ -167,18 +167,49 @@ def test_duplicate_event_does_not_update_thread_activity(tmp_path):
         polled_at="2026-01-01T00:00:02Z",
     )
     assert store.threads()[0]["updated_at"] == "2026-01-01T00:00:01Z"
-    edited = event(repo, source_id="1", number=7)
-    edited = replace(edited, source_updated_at="2026-01-01T00:01:00Z")
+    unchanged = event(repo, source_id="1", number=7)
+    unchanged = replace(unchanged, source_updated_at="2026-01-01T00:01:00Z")
     store.record_batch(
         repo.repo_id,
         "issues",
-        [edited],
+        [unchanged],
         since="now",
         etag=None,
         polled_at="2026-01-01T00:01:01Z",
     )
-    assert store.threads()[0]["updated_at"] == "2026-01-01T00:01:01Z"
+    assert store.threads()[0]["updated_at"] == "2026-01-01T00:00:01Z"
     store.close()
+
+
+def test_existing_issue_event_bootstraps_content_observation(tmp_path):
+    path = tmp_path / "state.db"
+    store = SQLiteGitHubStore(path)
+    repo = RepositoryRef(12345, "example/repo")
+    store.upsert_repository(repo.repo_id, repo.full_name, "now")
+    first = event(repo)
+    store.record_batch(
+        repo.repo_id, "issues", [first], since="now", etag=None, polled_at="now"
+    )
+    store.close()
+
+    reopened = SQLiteGitHubStore(path)
+    later = replace(first, source_updated_at="2026-01-01T00:01:00Z")
+    result = reopened.record_batch(
+        repo.repo_id,
+        "issues",
+        [later],
+        since="later",
+        etag=None,
+        polled_at="later",
+    )
+    assert result.events_persisted == 0
+    assert len(reopened.events()) == 1
+    observation = reopened.connection.execute(
+        "SELECT body FROM issue_content_observations WHERE repo_id=? AND source_id=?",
+        (repo.repo_id, first.source_id),
+    ).fetchone()
+    assert observation[0] == first.body
+    reopened.close()
 
 
 def test_cursor_failure_rolls_back_inserted_event(tmp_path):
@@ -272,16 +303,16 @@ def test_existing_state_db_migrates_execution_baselines(tmp_path):
     migrated.close()
 
 
-def test_resolved_issue_snapshot_is_not_a_new_task(tmp_path):
+def test_unchanged_issue_snapshot_is_not_a_new_task_after_resolution(tmp_path):
     store = SQLiteGitHubStore(tmp_path / "state.db")
     repo = RepositoryRef(12345, "example/repo")
     store.upsert_repository(repo.repo_id, repo.full_name, "now")
     first = event(repo)
-    edited_snapshot = replace(first, source_updated_at="2026-01-01T00:01:00Z")
+    unchanged_snapshot = replace(first, source_updated_at="2026-01-01T00:01:00Z")
     store.record_batch(
         repo.repo_id,
         "issues",
-        [first, edited_snapshot],
+        [first, unchanged_snapshot],
         since="now",
         etag=None,
         polled_at="now",
@@ -314,13 +345,13 @@ def test_resolved_issue_snapshot_is_not_a_new_task(tmp_path):
     store.record_batch(
         repo.repo_id,
         "issues",
-        [edited_snapshot],
+        [unchanged_snapshot],
         since="later",
         etag=None,
         polled_at="latest",
     )
-    assert store.execution_for_event(edited_snapshot.event_key) is None
-    assert store.claim_next_event(now="latest").event_key == edited_snapshot.event_key
+    assert store.execution_for_event(unchanged_snapshot.event_key) is None
+    assert store.claim_next_event(now="latest") is None
     store.close()
 
 
