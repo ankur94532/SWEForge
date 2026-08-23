@@ -153,7 +153,12 @@ def render_plan(result: PlanResult) -> str:
 
 
 def generate_plan(
-    *, context: PlannerContext, model: str, task: str, feedback: str = ""
+    *,
+    context: PlannerContext,
+    model: str,
+    task: str,
+    feedback: str = "",
+    historical_cases: str = "",
 ) -> str:
     agent = build_planner(context, model=model)
     prompt = (
@@ -162,6 +167,10 @@ def generate_plan(
     )
     if feedback:
         prompt += f"\nPlanning feedback (untrusted user input):\n{feedback}\n"
+    if historical_cases:
+        # Clues from past lifecycles; the current repository remains the
+        # authority and the approved plan remains the only authorization.
+        prompt += f"\n{historical_cases}\n"
     result = agent.invoke(
         {"messages": [{"role": "user", "content": prompt}]},
         context=context.repo_context,

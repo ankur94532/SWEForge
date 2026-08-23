@@ -39,23 +39,37 @@ from .github_store import (
     ExecutionPermit,
     ExecutionReviewRecord,
     InputPurpose,
+    IssueResolutionRecord,
+    IssueResolutionStatus,
     PendingWorkflowInputError,
     PermitSource,
     PlanRecord,
     PlanStatus,
     PublicationTarget,
+    RepoMemoryCandidateRecord,
+    RepoMemoryCandidateStatus,
     RepoMemoryLearningRecord,
     SQLiteGitHubStore,
     ThreadWorkspaceRecord,
     WorkflowMode,
     WorkflowPhase,
     WorkflowStateRecord,
+    execution_id_for,
+    repo_memory_candidate_id_for,
+)
+from .issue_resolution import (
+    ResolutionEvidence,
+    bounded_changed_files,
+    curate_issue_resolution,
+    render_case_context,
+    resolution_query,
 )
 from .memory_learning import (
     MemoryLearningResult,
     MemoryLearningStatus,
     RepoMemoryCandidate,
     apply_memory_candidates,
+    candidate_from_proposal,
     curate_repository_memory,
 )
 from .planner import PlannerContext, generate_plan
@@ -127,6 +141,7 @@ def _is_actionable_feedback(event: dict) -> bool:
 
 
 UNCONFIGURED_MEMORY_LEARNING = "no repository memory curator was configured"
+UNCONFIGURED_ISSUE_RESOLUTION = "no issue resolution curator was configured"
 
 
 def execution_summary_markers(target: PublicationTarget) -> tuple[str, ...]:
@@ -391,11 +406,15 @@ class WorkflowEngine:
             ),
             live_delivered_event_keys=delivered,
         )
+        task_text = normalize_task(selected_text or event["body"])
         plan_text = (planner or self.planner)(
             context=context,
             model=model,
-            task=format_source_context(
-                event, normalize_task(selected_text or event["body"])
+            task=format_source_context(event, task_text),
+            historical_cases=self.similar_resolved_cases(
+                repo_id=event["repo_id"],
+                issue_number=thread["issue_number"],
+                task_text=task_text,
             ),
         )
         if workspace.head_sha() != before_head or not workspace.is_clean():
@@ -699,6 +718,7 @@ class WorkflowEngine:
                 plan = self.store.plan(permit.plan_id)
                 if plan is None:
                     raise ValueError("approved plan disappeared")
+                state_repo_id = plan.repo_id
                 attempt_id = f"attempt-{permit.permit_id}"
                 attempt = self.store.ensure_execution_attempt(
                     attempt_id=attempt_id,
@@ -735,6 +755,70 @@ class WorkflowEngine:
                         return json.loads(answered.answer_json or "{}").get("answer")
                     return None
 
+                root_input_id = plan.root_input_id or plan.root_event_key
+
+                def record_proposal(
+                    *,
+                    category: str,
+                    fact: str,
+                    durability_reason: str,
+                    path: str,
+                    start_line: int,
+                    end_line: int,
+                ) -> str:
+                    """Persist a nominated fact; never write repository memory."""
+                    workspace = self.store.thread_workspace(permit.thread_id)
+                    if workspace is None:
+                        return "Repository workspace is unavailable."
+                    try:
+                        # Reading here proves the location exists and is inside
+                        # the repository before anything durable is written.
+                        candidate_from_proposal(
+                            repo_id=state_repo_id,
+                            worktree=workspace.workspace_path,
+                            category=category,
+                            fact=fact,
+                            durability_reason=durability_reason,
+                            path=path,
+                            start_line=start_line,
+                            end_line=end_line,
+                        )
+                    except (OSError, UnicodeError, ValueError) as exc:
+                        return f"Proposal rejected: {exc}"
+                    timestamp = self.clock()
+                    self.store.save_repo_memory_candidate(
+                        RepoMemoryCandidateRecord(
+                            candidate_id=repo_memory_candidate_id_for(
+                                repo_id=state_repo_id,
+                                thread_id=permit.thread_id,
+                                cycle_id=permit.cycle_id,
+                                root_input_id=root_input_id,
+                                fact=fact,
+                                evidence_path=path,
+                                evidence_start_line=start_line,
+                                evidence_end_line=end_line,
+                            ),
+                            repo_id=state_repo_id,
+                            thread_id=permit.thread_id,
+                            cycle_id=permit.cycle_id,
+                            root_input_id=root_input_id,
+                            source_event_key=plan.root_event_key,
+                            category=category,
+                            fact=fact,
+                            durability_reason=durability_reason,
+                            evidence_path=path,
+                            evidence_start_line=start_line,
+                            evidence_end_line=end_line,
+                            status=RepoMemoryCandidateStatus.PROPOSED.value,
+                            created_at=timestamp,
+                            updated_at=timestamp,
+                        )
+                    )
+                    return (
+                        "Recorded as a repository-memory candidate. SWEForge "
+                        "validates and decides after publication."
+                    )
+
                 def persist_request(payload: dict) -> None:
                     current_state = self.store.workflow_state(permit.thread_id)
                     if current_state is None:
@@ -759,6 +843,10 @@ class WorkflowEngine:
                     live_delivered_event_keys=delivered,
                     clarification_request_sink=persist_request,
                     resume_resolver=resolve_resume,
+                    repo_memory_proposal_sink=record_proposal,
+                    issue_memory_search=lambda query, limit: self.search_issue_memory(
+                        repo_id=state_repo_id, query=query, limit=limit
+                    ),
                     approved_plan_text=plan.plan_text,
                     approved_plan_id=plan.plan_id,
                     approved_plan_version=plan.version,
@@ -1287,6 +1375,7 @@ class WorkflowEngine:
         memory_store: BaseStore | None = None,
         memory_lock_root: str | Path = "~/.sweforge/locks",
         memory_model: str | None = None,
+        resolution_model: str | None = None,
     ) -> str | None:
         if publication_status not in {"COMPLETED", "NO_CHANGES"}:
             return None
@@ -1368,6 +1457,18 @@ class WorkflowEngine:
             lock_root=memory_lock_root,
             memory_model=memory_model,
         )
+        pending_case = self.store.issue_resolution_for_cycle(
+            thread_id=thread_id,
+            cycle_id=target.cycle_id,
+            root_event_key=target.source_event_key,
+            root_input_id=target.root_input_id,
+        )
+        if pending_case is not None:
+            self._learn_issue_resolution(
+                resolution=pending_case,
+                workspace_path=workspace.workspace_path if workspace else None,
+                resolution_model=resolution_model or memory_model,
+            )
         return comment_id
 
     def _learn_repository_memory(
@@ -1394,12 +1495,16 @@ class WorkflowEngine:
             MemoryLearningStatus.NO_UPDATE.value,
         }:
             return
-        # Count this run before doing any work so a crash still consumes budget
-        # and a permanently failing curator cannot hold the thread at IDLE.
-        attempt = (existing.attempt_count if existing else learning.attempt_count) + 1
+        # Commit the attempt before any external call.  A hard crash mid-curation
+        # must consume budget, otherwise the retry loop survives every restart.
+        attempt = self.store.claim_memory_learning_attempt(learning.learning_id)
         learning = replace(learning, attempt_count=attempt)
         unconfigured = False
+        proposal_records: list[RepoMemoryCandidateRecord] = []
         try:
+            proposed, proposal_records = self._proposed_memory_candidates(
+                learning=learning, workspace_path=workspace_path
+            )
             if proposal_json != "{}":
                 candidates = [
                     RepoMemoryCandidate.model_validate(item)
@@ -1442,7 +1547,22 @@ class WorkflowEngine:
             else:
                 candidates = []
                 proposal_json = "[]"
-                unconfigured = True
+                # Agent proposals are validated regardless, so the coverage gap
+                # closes even when no curator model is configured.
+                unconfigured = not proposed
+            if proposal_json == "{}":
+                proposal_json = "[]"
+            if proposed:
+                known = {candidate.candidate_id for candidate in candidates}
+                candidates = candidates + [
+                    candidate
+                    for candidate in proposed
+                    if candidate.candidate_id not in known
+                ]
+                proposal_json = json.dumps(
+                    [candidate.model_dump() for candidate in candidates],
+                    sort_keys=True,
+                )
             self.store.save_repo_memory_learning(
                 replace(
                     learning,
@@ -1472,6 +1592,7 @@ class WorkflowEngine:
                 MemoryLearningStatus.FAILED,
                 error=str(exc)[:500],
             )
+        self._settle_memory_proposals(proposal_records, result)
         self.store.save_repo_memory_learning(
             replace(
                 learning,
@@ -1485,6 +1606,242 @@ class WorkflowEngine:
                 updated_at=now,
                 proposal_json=proposal_json,
             )
+        )
+
+    def _proposed_memory_candidates(
+        self, *, learning: RepoMemoryLearningRecord, workspace_path: str | None
+    ) -> tuple[list[RepoMemoryCandidate], list[RepoMemoryCandidateRecord]]:
+        """Turn this lifecycle's nominated locations into derived candidates.
+
+        Evidence is read from the authoritative worktree here, so a proposal
+        contributes only a location -- never asserted repository content.
+        """
+        records = self.store.repo_memory_candidates_for_cycle(
+            thread_id=learning.thread_id,
+            cycle_id=learning.cycle_id,
+            root_event_key=learning.source_event_key,
+            root_input_id=learning.root_input_id,
+        )
+        if not records or not workspace_path:
+            return [], records
+        candidates: list[RepoMemoryCandidate] = []
+        seen: set[str] = set()
+        for record in records:
+            try:
+                candidate = candidate_from_proposal(
+                    repo_id=learning.repo_id,
+                    worktree=workspace_path,
+                    category=record.category,
+                    fact=record.fact,
+                    durability_reason=record.durability_reason,
+                    path=record.evidence_path,
+                    start_line=record.evidence_start_line,
+                    end_line=record.evidence_end_line,
+                )
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if candidate.candidate_id in seen:
+                continue
+            seen.add(candidate.candidate_id)
+            candidates.append(candidate)
+        return candidates, records
+
+    def _settle_memory_proposals(
+        self,
+        records: list[RepoMemoryCandidateRecord],
+        result: MemoryLearningResult,
+    ) -> None:
+        """Record whether each proposal survived validation, for diagnosis."""
+        if not records:
+            return
+        accepted = result.status is MemoryLearningStatus.UPDATED
+        now = self.clock()
+        for record in records:
+            if record.status != RepoMemoryCandidateStatus.PROPOSED.value:
+                continue
+            self.store.set_repo_memory_candidate_status(
+                record.candidate_id,
+                status=(
+                    RepoMemoryCandidateStatus.ACCEPTED.value
+                    if accepted
+                    else RepoMemoryCandidateStatus.REJECTED.value
+                ),
+                now=now,
+            )
+
+    # ------------------------------------------------------------------
+    # Resolved-issue (historical case) memory
+    #
+    # A case is generated automatically for finalized lifecycles only, and is
+    # retrieval material -- never repository truth and never authorization.
+    # ------------------------------------------------------------------
+
+    def search_issue_memory(self, *, repo_id: int, query: str, limit: int = 3) -> str:
+        """Repository-scoped historical case search rendered for a model."""
+        records = self.store.search_issue_resolutions(
+            repo_id=repo_id,
+            query=query,
+            limit=max(1, min(int(limit), 5)),
+            per_thread_limit=1,
+        )
+        return render_case_context(records) or "No similar resolved cases were found."
+
+    def similar_resolved_cases(
+        self, *, repo_id: int, issue_number: int, task_text: str, limit: int = 3
+    ) -> str:
+        """Bounded automatic retrieval for planning, from trusted input only."""
+        metadata = self.store.issue_metadata(repo_id=repo_id, issue_number=issue_number)
+        query = resolution_query(
+            issue_title=metadata.title if metadata else "",
+            issue_description=metadata.body if metadata else "",
+            task_text=task_text,
+        )
+        records = self.store.search_issue_resolutions(
+            repo_id=repo_id, query=query, limit=limit, per_thread_limit=1
+        )
+        return render_case_context(records)
+
+    def _learn_issue_resolution(
+        self,
+        *,
+        resolution: IssueResolutionRecord,
+        workspace_path: str | None,
+        resolution_model: str | None,
+    ) -> None:
+        """Generate one historical case, bounded and durably retried."""
+        now = self.clock()
+        existing = self.store.issue_resolution(resolution.resolution_id)
+        if existing is not None and existing.status in {
+            IssueResolutionStatus.COMPLETED.value,
+            IssueResolutionStatus.NO_CASE.value,
+        }:
+            return
+        # Same durability rule as repository learning: budget before the call.
+        attempt = self.store.claim_issue_resolution_attempt(resolution.resolution_id)
+        resolution = replace(resolution, attempt_count=attempt, updated_at=now)
+        if not resolution_model:
+            self.store.save_issue_resolution(
+                replace(
+                    resolution,
+                    status=IssueResolutionStatus.NO_CASE.value,
+                    error_message=UNCONFIGURED_ISSUE_RESOLUTION,
+                )
+            )
+            return
+        try:
+            evidence = self._resolution_evidence(resolution, workspace_path)
+            # Provenance is application-derived and stored whatever the model
+            # concludes, so the record stays traceable to its lifecycle.
+            resolution = replace(
+                resolution,
+                execution_id=execution_id_for(
+                    thread_id=resolution.thread_id,
+                    cycle_id=resolution.cycle_id,
+                    root_input_id=resolution.root_input_id,
+                ),
+                changed_files_json=bounded_changed_files(evidence.changed_files),
+                commit_sha=evidence.commit_sha,
+                pr_number=evidence.pr_number,
+                pr_url=evidence.pr_url,
+                review_id=self._resolution_review_id(resolution),
+            )
+            case = curate_issue_resolution(model=resolution_model, evidence=evidence)
+        except Exception as exc:
+            self.store.save_issue_resolution(
+                replace(
+                    resolution,
+                    status=IssueResolutionStatus.FAILED.value,
+                    error_message=str(exc)[:500],
+                )
+            )
+            return
+        if not case.useful:
+            self.store.save_issue_resolution(
+                replace(
+                    resolution,
+                    status=IssueResolutionStatus.NO_CASE.value,
+                    error_message=None,
+                )
+            )
+            return
+        self.store.save_issue_resolution(
+            replace(
+                resolution,
+                task_summary=case.task_summary,
+                symptom_summary=case.symptom_summary,
+                root_cause=case.root_cause,
+                fix_summary=case.fix_summary,
+                affected_components_json=json.dumps(case.affected_components),
+                validation_summary=case.validation_summary,
+                search_terms_json=json.dumps(case.search_terms),
+                limitations=case.limitations,
+                status=IssueResolutionStatus.COMPLETED.value,
+                error_message=None,
+            )
+        )
+
+    def _resolution_review_id(self, resolution: IssueResolutionRecord) -> str | None:
+        attempt = self.store.latest_attempt(resolution.thread_id, resolution.cycle_id)
+        review = (
+            self.store.execution_review_for_attempt(attempt.attempt_id)
+            if attempt
+            else None
+        )
+        return review.review_id if review else None
+
+    def _resolution_evidence(
+        self, resolution: IssueResolutionRecord, workspace_path: str | None
+    ) -> ResolutionEvidence:
+        plan = (
+            self.store.plan(resolution.plan_id) if resolution.plan_id else None
+        ) or self.store.plan_for_cycle(resolution.thread_id, resolution.cycle_id)
+        execution = self.store.execution_for_cycle(
+            thread_id=resolution.thread_id,
+            cycle_id=resolution.cycle_id,
+            root_event_key=resolution.source_event_key,
+            root_input_id=resolution.root_input_id,
+        )
+        attempt = self.store.latest_attempt(resolution.thread_id, resolution.cycle_id)
+        review = (
+            self.store.execution_review_for_attempt(attempt.attempt_id)
+            if attempt
+            else None
+        )
+        publication = (
+            self.store.publication_for_id(resolution.publication_id)
+            if resolution.publication_id
+            else None
+        )
+        workspace_record = self.store.thread_workspace(resolution.thread_id)
+        changed: tuple[str, ...] = ()
+        diff = ""
+        if workspace_path and workspace_record:
+            try:
+                inspection = Workspace(
+                    Path(workspace_path),
+                    Path(workspace_path),
+                    workspace_record.base_commit,
+                )
+                changed = tuple(inspection.changed_files()[:60])
+                diff = inspection.diff()[:20_000]
+            except (OSError, ValueError, WorkspaceError):
+                changed, diff = (), ""
+        source = self.store.source_event(resolution.source_event_key)
+        return ResolutionEvidence(
+            issue_number=resolution.issue_number,
+            issue_title=resolution.issue_title,
+            issue_description=resolution.issue_description_snapshot,
+            task_text=(source["body"] if source else "") or "",
+            plan_text=plan.plan_text if plan else "",
+            execution_response=(execution["response_text"] if execution else "") or "",
+            changed_files=changed,
+            diff=diff,
+            review_summary=review.summary if review else "",
+            repair_rounds=attempt.repair_round if attempt else 0,
+            publication_status=publication.status.value if publication else "",
+            pr_number=publication.pr_number if publication else None,
+            pr_url=publication.pr_url if publication else None,
+            commit_sha=publication.remote_commit_sha if publication else None,
         )
 
     def post_blocked_review_comment(
@@ -1823,6 +2180,7 @@ class WorkflowEngine:
         model: str,
         review_model: str | None = None,
         memory_model: str | None = None,
+        resolution_model: str | None = None,
         repo_paths: dict[str, str | Path],
         workspace_root: str | Path,
         memory_store: BaseStore | None = None,
@@ -1899,6 +2257,19 @@ class WorkflowEngine:
                 return WorkflowAdvanceResult(
                     WorkflowPhase.IDLE, thread_id, message="repository learning retried"
                 )
+            pending_case = self.store.pending_issue_resolution(thread_id)
+            if pending_case is not None:
+                workspace = self.store.thread_workspace(thread_id)
+                self._learn_issue_resolution(
+                    resolution=pending_case,
+                    workspace_path=workspace.workspace_path if workspace else None,
+                    resolution_model=resolution_model or memory_model,
+                )
+                return WorkflowAdvanceResult(
+                    WorkflowPhase.IDLE,
+                    thread_id,
+                    message="issue resolution learning retried",
+                )
         if state and state.phase == WorkflowPhase.REVIEW_BLOCKED:
             latest = self.store.latest_attempt(thread_id, state.cycle_id)
             review = (
@@ -1944,6 +2315,7 @@ class WorkflowEngine:
                     "memory_lock_root", "~/.sweforge/locks"
                 ),
                 memory_model=memory_model,
+                resolution_model=resolution_model,
             )
             return WorkflowAdvanceResult(
                 WorkflowPhase.IDLE, thread_id, message="finalized"

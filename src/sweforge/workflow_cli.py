@@ -60,6 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="trusted installed sandbox provider entry-point name",
     )
     parser.add_argument(
+        "--resolution-model",
+        help="model for resolved-issue case records (defaults to --memory-model)",
+    )
+    parser.add_argument(
         "--api-url",
         default=os.getenv("SWEFORGE_GITHUB_API_URL", "https://api.github.com"),
     )
@@ -86,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     execution_model = args.execution_model or args.model
     review_model = args.review_model or args.model
     memory_model = args.memory_model or review_model
+    resolution_model = args.resolution_model or memory_model
     if not all((planning_model, execution_model, review_model)):
         print(
             "sweforge-github-workflow: planning, execution, and review "
@@ -132,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             model=planning_model,
             review_model=review_model,
             memory_model=memory_model,
+            resolution_model=resolution_model,
             repo_paths=mappings,
             workspace_root=args.workspace_root,
             memory_store=memory.store,

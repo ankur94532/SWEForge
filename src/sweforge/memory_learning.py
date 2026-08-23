@@ -172,19 +172,16 @@ def curate_repository_memory(
             for item in evidence_items
             if item is not None
         ]
-        material = "\0".join(
-            [
-                str(repo_id),
-                proposal.category.casefold(),
-                proposal.fact.casefold(),
-                *sorted(
-                    item.content_hash for item in evidence_items if item is not None
-                ),
-            ]
-        )
         candidates.append(
             RepoMemoryCandidate(
-                candidate_id=hashlib.sha256(material.encode()).hexdigest()[:24],
+                candidate_id=_memory_entry_id(
+                    repo_id=repo_id,
+                    category=proposal.category,
+                    fact=proposal.fact,
+                    content_hashes=[
+                        item.content_hash for item in evidence_items if item is not None
+                    ],
+                ),
                 category=proposal.category,
                 fact=proposal.fact,
                 evidence=evidence,
@@ -196,6 +193,68 @@ def curate_repository_memory(
         proposal_json=json.dumps(
             [candidate.model_dump() for candidate in candidates], sort_keys=True
         ),
+    )
+
+
+def _memory_entry_id(
+    *, repo_id: int, category: str, fact: str, content_hashes: list[str]
+) -> str:
+    """Content identity of one durable memory entry, used for deduplication."""
+    material = "\0".join(
+        [str(repo_id), category.casefold(), fact.casefold(), *sorted(content_hashes)]
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:24]
+
+
+def candidate_from_proposal(
+    *,
+    repo_id: int,
+    worktree: str | Path,
+    category: str,
+    fact: str,
+    durability_reason: str,
+    path: str,
+    start_line: int,
+    end_line: int,
+) -> RepoMemoryCandidate:
+    """Build a candidate from a nominated location, deriving the evidence here.
+
+    The proposer only says WHERE to look.  The excerpt and hash are read from
+    the authoritative worktree so a model can never assert repository content
+    it did not actually find.
+    """
+    root = Path(worktree).resolve()
+    target = _safe_path(root, path)
+    lines = target.read_text(encoding="utf-8").splitlines()
+    if start_line < 1 or end_line < start_line:
+        raise ValueError("memory evidence range is inverted")
+    if end_line > len(lines):
+        raise ValueError("memory evidence range is outside the file")
+    excerpt = "\n".join(lines[start_line - 1 : end_line])
+    if not excerpt.strip():
+        raise ValueError("memory evidence range is empty")
+    if SECRET_RE.search(excerpt):
+        raise ValueError("memory evidence appears to contain a secret")
+    content_hash = hashlib.sha256(excerpt.encode()).hexdigest()
+    return RepoMemoryCandidate(
+        candidate_id=_memory_entry_id(
+            repo_id=repo_id,
+            category=category,
+            fact=fact,
+            content_hashes=[content_hash],
+        ),
+        category=category,
+        fact=fact,
+        evidence=[
+            RepoMemoryEvidence(
+                path=path,
+                start_line=start_line,
+                end_line=end_line,
+                content_hash=content_hash,
+                excerpt=excerpt[:MAX_EXCERPT_CHARS],
+            )
+        ],
+        durability_reason=durability_reason,
     )
 
 

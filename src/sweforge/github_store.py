@@ -4,6 +4,8 @@
 # ruff: noqa: E501
 
 import hashlib
+import json
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -318,7 +320,83 @@ CREATE TABLE IF NOT EXISTS repo_memory_learning (
 );
 """
 
+SCHEMA += """
+CREATE TABLE IF NOT EXISTS issue_metadata (
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    issue_number INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    body TEXT NOT NULL DEFAULT '',
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY(repo_id, issue_number)
+);
+CREATE TABLE IF NOT EXISTS repo_memory_candidates (
+    candidate_id TEXT PRIMARY KEY,
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    root_input_id TEXT NOT NULL,
+    source_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    category TEXT NOT NULL,
+    fact TEXT NOT NULL,
+    durability_reason TEXT NOT NULL,
+    evidence_path TEXT NOT NULL,
+    evidence_start_line INTEGER NOT NULL,
+    evidence_end_line INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PROPOSED',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_repo_memory_candidates_cycle
+    ON repo_memory_candidates(thread_id, cycle_id, root_input_id);
+CREATE TABLE IF NOT EXISTS issue_resolution_memory (
+    resolution_id TEXT PRIMARY KEY,
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    root_input_id TEXT NOT NULL,
+    source_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    issue_number INTEGER NOT NULL,
+    issue_title TEXT NOT NULL DEFAULT '',
+    issue_description_snapshot TEXT NOT NULL DEFAULT '',
+    task_summary TEXT NOT NULL DEFAULT '',
+    symptom_summary TEXT NOT NULL DEFAULT '',
+    root_cause TEXT NOT NULL DEFAULT '',
+    fix_summary TEXT NOT NULL DEFAULT '',
+    affected_components_json TEXT NOT NULL DEFAULT '[]',
+    changed_files_json TEXT NOT NULL DEFAULT '[]',
+    validation_summary TEXT NOT NULL DEFAULT '',
+    search_terms_json TEXT NOT NULL DEFAULT '[]',
+    limitations TEXT NOT NULL DEFAULT '',
+    plan_id TEXT,
+    execution_id TEXT,
+    review_id TEXT,
+    publication_id TEXT,
+    commit_sha TEXT,
+    pr_number INTEGER,
+    pr_url TEXT,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(thread_id, cycle_id, root_input_id)
+);
+CREATE INDEX IF NOT EXISTS idx_issue_resolution_repo
+    ON issue_resolution_memory(repo_id, issue_number);
+"""
+
 SCHEMA += REPO_MEMORY_LEARNING_DDL
+
+# Derived retrieval index.  The base table stays authoritative; this is
+# rebuildable from it and never the source of truth.
+ISSUE_RESOLUTION_FTS_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS issue_resolution_fts USING fts5(
+    resolution_id UNINDEXED,
+    haystack
+);
+"""
+
+SCHEMA += ISSUE_RESOLUTION_FTS_DDL
 
 
 @dataclass
@@ -435,6 +513,24 @@ MEMORY_LEARNING_PENDING = "PENDING"
 # curator that keeps failing must not hold an IssueThread at IDLE forever.
 MAX_MEMORY_LEARNING_ATTEMPTS = 3
 
+# Historical case generation is model-dependent, so it is bounded the same way.
+MAX_ISSUE_RESOLUTION_ATTEMPTS = 3
+
+
+class RepoMemoryCandidateStatus(StrEnum):
+    PROPOSED = "PROPOSED"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+
+
+class IssueResolutionStatus(StrEnum):
+    """Distinguishes "no useful case" from "failed" from "not configured"."""
+
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    NO_CASE = "NO_CASE"
+    FAILED = "FAILED"
+
 
 RESUMABLE_PUBLICATION_STATUSES = (
     PublicationStatus.PENDING,
@@ -464,6 +560,73 @@ def publication_id_for(*, thread_id: str, cycle_id: int, root_input_id: str) -> 
 def memory_learning_id_for(*, thread_id: str, cycle_id: int, root_input_id: str) -> str:
     """Return the stable identity for one lifecycle's memory learning."""
     return f"learning-{_lifecycle_digest(thread_id, cycle_id, root_input_id)}"
+
+
+def resolution_id_for(*, thread_id: str, cycle_id: int, root_input_id: str) -> str:
+    """Return the stable identity for one lifecycle's resolved-issue case.
+
+    One IssueThread can resolve several logical inputs, so a historical case
+    belongs to a lifecycle rather than to `repo_id + issue_number`.
+    """
+    return f"resolution-{_lifecycle_digest(thread_id, cycle_id, root_input_id)}"
+
+
+_FTS_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+_FTS_STOPWORDS = frozenset(
+    """a an and are as at be but by for from has have how in into is it its of on
+    or that the then there these this to was were what when where which who why with""".split()
+)
+
+
+def fts_match_expression(query: str, *, max_terms: int = 24) -> str:
+    """Build a safe FTS5 MATCH expression from arbitrary human text.
+
+    User and issue text is never passed to FTS5 directly: unbalanced quotes and
+    bare operators are a syntax error, so tokens are extracted, bounded and
+    quoted deterministically.
+    """
+    seen: list[str] = []
+    for token in _FTS_TOKEN_RE.findall(query or ""):
+        folded = token.casefold()
+        if len(folded) < 3 or folded in _FTS_STOPWORDS or folded in seen:
+            continue
+        seen.append(folded)
+        if len(seen) >= max_terms:
+            break
+    return " OR ".join(f'"{token}"' for token in seen)
+
+
+def normalized_memory_fact(fact: str) -> str:
+    """Collapse a proposed fact so replays hash to one candidate identity."""
+    return " ".join(fact.split()).casefold()
+
+
+def repo_memory_candidate_id_for(
+    *,
+    repo_id: int,
+    thread_id: str,
+    cycle_id: int,
+    root_input_id: str,
+    fact: str,
+    evidence_path: str,
+    evidence_start_line: int,
+    evidence_end_line: int,
+) -> str:
+    """Return the stable identity for one execution-time memory proposal."""
+    material = "\0".join(
+        [
+            str(repo_id),
+            thread_id,
+            str(cycle_id),
+            root_input_id,
+            normalized_memory_fact(fact),
+            evidence_path,
+            str(evidence_start_line),
+            str(evidence_end_line),
+        ]
+    )
+    digest = hashlib.sha256(material.encode()).hexdigest()[:24]
+    return f"repo-memory-candidate-{digest}"
 
 
 @dataclass(frozen=True)
@@ -729,6 +892,68 @@ class RepoMemoryLearningRecord:
     updated_at: str
     proposal_json: str = "{}"
     attempt_count: int = 0
+
+
+@dataclass(frozen=True)
+class RepoMemoryCandidateRecord:
+    candidate_id: str
+    repo_id: int
+    thread_id: str
+    cycle_id: int
+    root_input_id: str
+    source_event_key: str
+    category: str
+    fact: str
+    durability_reason: str
+    evidence_path: str
+    evidence_start_line: int
+    evidence_end_line: int
+    status: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class IssueMetadataRecord:
+    repo_id: int
+    issue_number: int
+    title: str
+    body: str
+    observed_at: str
+
+
+@dataclass(frozen=True)
+class IssueResolutionRecord:
+    resolution_id: str
+    repo_id: int
+    thread_id: str
+    cycle_id: int
+    root_input_id: str
+    source_event_key: str
+    issue_number: int
+    issue_title: str
+    issue_description_snapshot: str
+    task_summary: str
+    symptom_summary: str
+    root_cause: str
+    fix_summary: str
+    affected_components_json: str
+    changed_files_json: str
+    validation_summary: str
+    search_terms_json: str
+    limitations: str
+    plan_id: str | None
+    execution_id: str | None
+    review_id: str | None
+    publication_id: str | None
+    commit_sha: str | None
+    pr_number: int | None
+    pr_url: str | None
+    status: str
+    error_message: str | None
+    attempt_count: int
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True)
@@ -1263,6 +1488,318 @@ class SQLiteGitHubStore:
             "CREATE INDEX IF NOT EXISTS idx_repo_memory_learning_source "
             "ON repo_memory_learning(source_event_key)"
         )
+
+    # ------------------------------------------------------------------
+    # Durable attempt budgets
+    #
+    # Model-dependent learning must consume its budget BEFORE the external
+    # call, so a hard crash mid-call cannot reset the budget and retry forever.
+    # ------------------------------------------------------------------
+
+    def _claim_attempt(self, table: str, key_column: str, key: str) -> int:
+        with self.transaction(immediate=True) as db:
+            cursor = db.execute(
+                f"UPDATE {table} SET attempt_count = attempt_count + 1 "
+                f"WHERE {key_column} = ?",
+                (key,),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"{table} record does not exist")
+            row = db.execute(
+                f"SELECT attempt_count FROM {table} WHERE {key_column} = ?", (key,)
+            ).fetchone()
+        return int(row["attempt_count"])
+
+    def claim_memory_learning_attempt(self, learning_id: str) -> int:
+        """Durably consume one repository-learning attempt before curating."""
+        return self._claim_attempt("repo_memory_learning", "learning_id", learning_id)
+
+    def claim_issue_resolution_attempt(self, resolution_id: str) -> int:
+        """Durably consume one resolved-issue attempt before curating."""
+        return self._claim_attempt(
+            "issue_resolution_memory", "resolution_id", resolution_id
+        )
+
+    # ------------------------------------------------------------------
+    # Execution-time repository-memory proposals
+    #
+    # A proposal only nominates WHERE evidence lives.  The application derives
+    # what those lines contain and the existing validator remains the sole
+    # writer of durable repository memory.
+    # ------------------------------------------------------------------
+
+    def save_repo_memory_candidate(
+        self, record: RepoMemoryCandidateRecord
+    ) -> RepoMemoryCandidateRecord:
+        expected = repo_memory_candidate_id_for(
+            repo_id=record.repo_id,
+            thread_id=record.thread_id,
+            cycle_id=record.cycle_id,
+            root_input_id=record.root_input_id,
+            fact=record.fact,
+            evidence_path=record.evidence_path,
+            evidence_start_line=record.evidence_start_line,
+            evidence_end_line=record.evidence_end_line,
+        )
+        if record.candidate_id != expected:
+            raise ValueError("repository memory candidate id does not match evidence")
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO repo_memory_candidates(
+                   candidate_id, repo_id, thread_id, cycle_id, root_input_id,
+                   source_event_key, category, fact, durability_reason,
+                   evidence_path, evidence_start_line, evidence_end_line,
+                   status, created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(candidate_id) DO UPDATE SET
+                     status=excluded.status, updated_at=excluded.updated_at""",
+                (
+                    record.candidate_id,
+                    record.repo_id,
+                    record.thread_id,
+                    record.cycle_id,
+                    record.root_input_id,
+                    record.source_event_key,
+                    record.category,
+                    record.fact,
+                    record.durability_reason,
+                    record.evidence_path,
+                    record.evidence_start_line,
+                    record.evidence_end_line,
+                    record.status,
+                    record.created_at,
+                    record.updated_at,
+                ),
+            )
+        return self.repo_memory_candidate(record.candidate_id)  # type: ignore[return-value]
+
+    def repo_memory_candidate(
+        self, candidate_id: str
+    ) -> RepoMemoryCandidateRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM repo_memory_candidates WHERE candidate_id = ?",
+            (candidate_id,),
+        ).fetchone()
+        return RepoMemoryCandidateRecord(**dict(row)) if row else None
+
+    def repo_memory_candidates_for_cycle(
+        self,
+        *,
+        thread_id: str,
+        cycle_id: int,
+        root_event_key: str,
+        root_input_id: str | None,
+    ) -> list[RepoMemoryCandidateRecord]:
+        rows = self.connection.execute(
+            """SELECT * FROM repo_memory_candidates
+               WHERE thread_id = ? AND cycle_id = ? AND root_input_id = ?
+               ORDER BY created_at, candidate_id""",
+            (thread_id, cycle_id, root_input_id or root_event_key),
+        ).fetchall()
+        return [RepoMemoryCandidateRecord(**dict(row)) for row in rows]
+
+    def set_repo_memory_candidate_status(
+        self, candidate_id: str, *, status: str, now: str
+    ) -> None:
+        with self.transaction() as db:
+            db.execute(
+                "UPDATE repo_memory_candidates SET status = ?, updated_at = ? "
+                "WHERE candidate_id = ?",
+                (status, now, candidate_id),
+            )
+
+    # ------------------------------------------------------------------
+    # Canonical issue metadata snapshots
+    # ------------------------------------------------------------------
+
+    def upsert_issue_metadata(
+        self,
+        *,
+        repo_id: int,
+        issue_number: int,
+        title: str,
+        body: str,
+        observed_at: str,
+    ) -> None:
+        """Record the newest observed issue title/body seen during ingestion."""
+        with self.transaction() as db:
+            db.execute(
+                """INSERT INTO issue_metadata(
+                   repo_id, issue_number, title, body, observed_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(repo_id, issue_number) DO UPDATE SET
+                     title=excluded.title, body=excluded.body,
+                     observed_at=excluded.observed_at
+                   WHERE excluded.observed_at >= issue_metadata.observed_at""",
+                (repo_id, issue_number, title or "", body or "", observed_at),
+            )
+
+    def issue_metadata(
+        self, *, repo_id: int, issue_number: int
+    ) -> IssueMetadataRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM issue_metadata WHERE repo_id = ? AND issue_number = ?",
+            (repo_id, issue_number),
+        ).fetchone()
+        return IssueMetadataRecord(**dict(row)) if row else None
+
+    # ------------------------------------------------------------------
+    # Resolved-issue (historical case) memory
+    # ------------------------------------------------------------------
+
+    def issue_resolution(self, resolution_id: str) -> IssueResolutionRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM issue_resolution_memory WHERE resolution_id = ?",
+            (resolution_id,),
+        ).fetchone()
+        return IssueResolutionRecord(**dict(row)) if row else None
+
+    def issue_resolution_for_cycle(
+        self,
+        *,
+        thread_id: str,
+        cycle_id: int,
+        root_event_key: str,
+        root_input_id: str | None,
+    ) -> IssueResolutionRecord | None:
+        return self.issue_resolution(
+            resolution_id_for(
+                thread_id=thread_id,
+                cycle_id=cycle_id,
+                root_input_id=root_input_id or root_event_key,
+            )
+        )
+
+    def pending_issue_resolution(self, thread_id: str) -> IssueResolutionRecord | None:
+        row = self.connection.execute(
+            """SELECT * FROM issue_resolution_memory
+               WHERE thread_id = ? AND status IN ('PENDING', 'FAILED')
+                 AND attempt_count < ?
+               ORDER BY cycle_id, created_at, resolution_id LIMIT 1""",
+            (thread_id, MAX_ISSUE_RESOLUTION_ATTEMPTS),
+        ).fetchone()
+        return IssueResolutionRecord(**dict(row)) if row else None
+
+    def save_issue_resolution(
+        self, record: IssueResolutionRecord
+    ) -> IssueResolutionRecord:
+        expected = resolution_id_for(
+            thread_id=record.thread_id,
+            cycle_id=record.cycle_id,
+            root_input_id=record.root_input_id,
+        )
+        if record.resolution_id != expected:
+            raise ValueError("resolution id does not match its lifecycle")
+        columns = [field for field in IssueResolutionRecord.__dataclass_fields__]
+        assignments = ", ".join(
+            f"{name}=excluded.{name}" for name in columns if name != "resolution_id"
+        )
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                f"""INSERT INTO issue_resolution_memory({", ".join(columns)})
+                    VALUES({", ".join("?" for _ in columns)})
+                    ON CONFLICT(resolution_id) DO UPDATE SET {assignments}""",
+                [getattr(record, name) for name in columns],
+            )
+            self._index_issue_resolution(db, record)
+        return self.issue_resolution(record.resolution_id)  # type: ignore[return-value]
+
+    @staticmethod
+    def _resolution_haystack(record: IssueResolutionRecord) -> str:
+        try:
+            components = " ".join(json.loads(record.affected_components_json or "[]"))
+            terms = " ".join(json.loads(record.search_terms_json or "[]"))
+            changed = " ".join(json.loads(record.changed_files_json or "[]"))
+        except (TypeError, ValueError):
+            components = terms = changed = ""
+        return "\n".join(
+            part
+            for part in (
+                record.issue_title,
+                record.issue_description_snapshot,
+                record.task_summary,
+                record.symptom_summary,
+                record.root_cause,
+                record.fix_summary,
+                record.validation_summary,
+                components,
+                terms,
+                changed,
+            )
+            if part
+        )
+
+    def _index_issue_resolution(
+        self, db: sqlite3.Connection, record: IssueResolutionRecord
+    ) -> None:
+        db.execute(
+            "DELETE FROM issue_resolution_fts WHERE resolution_id = ?",
+            (record.resolution_id,),
+        )
+        # Only terminal, genuinely resolved cases are retrievable.
+        if record.status != IssueResolutionStatus.COMPLETED.value:
+            return
+        db.execute(
+            "INSERT INTO issue_resolution_fts(resolution_id, haystack) VALUES(?, ?)",
+            (record.resolution_id, self._resolution_haystack(record)),
+        )
+
+    def rebuild_issue_resolution_index(self) -> int:
+        """Recreate the derived search index from the authoritative rows."""
+        with self.transaction(immediate=True) as db:
+            db.execute("DELETE FROM issue_resolution_fts")
+            rows = db.execute(
+                "SELECT * FROM issue_resolution_memory ORDER BY resolution_id"
+            ).fetchall()
+            for row in rows:
+                self._index_issue_resolution(db, IssueResolutionRecord(**dict(row)))
+            indexed = db.execute(
+                "SELECT count(*) AS total FROM issue_resolution_fts"
+            ).fetchone()
+        return int(indexed["total"])
+
+    def search_issue_resolutions(
+        self,
+        *,
+        repo_id: int,
+        query: str,
+        limit: int = 5,
+        per_thread_limit: int | None = None,
+    ) -> list[IssueResolutionRecord]:
+        """Rank completed cases from ONE repository by lexical relevance.
+
+        `repo_id` comes from authoritative context and is applied against the
+        base rows, so the derived index can never widen repository scope.
+        """
+        expression = fts_match_expression(query)
+        bounded = max(0, min(int(limit), 25))
+        if not expression or not bounded:
+            return []
+        rows = self.connection.execute(
+            """SELECT base.*, bm25(issue_resolution_fts) AS relevance
+               FROM issue_resolution_fts
+               JOIN issue_resolution_memory AS base
+                 ON base.resolution_id = issue_resolution_fts.resolution_id
+               WHERE issue_resolution_fts MATCH ?
+                 AND base.repo_id = ? AND base.status = ?
+               ORDER BY relevance, base.resolution_id""",
+            (expression, repo_id, IssueResolutionStatus.COMPLETED.value),
+        ).fetchall()
+        selected: list[IssueResolutionRecord] = []
+        per_thread: dict[str, int] = {}
+        for row in rows:
+            values = dict(row)
+            values.pop("relevance", None)
+            record = IssueResolutionRecord(**values)
+            if per_thread_limit is not None:
+                seen = per_thread.get(record.thread_id, 0)
+                if seen >= per_thread_limit:
+                    continue
+                per_thread[record.thread_id] = seen + 1
+            selected.append(record)
+            if len(selected) >= bounded:
+                break
+        return selected
 
     def close(self) -> None:
         self.connection.close()
@@ -3291,6 +3828,44 @@ class SQLiteGitHubStore:
                     target.root_input_id,
                     target.repo_id,
                     MEMORY_LEARNING_PENDING,
+                    now,
+                    now,
+                ),
+            )
+            # A historical case exists for every finalized lifecycle, with no
+            # model discretion over whether the job was created.  Only
+            # finalization reaches here, so failed or blocked work never
+            # produces a "solved issue" record.
+            metadata = db.execute(
+                "SELECT title, body FROM issue_metadata "
+                "WHERE repo_id = ? AND issue_number = ?",
+                (target.repo_id, target.issue_number),
+            ).fetchone()
+            db.execute(
+                """INSERT INTO issue_resolution_memory(
+                   resolution_id, repo_id, thread_id, cycle_id, root_input_id,
+                   source_event_key, issue_number, issue_title,
+                   issue_description_snapshot, plan_id, publication_id,
+                   status, attempt_count, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)
+                   ON CONFLICT(resolution_id) DO NOTHING""",
+                (
+                    resolution_id_for(
+                        thread_id=target.thread_id,
+                        cycle_id=target.cycle_id,
+                        root_input_id=target.root_input_id,
+                    ),
+                    target.repo_id,
+                    target.thread_id,
+                    target.cycle_id,
+                    target.root_input_id,
+                    target.source_event_key,
+                    target.issue_number,
+                    (metadata["title"] if metadata else "") or "",
+                    (metadata["body"] if metadata else "") or "",
+                    target.plan_id,
+                    publication_id,
+                    IssueResolutionStatus.PENDING.value,
                     now,
                     now,
                 ),

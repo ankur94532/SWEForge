@@ -12,6 +12,7 @@ import pytest
 from test_publication_identity import THREAD_ID, Harness, approval, source_event
 
 from sweforge.github_store import (
+    MAX_ISSUE_RESOLUTION_ATTEMPTS,
     MAX_MEMORY_LEARNING_ATTEMPTS,
     SQLiteGitHubStore,
     WorkflowPhase,
@@ -144,12 +145,13 @@ def published_thread(tmp_path):
     return harness, origin
 
 
-def advance(harness, *, memory_model):
+def advance(harness, *, memory_model, resolution_model=None):
     return harness.engine.advance(
         thread_id=THREAD_ID,
         model="planning-sonnet",
         review_model="review-sonnet",
         memory_model=memory_model,
+        resolution_model=resolution_model,
         repo_paths={harness.repo.full_name: harness.source},
         workspace_root=harness.tmp_path / "workspaces",
         memory_store=NullMemoryStore(),
@@ -167,23 +169,29 @@ def test_a_failing_curator_cannot_hold_the_thread_at_idle(tmp_path, monkeypatch)
         raise RuntimeError("missing ANTHROPIC_API_KEY")
 
     monkeypatch.setattr("sweforge.memory_learning.init_chat_model", exploding)
+    # Historical-case learning is a separate lane and must also stay offline.
+    monkeypatch.setattr("sweforge.issue_resolution.init_chat_model", exploding)
     assert advance(harness, memory_model="anthropic:model").phase is WorkflowPhase.IDLE
 
-    # A new actionable input is waiting behind the failing learning record.
+    # A new actionable input is waiting behind the failing learning records.
     harness.record(
         source_event(harness.repo, "9", "@agent now add tests", "2026-01-05T00:00:00Z")
     )
     assert harness.engine.next_workflow_input(THREAD_ID) is not None
 
-    results = [advance(harness, memory_model="anthropic:model") for _ in range(4)]
+    results = [advance(harness, memory_model="anthropic:model") for _ in range(8)]
     messages = [item.message for item in results]
     assert messages.count("repository learning retried") == (
         MAX_MEMORY_LEARNING_ATTEMPTS - 1
     )
-    # Retries are bounded, then the queued logical input finally runs.
-    assert len(calls) == MAX_MEMORY_LEARNING_ATTEMPTS
+    assert messages.count("issue resolution learning retried") == (
+        MAX_ISSUE_RESOLUTION_ATTEMPTS - 1
+    )
+    # Both lanes are bounded, then the queued logical input finally runs.
+    assert len(calls) == (MAX_MEMORY_LEARNING_ATTEMPTS + MAX_ISSUE_RESOLUTION_ATTEMPTS)
     assert harness.store.workflow_state(THREAD_ID).cycle_id == 2
     assert harness.store.pending_memory_learning(THREAD_ID) is None
+    assert harness.store.pending_issue_resolution(THREAD_ID) is None
 
     # The failure stays visible for diagnosis rather than being erased.
     record = harness.store.memory_learning_for_cycle(

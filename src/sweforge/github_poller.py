@@ -73,7 +73,7 @@ class GitHubPoller:
         for stream in STREAMS:
             response, since = self._fetch(repo, stream, observed)
             events = list(
-                self._normalize(repo, stream, response.items, classifications)
+                self._normalize(repo, stream, response.items, classifications, observed)
             )
             batch = self.store.record_batch(
                 repo.repo_id,
@@ -122,12 +122,36 @@ class GitHubPoller:
             UTC
         ).isoformat().replace("+00:00", "Z")
 
+    def _snapshot_issue(
+        self, repo: RepositoryRef, payload: dict, number: int, observed: str
+    ) -> None:
+        """Persist the canonical issue title/body already present in a payload.
+
+        SourceEvent bodies are comments, not the issue description, and are
+        immutable.  Historical cases need the issue's own title and body, so
+        ingestion records a snapshot rather than re-fetching it later.
+        """
+        if not isinstance(payload, dict):
+            return
+        title = payload.get("title")
+        body = payload.get("body")
+        if title is None and body is None:
+            return
+        self.store.upsert_issue_metadata(
+            repo_id=repo.repo_id,
+            issue_number=number,
+            title=str(title or ""),
+            body=str(body or ""),
+            observed_at=str(payload.get("updated_at") or observed),
+        )
+
     def _normalize(
         self,
         repo: RepositoryRef,
         stream: str,
         items: Iterable[dict],
         classifications: dict[int, SubjectKind],
+        observed: str,
     ) -> Iterable[SourceEvent]:
         for item in items:
             body = item.get("body")
@@ -141,6 +165,7 @@ class GitHubPoller:
             if stream == "issues":
                 if item.get("pull_request"):
                     continue
+                self._snapshot_issue(repo, item, item["number"], observed)
                 yield self._event(
                     repo,
                     SourceKind.ISSUE,
@@ -153,9 +178,11 @@ class GitHubPoller:
             elif stream == "issue_comments":
                 number = self._number_from_url(item.get("issue_url"))
                 if number not in classifications:
-                    classifications[number] = classify_subject(
-                        self.client.issue(repo, number)
-                    )
+                    # Already fetched for classification; snapshot it here so
+                    # historical learning never needs its own network call.
+                    payload = self.client.issue(repo, number)
+                    classifications[number] = classify_subject(payload)
+                    self._snapshot_issue(repo, payload, number, observed)
                 subject = classifications[number]
                 yield self._event(
                     repo,

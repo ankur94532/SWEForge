@@ -204,6 +204,8 @@ def run_task(
     interrupt_result_sink: Callable[[dict[str, Any]], None] | None = None,
     resume_value: Any | None = None,
     resume_resolver: Callable[[tuple[dict[str, Any], ...]], Any] | None = None,
+    repo_memory_proposal_sink: Callable[..., str] | None = None,
+    issue_memory_search: Callable[[str, int], str] | None = None,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
@@ -286,15 +288,85 @@ def run_task(
             return f"Clarification answer received: {answer}"
 
         clarification_tools.append(request_clarification)
+    memory_tools = []
+    if repo_memory_proposal_sink is not None:
+
+        @tool
+        def propose_repo_memory(
+            category: str,
+            fact: str,
+            durability_reason: str,
+            path: str,
+            start_line: int,
+            end_line: int,
+        ) -> str:
+            """Nominate durable repository knowledge for later validation.
+
+            Use this for facts a future task in THIS repository would need --
+            build/test commands, conventions, architectural boundaries,
+            configuration locations, stable dependency relationships -- even
+            when you found them in files this task did not change.
+
+            This does not write repository memory. Point at the lines that
+            prove the fact; SWEForge reads them itself, verifies them after
+            publication and decides whether to record the fact.
+            """
+            return repo_memory_proposal_sink(
+                category=category,
+                fact=fact,
+                durability_reason=durability_reason,
+                path=path,
+                start_line=int(start_line),
+                end_line=int(end_line),
+            )
+
+        memory_tools.append(propose_repo_memory)
+    research_tools = []
+    if issue_memory_search is not None:
+
+        @tool
+        def search_issue_memory(query: str, limit: int = 3) -> str:
+            """Search past resolved issues in THIS repository for similar cases.
+
+            Returns concise historical records: symptom, root cause, fix and
+            affected components. They are clues from when they were fixed, not
+            current repository truth -- verify against the code before relying
+            on one.
+            """
+            return issue_memory_search(query, int(limit))
+
+        research_tools.append(search_issue_memory)
     if capability_registry is not None:
         if repo_context is None:
             raise ValueError("MCP capabilities require authoritative context")
         mcp_tools, _ = asyncio.run(
             load_repo_mcp_tools(capability_registry, repo_context)
         )
+    # The general-purpose subagent is read-only research: it may search
+    # historical cases and inspect files, but proposing durable repository
+    # knowledge and interrupting for a human stay with the main agent, which
+    # owns the lifecycle.  Overriding the default subagent is what withholds
+    # them; by default deepagents grants a subagent every parent tool.
+    subagents = [
+        {
+            "name": "general-purpose",
+            "description": (
+                "Read-only investigator for researching questions, searching "
+                "code and gathering evidence. Returns a written report; it "
+                "cannot propose repository memory or ask the human anything."
+            ),
+            "system_prompt": (
+                "Investigate the request within this repository worktree and "
+                "report concise, concrete findings with file paths and line "
+                "numbers. Do not modify application state."
+            ),
+            "tools": [*mcp_tools, *research_tools],
+        }
+    ]
     agent = create_deep_agent(
         model=model,
-        tools=[*mcp_tools, *clarification_tools],
+        tools=[*mcp_tools, *clarification_tools, *memory_tools, *research_tools],
+        subagents=subagents,
         backend=backend,
         system_prompt=(
             "Work only within the provided repository worktree. Inspect the code, "

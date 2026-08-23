@@ -56,6 +56,8 @@ class TaskRunner(Protocol):
         clarification_request_sink: Callable[[dict], None] | None = None,
         resume_value: object | None = None,
         resume_resolver: Callable[[tuple[dict, ...]], object] | None = None,
+        repo_memory_proposal_sink: Callable[..., str] | None = None,
+        issue_memory_search: Callable[[str, int], str] | None = None,
     ) -> str: ...
 
 
@@ -229,6 +231,8 @@ def execute_one(
     clarification_request_sink: Callable[[dict], None] | None = None,
     resume_value: object | None = None,
     resume_resolver: Callable[[tuple[dict, ...]], object] | None = None,
+    repo_memory_proposal_sink: Callable[..., str] | None = None,
+    issue_memory_search: Callable[[str, int], str] | None = None,
     clarification_enabled: bool = True,
 ) -> ExecutionResult:
     clock = now or (lambda: datetime.now(UTC))
@@ -259,6 +263,8 @@ def execute_one(
                 clarification_request_sink=clarification_request_sink,
                 resume_value=resume_value,
                 resume_resolver=resume_resolver,
+                repo_memory_proposal_sink=repo_memory_proposal_sink,
+                issue_memory_search=issue_memory_search,
                 clarification_enabled=clarification_enabled,
                 now=clock,
             )
@@ -307,6 +313,8 @@ def _execute_claim(
     clarification_request_sink: Callable[[dict], None] | None = None,
     resume_value: object | None = None,
     resume_resolver: Callable[[tuple[dict, ...]], object] | None = None,
+    repo_memory_proposal_sink: Callable[..., str] | None = None,
+    issue_memory_search: Callable[[str, int], str] | None = None,
     clarification_enabled: bool = True,
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
@@ -416,6 +424,10 @@ def _execute_claim(
             runner_kwargs.pop("resume_value", None)
         if resume_resolver is None:
             runner_kwargs.pop("resume_resolver", None)
+        if repo_memory_proposal_sink is not None:
+            runner_kwargs["repo_memory_proposal_sink"] = repo_memory_proposal_sink
+        if issue_memory_search is not None:
+            runner_kwargs["issue_memory_search"] = issue_memory_search
         if live_input_provider is not None:
             runner_kwargs["live_input_provider"] = live_input_provider
         if live_delivered_event_keys is not None:

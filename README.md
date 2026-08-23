@@ -363,16 +363,82 @@ lifecycle: it is only ever written through its own `learning_id`, and the
 next logical input is selected, so a stalled record from an earlier cycle can
 neither block nor overwrite a newer one and can never mutate workflow state.
 
-Repository-memory learning curates after publication from the cumulative diff,
-so the evidence it may cite is bounded by what the task changed: only changed
-files enter the evidence catalog, and only their first window of lines.
-Durable knowledge discovered in files the task did not modify — build and test
-commands, conventions, configuration locations, dependency relationships — is
-therefore not citable today, and a proposal that cites anything outside the
-catalog is rejected. Closing that gap needs an application-controlled
-`propose_repo_memory` tool that records candidate evidence during execution
-without mutating memory; the existing post-publication validator would still
-decide what is durable, evidence-backed, non-secret, novel and repo-scoped.
+## Two kinds of memory
+
+SWEForge keeps two deliberately separate forms of durable knowledge. They
+inform each other but never merge.
+
+**Repository memory** answers *what should future agents know about how this
+repository works?* It is compact, broadly loaded into every execution agent as
+`/memories/AGENTS.md`, and only ever written by the application's
+evidence-backed validator.
+
+> Integration tests run with `./gradlew integrationTest`.
+
+**Resolved-issue memory** answers *have we solved something like this before?*
+It is structured case history, repository-scoped, and retrieved rather than
+loaded.
+
+> #142 — bulk discount failed above $100 because subtotal cents were divided
+> before `DiscountPolicy`; removed the division; pricing tests passed.
+
+The distinction is a trust boundary. A case is what one lifecycle diagnosed at
+the time it was fixed; it is a clue for future work, never repository truth.
+"#88 was fixed by bypassing cache X" must never become "cache X should always
+be bypassed". A historical case may motivate a repository-memory proposal, but
+it is never sufficient evidence on its own: durable repository knowledge is
+admitted only when grounded in current repository lines that the application
+reads and verifies itself.
+
+### Nominating repository knowledge
+
+Curation after publication sees the cumulative diff, so on its own it can only
+cite files the task changed, and only their first window of lines. Knowledge
+found while *reading* — build and test commands, conventions, configuration
+locations, dependency relationships — used to be unreachable.
+
+Execution agents can now call `propose_repo_memory(category, fact,
+durability_reason, path, start_line, end_line)`. The tool writes nothing. The
+model nominates only *where* the evidence is; SWEForge reads those lines from
+the authoritative worktree and derives the excerpt and hash itself, so a model
+can never assert repository content it did not find. Paths that are absolute or
+escape the worktree, inverted or out-of-range line spans, empty spans and
+secret-looking evidence are all refused. Proposals are stored per lifecycle
+with a deterministic identity, then re-verified against the live worktree after
+publication and put through the same validator, deduplication and repository
+lock as diff-derived candidates. Because proposals are validated on their own,
+the gap closes even when no curator model is configured.
+
+Repository memory stays write-denied to the agent: `/memories/**` and
+`/skills/**` remain deny rules, and the validator is still the only writer.
+
+### How a case is created and used
+
+Historical cases are automatic, with no model discretion over whether the job
+exists. Finalization creates the record in the same transaction that marks the
+plan executed, so only genuinely finalized lifecycles produce one — failed,
+review-blocked, unapproved or incomplete work never claims to have solved
+anything. Identity is `stable(thread_id, cycle_id, root_input_id)`, matching
+execution, publication and learning, so one issue worked in three cycles yields
+three independent cases while `issue_number` and `thread_id` still group them.
+The issue's canonical title and body are snapshotted during ingestion from
+payloads the poller already holds, so learning never needs its own network call.
+
+Retrieval is local and deterministic: SQLite FTS5/BM25 over the case rows,
+always filtered by authoritative `repo_id`, so one repository can never read
+another's history. The index is derived and rebuildable; the rows are
+authoritative. Planning automatically receives the top few relevant cases,
+capped at one per IssueThread so a single noisy issue cannot flood context, and
+the main agent can call `search_issue_memory` for deeper read-only research.
+Cases are always framed as clues to verify against current code, and the
+approved plan remains the only thing that authorizes work.
+
+Both learning lanes are optimizations, never authorization inputs. Each claims
+its attempt durably *before* invoking a model, so a hard crash consumes budget
+instead of retrying forever; each is bounded at three attempts and then left
+FAILED with its error while the thread proceeds to its next logical input. A
+lifecycle that ran with no curator configured is recorded distinctly from one
+that curated and found nothing.
 
 Learning never gates delivery. Repository memory is an optimization, not an
 authorization input, so a curator that keeps failing is retried a bounded
