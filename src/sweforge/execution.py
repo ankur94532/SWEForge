@@ -53,6 +53,7 @@ class TaskRunner(Protocol):
         sandbox_backend_provider: SandboxBackendProvider | None = None,
         secure_execution: bool = True,
         unsafe_local_shell: bool = False,
+        clarification_request_sink: Callable[[dict], None] | None = None,
     ) -> str: ...
 
 
@@ -160,10 +161,19 @@ class ExecutionResult:
     diff: str = ""
     error: str | None = None
     workspace_created: bool = False
+    clarification: "ClarificationRequestProposal | None" = None
 
     @property
     def has_work(self) -> bool:
         return self.event is not None
+
+
+@dataclass(frozen=True)
+class ClarificationRequestProposal:
+    question: str
+    reason: str
+    answer_type: str = "TEXT"
+    choices: tuple[str, ...] = ()
 
 
 def recover_stale(
@@ -212,6 +222,7 @@ def execute_one(
     sandbox_backend_provider: SandboxBackendProvider | None = None,
     secure_execution: bool = True,
     unsafe_local_shell: bool = False,
+    clarification_request_sink: Callable[[dict], None] | None = None,
 ) -> ExecutionResult:
     clock = now or (lambda: datetime.now(UTC))
     event = store.claim_next_event(now=utc_timestamp(clock()))
@@ -238,6 +249,7 @@ def execute_one(
                 sandbox_backend_provider=sandbox_backend_provider,
                 secure_execution=secure_execution,
                 unsafe_local_shell=unsafe_local_shell,
+                clarification_request_sink=clarification_request_sink,
                 now=clock,
             )
     except ThreadLockUnavailable:
@@ -280,6 +292,7 @@ def _execute_claim(
     sandbox_backend_provider: SandboxBackendProvider | None = None,
     secure_execution: bool = True,
     unsafe_local_shell: bool = False,
+    clarification_request_sink: Callable[[dict], None] | None = None,
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
     try:
@@ -346,6 +359,13 @@ def _execute_claim(
         memory_namespace = repo_memory_namespace(event.repo_id)
         if memory_store is not None:
             ensure_repo_memory(memory_store, memory_namespace)
+        clarification_holder: dict[str, dict] = {}
+
+        def capture_clarification(proposal: dict) -> None:
+            clarification_holder["proposal"] = proposal
+            if clarification_request_sink is not None:
+                clarification_request_sink(proposal)
+
         runner_kwargs = {
             "model": model,
             "worktree": str(workspace.path),
@@ -365,6 +385,7 @@ def _execute_claim(
             "sandbox_backend_provider": sandbox_backend_provider,
             "secure_execution": secure_execution,
             "unsafe_local_shell": unsafe_local_shell,
+            "clarification_request_sink": capture_clarification,
         }
         if live_input_provider is not None:
             runner_kwargs["live_input_provider"] = live_input_provider
@@ -375,6 +396,23 @@ def _execute_claim(
         diff = workspace.diff()
         end_head_sha = workspace.head_sha()
         end_dirty = not workspace.is_clean()
+        if clarification_holder.get("proposal"):
+            proposal = clarification_holder["proposal"]
+            return ExecutionResult(
+                status="CLARIFICATION",
+                event=event,
+                workspace=workspace,
+                response=str(response),
+                changed_files=changed,
+                diff=diff,
+                clarification=ClarificationRequestProposal(
+                    question=proposal["question"],
+                    reason=proposal["reason"],
+                    answer_type=proposal["answer_type"],
+                    choices=tuple(proposal["choices"]),
+                ),
+                workspace_created=workspace.created,
+            )
         if persist_execution:
             store.mark_execution_succeeded(
                 event.event_key,

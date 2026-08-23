@@ -13,6 +13,7 @@ from langgraph.store.base import BaseStore
 from .capabilities import RepoCapabilityRegistry
 from .context import RepoAgentContext
 from .execution import (
+    ClarificationRequestProposal,
     ExecutionResult,
     ThreadLockUnavailable,
     _execute_claim,
@@ -33,6 +34,8 @@ from .github_store import (
     AttemptKind,
     AttemptStatus,
     ClaimedEvent,
+    ClarificationRequestRecord,
+    ClarificationStatus,
     ExecutionPermit,
     ExecutionReviewRecord,
     InputPurpose,
@@ -193,6 +196,7 @@ class WorkflowEngine:
         planner: Callable[..., str] | None = None,
         reviewer: Callable[..., ExecutionReviewResult] | None = None,
         memory_learner: Callable[..., list[RepoMemoryCandidate]] | None = None,
+        clarification_classifier: Callable[..., dict] | None = None,
         clock: Callable[[], str] = _now,
     ) -> None:
         self.store = store
@@ -200,6 +204,7 @@ class WorkflowEngine:
         self.planner = planner or generate_plan
         self.reviewer = reviewer or review_execution
         self.memory_learner = memory_learner
+        self.clarification_classifier = clarification_classifier
         self.clock = clock
 
     def start_cycle(
@@ -346,7 +351,9 @@ class WorkflowEngine:
             ),
             memory_store=memory_store,
             memory_namespace=None,
-            live_input_provider=lambda: self.pending_live_inputs(event["thread_id"]),
+            live_input_provider=lambda: self.pending_planning_inputs(
+                event["thread_id"]
+            ),
             live_delivered_event_keys=delivered,
         )
         plan_text = (planner or self.planner)(
@@ -362,7 +369,7 @@ class WorkflowEngine:
                 event_key,
                 thread_id=event["thread_id"],
                 cycle_id=draft.cycle_id,
-                purpose=InputPurpose.LIVE_PLANNING_INPUT,
+                purpose=InputPurpose.PLANNING_INPUT,
             )
         return self.store.plan(draft.plan_id)  # type: ignore[return-value]
 
@@ -633,11 +640,6 @@ class WorkflowEngine:
         unsafe_local_shell: bool = False,
     ) -> ExecutionResult:
         permit = self.validate_permit(permit_id)
-        if live_input_provider is None:
-
-            def live_input_provider() -> list[tuple[str, str]]:
-                return self.pending_live_inputs(permit.thread_id)
-
         delivered: set[str] = set()
         clock = now or (lambda: datetime.now(UTC))
         try:
@@ -664,7 +666,7 @@ class WorkflowEngine:
                 result = _execute_claim(
                     store=self.store,
                     event=event,
-                    live_input_provider=live_input_provider,
+                    live_input_provider=None,
                     live_delivered_event_keys=delivered,
                     approved_plan_text=plan.plan_text,
                     approved_plan_id=plan.plan_id,
@@ -699,6 +701,23 @@ class WorkflowEngine:
                         end_head_sha=execution["end_head_sha"] if execution else None,
                         end_dirty=bool(execution["end_dirty"]) if execution else False,
                     )
+                elif result.status == "CLARIFICATION":
+                    self.store.finish_execution_attempt(
+                        attempt.attempt_id,
+                        status=AttemptStatus.INTERRUPTED,
+                        completed_at=utc_timestamp(clock()),
+                        response_text=result.response,
+                    )
+                    self.store.interrupt_execution_for_clarification(
+                        permit_id=permit.permit_id,
+                        event_key=permit.root_event_key,
+                        now=utc_timestamp(clock()),
+                    )
+                    current = self.store.workflow_state(permit.thread_id)
+                    if current and result.clarification:
+                        self._persist_clarification(
+                            state=current, proposal=result.clarification
+                        )
                 else:
                     self.store.finish_execution_attempt(
                         attempt.attempt_id,
@@ -710,6 +729,8 @@ class WorkflowEngine:
                     phase = (
                         WorkflowPhase.REVIEW_EXECUTION
                         if result.status == "SUCCEEDED"
+                        else WorkflowPhase.WAITING_FOR_INPUT
+                        if result.status == "CLARIFICATION"
                         else WorkflowPhase.EXECUTION_READY
                     )
                     self.store.save_workflow_state(
@@ -724,6 +745,88 @@ class WorkflowEngine:
                 return result
         except ThreadLockUnavailable:
             return ExecutionResult(status="BUSY")
+
+    def _persist_clarification(
+        self, *, state: WorkflowStateRecord, proposal: ClarificationRequestProposal
+    ) -> ClarificationRequestRecord:
+        clarification_id = "clarification-" + _stable_id(
+            state.thread_id, state.cycle_id, proposal.question
+        )
+        record = ClarificationRequestRecord(
+            clarification_id=clarification_id,
+            thread_id=state.thread_id,
+            cycle_id=state.cycle_id,
+            root_event_key=state.root_event_key,
+            requested_from_phase=WorkflowPhase.EXECUTING.value,
+            question=proposal.question,
+            reason=proposal.reason,
+            answer_type=proposal.answer_type,
+            choices_json=json.dumps(list(proposal.choices)),
+            origin_surface=state.response_surface,
+            response_subject_number=state.response_subject_number or state.issue_number,
+            response_comment_id=None,
+            response_url=None,
+            review_thread_root_id=state.review_thread_root_id,
+            status=ClarificationStatus.OPEN.value,
+            created_at=self.clock(),
+            answered_at=None,
+            answer_event_key=None,
+            answer_json=None,
+        )
+        existing = self.store.clarification(clarification_id)
+        if existing and existing.response_comment_id:
+            return existing
+        saved = self.store.save_clarification(record)
+        if self.client is None:
+            return saved
+        repo = self.client.repository(state.repo_full_name)
+        marker = f"<!-- sweforge:clarification:{clarification_id} -->"
+        existing_comments = (
+            self.client.review_comments_for_pull_request(
+                repo, saved.response_subject_number
+            )
+            if state.response_surface == "PR_INLINE_REVIEW"
+            else self.client.comments(repo, saved.response_subject_number)
+        )
+        matching = [
+            item for item in existing_comments if marker in (item.get("body") or "")
+        ]
+        if matching:
+            return self.store.save_clarification(
+                replace(
+                    saved,
+                    response_comment_id=str(matching[0]["id"]),
+                    response_url=matching[0].get("html_url"),
+                )
+            )
+        choices = json.loads(saved.choices_json)
+        body = [
+            marker,
+            "### SWEForge needs one detail before continuing",
+            "",
+            saved.question,
+        ]
+        if choices:
+            body.extend(["", *[f"- {choice}" for choice in choices]])
+        body.extend(["", "Reply with:", "@agent <your answer>"])
+        rendered = "\n".join(body)
+        if state.response_surface == "PR_INLINE_REVIEW":
+            root = state.review_thread_root_id or state.response_comment_id
+            if not root:
+                raise WorkspaceError("inline clarification response target is missing")
+            comment = self.client.create_review_comment_reply(
+                repo, saved.response_subject_number, int(root), rendered
+            )
+        else:
+            comment = self.client.create_comment(
+                repo, saved.response_subject_number, rendered
+            )
+        updated = replace(
+            saved,
+            response_comment_id=str(comment["id"]),
+            response_url=comment.get("html_url"),
+        )
+        return self.store.save_clarification(updated)
 
     def execute_repair_authorized(
         self,
@@ -780,11 +883,6 @@ class WorkflowEngine:
         if parent is None:
             raise ValueError("repair permit parent review is unavailable")
         task = _build_repair_task(plan, parent)
-        if live_input_provider is None:
-
-            def live_input_provider():
-                return self.pending_live_inputs(permit.thread_id)
-
         delivered: set[str] = set()
         try:
             with thread_lock(lock_root, permit.thread_id):
@@ -802,7 +900,7 @@ class WorkflowEngine:
                     checkpointer=checkpointer,
                     runner=runner or run_task,
                     memory_store=memory_store,
-                    live_input_provider=live_input_provider,
+                    live_input_provider=None,
                     live_delivered_event_keys=delivered,
                     approved_plan_text=None,
                     approved_plan_id=None,
@@ -851,7 +949,7 @@ class WorkflowEngine:
         *,
         thread_id: str,
         cycle_id: int,
-        purpose: InputPurpose = InputPurpose.LIVE_EXECUTION_INPUT,
+        purpose: InputPurpose = InputPurpose.DEFERRED_FOLLOWUP,
     ) -> None:
         self.store.consume_input(
             event_key,
@@ -880,6 +978,167 @@ class WorkflowEngine:
             if starts_with_agent_invocation(row["body"])
             and not is_exact_approval(row["body"])
         ]
+
+    def pending_planning_inputs(self, thread_id: str) -> list[tuple[str, str]]:
+        state = self.store.workflow_state(thread_id)
+        after = state.root_event_key if state else None
+        rows = list(self.store.deferred_followups(thread_id))
+        rows.extend(self.store.unconsumed_inputs(thread_id, after_event_key=after))
+        seen: set[str] = set()
+        result: list[tuple[str, str]] = []
+        for row in rows:
+            if (
+                row["event_key"] in seen
+                or not starts_with_agent_invocation(row["body"])
+                or is_exact_approval(row["body"])
+            ):
+                continue
+            seen.add(row["event_key"])
+            result.append(
+                (
+                    row["event_key"],
+                    format_source_context(row, normalize_task(row["body"])),
+                )
+            )
+        return result
+
+    def _defer_active_followups(self, state: WorkflowStateRecord) -> None:
+        if state.phase not in {
+            WorkflowPhase.EXECUTING,
+            WorkflowPhase.REVIEW_EXECUTION,
+            WorkflowPhase.REPAIR_READY,
+            WorkflowPhase.AWAITING_PUBLICATION,
+        }:
+            return
+        for row in self.store.unconsumed_inputs(
+            state.thread_id, after_event_key=state.root_event_key
+        ):
+            if _is_actionable_feedback(row):
+                self.store.defer_followup(
+                    source_event_key=row["event_key"],
+                    thread_id=state.thread_id,
+                    originating_cycle_id=state.cycle_id,
+                    queued_at=self.clock(),
+                )
+
+    @staticmethod
+    def _clarification_target_matches(row, clarification) -> bool:
+        if clarification.clarification_id in row["body"]:
+            return True
+        if row["in_reply_to_id"] and clarification.response_comment_id:
+            return row["in_reply_to_id"] == clarification.response_comment_id
+        if clarification.origin_surface == "PR_INLINE_REVIEW":
+            return row["review_thread_root_id"] == clarification.review_thread_root_id
+        return (
+            row["origin_surface"] == clarification.origin_surface
+            and row["subject_number"] == clarification.response_subject_number
+        )
+
+    def _deterministic_clarification_answer(
+        self, clarification, body: str
+    ) -> str | None:
+        text = invocation_text(body) or body
+        answer_type = clarification.answer_type.upper()
+        if answer_type == "BOOLEAN":
+            lowered = text.casefold().strip(" .!?\t\n")
+            if lowered in {"yes", "no", "true", "false"}:
+                return "true" if lowered in {"yes", "true"} else "false"
+            return None
+        if answer_type == "CHOICE":
+            choices = json.loads(clarification.choices_json)
+            matches = [
+                choice for choice in choices if choice.casefold() in text.casefold()
+            ]
+            return matches[0] if len(matches) == 1 else None
+        if answer_type in {"TEXT", "VALUE"} and text.strip():
+            return text.strip()
+        return None
+
+    def _resolve_open_clarification(self, state: WorkflowStateRecord) -> None:
+        clarification = self.store.clarification_for_thread(state.thread_id)
+        if clarification is None:
+            return
+        for row in self.store.unconsumed_inputs(
+            state.thread_id, after_event_key=state.root_event_key
+        ):
+            if not starts_with_agent_invocation(row["body"]):
+                continue
+            if not self._clarification_target_matches(row, clarification):
+                self.store.defer_followup(
+                    source_event_key=row["event_key"],
+                    thread_id=state.thread_id,
+                    originating_cycle_id=state.cycle_id,
+                    queued_at=self.clock(),
+                )
+                continue
+            answer = self._deterministic_clarification_answer(
+                clarification, row["body"]
+            )
+            classification = None
+            if answer is None and self.clarification_classifier is not None:
+                classification = self.clarification_classifier(
+                    clarification=clarification, event=dict(row)
+                )
+                if classification.get("relationship") == "CHANGES_SCOPE":
+                    self.store.consume_input(
+                        row["event_key"],
+                        thread_id=state.thread_id,
+                        cycle_id=state.cycle_id,
+                        purpose=InputPurpose.PLANNING_INPUT,
+                        claimed_at=self.clock(),
+                    )
+                    self.store.cancel_clarification_for_replan(
+                        clarification.clarification_id,
+                        event_key=row["event_key"],
+                        now=self.clock(),
+                    )
+                    return
+                if classification.get("relationship") != "ANSWERS_CLARIFICATION":
+                    if classification.get("relationship") in {
+                        "UNRELATED_FOLLOWUP",
+                        "CHANGES_SCOPE",
+                    }:
+                        self.store.defer_followup(
+                            source_event_key=row["event_key"],
+                            thread_id=state.thread_id,
+                            originating_cycle_id=state.cycle_id,
+                            queued_at=self.clock(),
+                        )
+                    continue
+                answer = classification.get("extracted_answer")
+            if not answer:
+                continue
+            residual = None
+            text = invocation_text(row["body"]) or row["body"]
+            if answer.casefold() in text.casefold():
+                residual = text[text.casefold().find(answer.casefold()) + len(answer) :]
+                residual = residual.lstrip(" .,:;!-\n")
+                if residual.casefold().startswith(("also ", "and ", "plus ")):
+                    residual = residual.split(" ", 1)[1].strip()
+                else:
+                    residual = None
+            if residual:
+                self.store.defer_followup(
+                    source_event_key=row["event_key"],
+                    thread_id=state.thread_id,
+                    originating_cycle_id=state.cycle_id,
+                    queued_at=self.clock(),
+                    residual_text=residual,
+                )
+            self.store.consume_input(
+                row["event_key"],
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                purpose=InputPurpose.CLARIFICATION_RESPONSE,
+                claimed_at=self.clock(),
+            )
+            self.store.resume_clarification(
+                clarification.clarification_id,
+                answer_event_key=row["event_key"],
+                answer_json=json.dumps({"answer": answer, "residual": residual}),
+                now=self.clock(),
+            )
+            return
 
     def acknowledge_live_inputs(
         self,
@@ -1287,7 +1546,10 @@ class WorkflowEngine:
                 state, lock_root=Path("~/.sweforge/locks").expanduser()
             )
         after = state.root_event_key if state else None
-        candidates = self.store.unconsumed_inputs(thread_id, after_event_key=after)
+        candidates = list(self.store.deferred_followups(thread_id))
+        candidates.extend(
+            self.store.unconsumed_inputs(thread_id, after_event_key=after)
+        )
         for row in candidates:
             if self.store.execution_for_event(row["event_key"]) is None:
                 return row["event_key"]
@@ -1298,8 +1560,11 @@ class WorkflowEngine:
         if state and state.phase != WorkflowPhase.IDLE:
             return None
         self._drain_approval_controls(thread_id, state)
-        candidates = self.store.unconsumed_inputs(
-            thread_id, after_event_key=state.root_event_key if state else None
+        candidates = list(self.store.deferred_followups(thread_id))
+        candidates.extend(
+            self.store.unconsumed_inputs(
+                thread_id, after_event_key=state.root_event_key if state else None
+            )
         )
         for row in candidates:
             if self.store.execution_for_event(row["event_key"]) is None:
@@ -1358,19 +1623,12 @@ class WorkflowEngine:
                 ),
                 memory_store=memory_store,
                 memory_namespace=None,
-                live_input_provider=lambda: self.pending_live_inputs(state.thread_id),
+                live_input_provider=None,
                 live_delivered_event_keys=review_delivered,
             ),
             model=model,
             evidence=evidence,
         )
-        for event_key in review_delivered:
-            self._acknowledge_delivered(
-                event_key,
-                thread_id=state.thread_id,
-                cycle_id=state.cycle_id,
-                purpose=InputPurpose.LIVE_REVIEW_INPUT,
-            )
         review_id = "review-" + _stable_id(
             attempt.attempt_id, json.dumps(result.model_dump(), sort_keys=True)
         )
@@ -1457,6 +1715,28 @@ class WorkflowEngine:
                     thread_id,
                     message="orphaned repair recovered",
                 )
+            state = self.store.workflow_state(thread_id)
+            if state and state.phase == WorkflowPhase.WAITING_FOR_INPUT:
+                pending_clarification = self.store.clarification_for_thread(thread_id)
+                if (
+                    pending_clarification
+                    and not pending_clarification.response_comment_id
+                ):
+                    self._persist_clarification(
+                        state=state,
+                        proposal=ClarificationRequestProposal(
+                            question=pending_clarification.question,
+                            reason=pending_clarification.reason,
+                            answer_type=pending_clarification.answer_type,
+                            choices=tuple(
+                                json.loads(pending_clarification.choices_json)
+                            ),
+                        ),
+                    )
+                self._resolve_open_clarification(state)
+                state = self.store.workflow_state(thread_id)
+            if state:
+                self._defer_active_followups(state)
         if state and state.phase == WorkflowPhase.IDLE:
             learning = self.store.repo_memory_learning(state.root_event_key)
             if learning and learning.status in {
@@ -1920,7 +2200,7 @@ class WorkflowEngine:
         def live_inputs() -> list[tuple[str, str]]:
             return [
                 item
-                for item in self.pending_live_inputs(state.thread_id)
+                for item in self.pending_planning_inputs(state.thread_id)
                 if item[0] != event_key
             ]
 
@@ -1974,6 +2254,6 @@ class WorkflowEngine:
                 delivered_event_key,
                 thread_id=state.thread_id,
                 cycle_id=planning_state.cycle_id,
-                purpose=InputPurpose.LIVE_PLANNING_INPUT,
+                purpose=InputPurpose.PLANNING_INPUT,
             )
         return result

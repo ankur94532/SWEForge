@@ -17,6 +17,7 @@ from deepagents.backends.protocol import SandboxBackendProtocol
 from deepagents.middleware.permissions import FilesystemPermission
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool
 from langgraph.store.base import BaseStore
 
 from .capabilities import RepoCapabilityRegistry, load_repo_mcp_tools
@@ -170,6 +171,7 @@ def run_task(
     unsafe_local_shell: bool = False,
     live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
     live_delivered_event_keys: set[str] | None = None,
+    clarification_request_sink: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
@@ -220,6 +222,34 @@ def run_task(
         else []
     )
     mcp_tools = []
+    clarification_tools = []
+    if clarification_request_sink is not None:
+
+        @tool
+        def request_clarification(
+            question: str,
+            reason: str,
+            answer_type: str = "TEXT",
+            choices: list[str] | None = None,
+        ) -> str:
+            """Request specific missing information before safely continuing."""
+            normalized_type = answer_type.upper()
+            if normalized_type not in {"CHOICE", "BOOLEAN", "TEXT", "VALUE"}:
+                raise ValueError("answer_type must be CHOICE, BOOLEAN, TEXT, or VALUE")
+            normalized_choices = tuple(str(item) for item in (choices or ()))
+            if normalized_type == "CHOICE" and not normalized_choices:
+                raise ValueError("CHOICE clarification requires choices")
+            clarification_request_sink(
+                {
+                    "question": question[:2_000],
+                    "reason": reason[:2_000],
+                    "answer_type": normalized_type,
+                    "choices": normalized_choices,
+                }
+            )
+            return "Clarification request recorded. Stop and wait for the answer."
+
+        clarification_tools.append(request_clarification)
     if capability_registry is not None:
         if repo_context is None:
             raise ValueError("MCP capabilities require authoritative context")
@@ -228,7 +258,7 @@ def run_task(
         )
     agent = create_deep_agent(
         model=model,
-        tools=mcp_tools,
+        tools=[*mcp_tools, *clarification_tools],
         backend=backend,
         system_prompt=(
             "Work only within the provided repository worktree. Inspect the code, "

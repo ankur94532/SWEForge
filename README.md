@@ -273,3 +273,17 @@ Git config, SQLite state, or command-line argument. The publisher derives the
 credential-free HTTPS remote from the configured GitHub API host and does not
 trust an arbitrary credential-bearing remote. Publication failures preserve
 the workspace and durable progress for retry.
+## Human-input routing
+
+An `IssueThread` is the durable conversation identity; each planning, execution,
+review, publication, and learning sequence is a cycle within that thread.
+Unsolicited `@agent` input is planning input while planning and is a durable
+next-cycle follow-up once execution, review, repair, or publication is active.
+It is never injected into execution or `REVIEW_EXECUTION`.
+
+An execution agent may instead use the application-owned clarification tool when
+specific missing information prevents safe continuation. SWEForge persists the
+request, enters `WAITING_FOR_INPUT`, routes the question back to its issue,
+PR conversation, or inline review thread, and resumes the same cycle only after
+an unambiguous, provenance-matched answer. Mixed answers retain residual
+follow-up text for the next planning cycle.

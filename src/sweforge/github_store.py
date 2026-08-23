@@ -236,6 +236,37 @@ CREATE TABLE IF NOT EXISTS thread_input_consumptions (
     claimed_at TEXT NOT NULL,
     consumed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS clarification_requests (
+    clarification_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    root_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    requested_from_phase TEXT NOT NULL,
+    question TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    answer_type TEXT NOT NULL,
+    choices_json TEXT NOT NULL DEFAULT '[]',
+    origin_surface TEXT NOT NULL,
+    response_subject_number INTEGER NOT NULL,
+    response_comment_id TEXT,
+    response_url TEXT,
+    review_thread_root_id TEXT,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    answered_at TEXT,
+    answer_event_key TEXT REFERENCES source_events(event_key),
+    answer_json TEXT
+);
+CREATE TABLE IF NOT EXISTS deferred_followups (
+    source_event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    originating_cycle_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'QUEUED',
+    residual_text TEXT,
+    queued_at TEXT NOT NULL,
+    consumed_cycle_id INTEGER,
+    consumed_at TEXT
+);
 CREATE TABLE IF NOT EXISTS repo_memory_learning (
     event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
     thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
@@ -290,6 +321,7 @@ class WorkflowPhase(StrEnum):
     REVIEW_EXECUTION = "REVIEW_EXECUTION"
     REPAIR_READY = "REPAIR_READY"
     REVIEW_BLOCKED = "REVIEW_BLOCKED"
+    WAITING_FOR_INPUT = "WAITING_FOR_INPUT"
 
 
 class WorkflowMode(StrEnum):
@@ -320,6 +352,15 @@ class InputPurpose(StrEnum):
     EARLY_PLAN_APPROVAL = "EARLY_PLAN_APPROVAL"
     STALE_PLAN_APPROVAL = "STALE_PLAN_APPROVAL"
     LIVE_REVIEW_INPUT = "LIVE_REVIEW_INPUT"
+    PLANNING_INPUT = "PLANNING_INPUT"
+    CLARIFICATION_RESPONSE = "CLARIFICATION_RESPONSE"
+    DEFERRED_FOLLOWUP = "DEFERRED_FOLLOWUP"
+
+
+class ClarificationStatus(StrEnum):
+    OPEN = "OPEN"
+    ANSWERED = "ANSWERED"
+    CANCELLED = "CANCELLED"
 
 
 class AttemptKind(StrEnum):
@@ -535,6 +576,41 @@ class WorkflowInputRecord:
 
 
 @dataclass(frozen=True)
+class ClarificationRequestRecord:
+    clarification_id: str
+    thread_id: str
+    cycle_id: int
+    root_event_key: str
+    requested_from_phase: str
+    question: str
+    reason: str
+    answer_type: str
+    choices_json: str
+    origin_surface: str
+    response_subject_number: int
+    response_comment_id: str | None
+    response_url: str | None
+    review_thread_root_id: str | None
+    status: str
+    created_at: str
+    answered_at: str | None
+    answer_event_key: str | None
+    answer_json: str | None
+
+
+@dataclass(frozen=True)
+class DeferredFollowupRecord:
+    source_event_key: str
+    thread_id: str
+    originating_cycle_id: int
+    status: str
+    residual_text: str | None
+    queued_at: str
+    consumed_cycle_id: int | None
+    consumed_at: str | None
+
+
+@dataclass(frozen=True)
 class RepoMemoryLearningRecord:
     event_key: str
     thread_id: str
@@ -647,6 +723,14 @@ class SQLiteGitHubStore:
                 "PRAGMA table_info(repo_memory_learning)"
             )
         }
+        deferred_columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(deferred_followups)")
+        }
+        if "residual_text" not in deferred_columns:
+            self.connection.execute(
+                "ALTER TABLE deferred_followups ADD COLUMN residual_text TEXT"
+            )
         if "proposal_json" not in memory_columns:
             self.connection.execute(
                 "ALTER TABLE repo_memory_learning ADD COLUMN proposal_json "
@@ -1272,6 +1356,98 @@ class SQLiteGitHubStore:
                 response_text=None,
                 error_message=error_message,
                 workspace_path=workspace_path,
+            )
+
+    def interrupt_execution_for_clarification(
+        self, *, permit_id: str, event_key: str, now: str
+    ) -> None:
+        with self.transaction(immediate=True) as db:
+            self._update_execution(
+                db,
+                event_key,
+                ExecutionStatus.INTERRUPTED,
+                completed_at=now,
+                response_text=None,
+                error_message="execution is waiting for clarification",
+                workspace_path=None,
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase=?, updated_at=? "
+                "WHERE current_plan_id=(SELECT plan_id FROM execution_permits WHERE permit_id=?)",
+                (WorkflowPhase.WAITING_FOR_INPUT.value, now, permit_id),
+            )
+
+    def resume_clarification(
+        self,
+        clarification_id: str,
+        *,
+        answer_event_key: str,
+        answer_json: str,
+        now: str,
+    ) -> ClarificationRequestRecord:
+        with self.transaction(immediate=True) as db:
+            row = db.execute(
+                "SELECT * FROM clarification_requests WHERE clarification_id=?",
+                (clarification_id,),
+            ).fetchone()
+            if row is None or row["status"] != ClarificationStatus.OPEN.value:
+                raise ValueError("clarification is not open")
+            db.execute(
+                "UPDATE clarification_requests SET status=?, answered_at=?, "
+                "answer_event_key=?, answer_json=? WHERE clarification_id=?",
+                (
+                    ClarificationStatus.ANSWERED.value,
+                    now,
+                    answer_event_key,
+                    answer_json,
+                    clarification_id,
+                ),
+            )
+            permit = db.execute(
+                "SELECT permit_id, root_event_key FROM execution_permits "
+                "WHERE thread_id=? AND cycle_id=? AND invalidated_at IS NULL",
+                (row["thread_id"], row["cycle_id"]),
+            ).fetchone()
+            if permit:
+                db.execute(
+                    "UPDATE execution_permits SET consumed_at=NULL WHERE permit_id=?",
+                    (permit["permit_id"],),
+                )
+                db.execute(
+                    "UPDATE event_executions SET status=?, completed_at=NULL, "
+                    "error_message=NULL WHERE event_key=?",
+                    (ExecutionStatus.RETRY_PENDING.value, permit["root_event_key"]),
+                )
+                db.execute(
+                    "UPDATE issue_workflow_state SET phase=?, updated_at=? WHERE thread_id=?",
+                    (WorkflowPhase.EXECUTION_READY.value, now, row["thread_id"]),
+                )
+        return self.clarification(clarification_id)  # type: ignore[return-value]
+
+    def cancel_clarification_for_replan(
+        self, clarification_id: str, *, event_key: str, now: str
+    ) -> None:
+        with self.transaction(immediate=True) as db:
+            row = db.execute(
+                "SELECT * FROM clarification_requests WHERE clarification_id=?",
+                (clarification_id,),
+            ).fetchone()
+            if row is None or row["status"] != ClarificationStatus.OPEN.value:
+                raise ValueError("clarification is not open")
+            db.execute(
+                "UPDATE clarification_requests SET status=?, answered_at=?, "
+                "answer_event_key=? WHERE clarification_id=?",
+                (ClarificationStatus.CANCELLED.value, now, event_key, clarification_id),
+            )
+            db.execute(
+                "UPDATE execution_permits SET invalidated_at=? WHERE thread_id=? "
+                "AND cycle_id=? AND invalidated_at IS NULL",
+                (now, row["thread_id"], row["cycle_id"]),
+            )
+            db.execute(
+                "UPDATE issue_workflow_state SET phase=?, planning_feedback_event_key=?, "
+                "updated_at=? WHERE thread_id=?",
+                (WorkflowPhase.PLANNING.value, event_key, now, row["thread_id"]),
             )
 
     @staticmethod
@@ -2511,6 +2687,12 @@ class SQLiteGitHubStore:
                 ),
             )
             db.execute(
+                """UPDATE deferred_followups SET status='CONSUMED',
+                   consumed_cycle_id=?, consumed_at=?
+                   WHERE source_event_key=? AND status='QUEUED'""",
+                (plan.cycle_id, claimed_at, plan.root_event_key),
+            )
+            db.execute(
                 """INSERT INTO issue_plans(
                    plan_id, thread_id, repo_id, repo_full_name, issue_number,
                    cycle_id, version, root_event_key, plan_text, status,
@@ -3297,6 +3479,97 @@ class SQLiteGitHubStore:
         ).fetchone()
         return self._input_record(row) if row else None
 
+    def clarification_for_thread(
+        self, thread_id: str, *, status: str = ClarificationStatus.OPEN.value
+    ) -> ClarificationRequestRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM clarification_requests WHERE thread_id = ? AND status = ? "
+            "ORDER BY created_at, clarification_id LIMIT 1",
+            (thread_id, status),
+        ).fetchone()
+        return ClarificationRequestRecord(**dict(row)) if row else None
+
+    def clarification(self, clarification_id: str) -> ClarificationRequestRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM clarification_requests WHERE clarification_id = ?",
+            (clarification_id,),
+        ).fetchone()
+        return ClarificationRequestRecord(**dict(row)) if row else None
+
+    def save_clarification(
+        self, record: ClarificationRequestRecord
+    ) -> ClarificationRequestRecord:
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO clarification_requests(
+                   clarification_id, thread_id, cycle_id, root_event_key,
+                   requested_from_phase, question, reason, answer_type,
+                   choices_json, origin_surface, response_subject_number,
+                   response_comment_id, response_url, review_thread_root_id,
+                   status, created_at, answered_at, answer_event_key, answer_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(clarification_id) DO UPDATE SET
+                   response_comment_id=excluded.response_comment_id,
+                   response_url=excluded.response_url,
+                   status=excluded.status, answered_at=excluded.answered_at,
+                   answer_event_key=excluded.answer_event_key,
+                   answer_json=excluded.answer_json""",
+                tuple(record.__dict__.values()),
+            )
+        return self.clarification(record.clarification_id)  # type: ignore[return-value]
+
+    def defer_followup(
+        self,
+        *,
+        source_event_key: str,
+        thread_id: str,
+        originating_cycle_id: int,
+        queued_at: str,
+        residual_text: str | None = None,
+    ) -> DeferredFollowupRecord:
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO deferred_followups(
+                   source_event_key, thread_id, originating_cycle_id,
+                   status, residual_text, queued_at)
+                   VALUES(?,?,?,'QUEUED',?,?) ON CONFLICT(source_event_key) DO NOTHING""",
+                (
+                    source_event_key,
+                    thread_id,
+                    originating_cycle_id,
+                    residual_text,
+                    queued_at,
+                ),
+            )
+        return self.deferred_followup(source_event_key)  # type: ignore[return-value]
+
+    def deferred_followup(self, source_event_key: str) -> DeferredFollowupRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM deferred_followups WHERE source_event_key = ?",
+            (source_event_key,),
+        ).fetchone()
+        return DeferredFollowupRecord(**dict(row)) if row else None
+
+    def deferred_followups(self, thread_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """SELECT se.*, COALESCE(df.residual_text, se.body) AS body FROM deferred_followups df
+               JOIN source_events se ON se.event_key = df.source_event_key
+               WHERE df.thread_id = ? AND df.status = 'QUEUED'
+               ORDER BY se.source_updated_at, se.discovered_at, se.event_key""",
+            (thread_id,),
+        ).fetchall()
+
+    def consume_deferred_followup(
+        self, source_event_key: str, *, cycle_id: int, consumed_at: str
+    ) -> None:
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """UPDATE deferred_followups SET status='CONSUMED',
+                   consumed_cycle_id=?, consumed_at=?
+                   WHERE source_event_key=? AND status='QUEUED'""",
+                (cycle_id, consumed_at, source_event_key),
+            )
+
     def consume_input(
         self,
         event_key: str,
@@ -3474,7 +3747,12 @@ class SQLiteGitHubStore:
             keys = [row["event_key"] for row in rows]
             if after_event_key in keys:
                 rows = rows[keys.index(after_event_key) + 1 :]
-        return [row for row in rows if self.input_consumption(row["event_key"]) is None]
+        return [
+            row
+            for row in rows
+            if self.input_consumption(row["event_key"]) is None
+            and self.deferred_followup(row["event_key"]) is None
+        ]
 
     @staticmethod
     def _plan_record(row: sqlite3.Row) -> PlanRecord:
