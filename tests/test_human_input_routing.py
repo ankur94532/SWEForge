@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from dataclasses import replace
 from typing import TypedDict
 
@@ -6,6 +7,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+from sweforge.agent import run_task
 from sweforge.execution import ClarificationRequestProposal
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import (
@@ -157,6 +159,131 @@ def test_same_question_has_distinct_occurrence_ids(tmp_path):
     store.close()
 
 
+def test_terminal_clarification_replay_cannot_reopen(tmp_path):
+    store, _repo, events = _store_with_cycle(tmp_path)
+    thread_id = store.source_event(events[0].event_key)["thread_id"]
+    base = ClarificationRequestRecord(
+        clarification_id="clarification-terminal",
+        thread_id=thread_id,
+        cycle_id=1,
+        root_event_key=events[0].event_key,
+        occurrence_key="occ-terminal",
+        requested_from_phase=WorkflowPhase.EXECUTING.value,
+        question="Continue?",
+        reason="needed",
+        answer_type="BOOLEAN",
+        choices_json="[]",
+        origin_surface="ISSUE",
+        response_subject_number=7,
+        response_comment_id=None,
+        response_url=None,
+        review_thread_root_id=None,
+        status=ClarificationStatus.OPEN.value,
+        created_at="now",
+        answered_at=None,
+        answer_event_key=None,
+        answer_json=None,
+    )
+    store.save_clarification(base)
+    store.connection.execute(
+        "UPDATE clarification_requests SET status=? WHERE clarification_id=?",
+        (ClarificationStatus.ANSWERED.value, base.clarification_id),
+    )
+    store.connection.commit()
+    store.save_clarification(base)
+    assert (
+        store.clarification(base.clarification_id).status
+        == ClarificationStatus.ANSWERED.value
+    )
+    store.connection.execute(
+        "UPDATE clarification_requests SET status=? WHERE clarification_id=?",
+        (ClarificationStatus.CANCELLED.value, base.clarification_id),
+    )
+    store.connection.commit()
+    store.save_clarification(base)
+    assert (
+        store.clarification(base.clarification_id).status
+        == ClarificationStatus.CANCELLED.value
+    )
+    store.close()
+
+
+def test_legacy_deferred_followup_table_is_rebuilt_idempotently(tmp_path):
+    store, _repo, events = _store_with_cycle(tmp_path)
+    db_path = store.path
+    thread_id = store.source_event(events[0].event_key)["thread_id"]
+    store.close()
+    db = sqlite3.connect(db_path)
+    db.execute("DROP TABLE deferred_followups")
+    db.execute("""CREATE TABLE deferred_followups(
+        source_event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
+        thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+        originating_cycle_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'QUEUED',
+        queued_at TEXT NOT NULL, consumed_cycle_id INTEGER, consumed_at TEXT)""")
+    db.execute(
+        "INSERT INTO deferred_followups("
+        "source_event_key,thread_id,originating_cycle_id,queued_at) "
+        "VALUES(?,?,?,?)",
+        (events[1].event_key, thread_id, 1, "now"),
+    )
+    db.commit()
+    db.close()
+    reopened = SQLiteGitHubStore(db_path)
+    first = reopened.deferred_followup(events[1].event_key)
+    assert first is not None
+    assert first.deferred_id.startswith("deferred-")
+    columns = {
+        row[1]
+        for row in reopened.connection.execute("PRAGMA table_info(deferred_followups)")
+    }
+    assert "deferred_id" in columns
+    reopened.close()
+    reopened = SQLiteGitHubStore(db_path)
+    assert (
+        reopened.deferred_followup(events[1].event_key).deferred_id == first.deferred_id
+    )
+    reopened.close()
+
+
+def test_deferred_ids_from_one_source_event_are_consumed_independently(tmp_path):
+    store, _repo, events = _store_with_cycle(tmp_path)
+    thread_id = store.source_event(events[0].event_key)["thread_id"]
+    first = store.defer_followup(
+        source_event_key=events[1].event_key,
+        thread_id=thread_id,
+        originating_cycle_id=1,
+        queued_at="one",
+        residual_text="first",
+    )
+    second = store.defer_followup(
+        source_event_key=events[1].event_key,
+        thread_id=thread_id,
+        originating_cycle_id=1,
+        queued_at="two",
+        residual_text="second",
+    )
+    assert first.deferred_id != second.deferred_id
+    store.consume_deferred_followup(
+        events[1].event_key,
+        deferred_id=first.deferred_id,
+        cycle_id=2,
+        consumed_at="later",
+    )
+    assert (
+        store.deferred_followup(
+            events[1].event_key, deferred_id=first.deferred_id
+        ).status
+        == "CONSUMED"
+    )
+    assert (
+        store.deferred_followup(
+            events[1].event_key, deferred_id=second.deferred_id
+        ).status
+        == "QUEUED"
+    )
+    store.close()
+
+
 def test_native_interrupt_prevents_post_request_action_until_resume():
     class State(TypedDict):
         actions: list[str]
@@ -182,3 +309,69 @@ def test_native_interrupt_prevents_post_request_action_until_resume():
 
     resumed = compiled.invoke(Command(resume="yes"), config=config)
     assert resumed["actions"] == ["before", "after:yes"]
+
+
+def test_sweforge_agent_boundary_only_reports_real_pending_interrupt(monkeypatch):
+    calls = []
+    invocations = 0
+
+    class FakeAgent:
+        def invoke(self, state, **kwargs):
+            nonlocal invocations
+            invocations += 1
+            calls.append(state)
+            if invocations in (1, 2):
+
+                class Pending:
+                    value = {
+                        "question": "Which region?",
+                        "reason": "required",
+                        "answer_type": "CHOICE",
+                        "choices": ["east", "west"],
+                        "occurrence_key": f"occ-{invocations}",
+                    }
+
+                return {"messages": [], "__interrupt__": [Pending()]}
+            return {"messages": [type("Message", (), {"content": "done"})()]}
+
+    monkeypatch.setattr("sweforge.agent.create_deep_agent", lambda **_: FakeAgent())
+    interruptions = []
+    assert (
+        run_task(
+            model="provider:model",
+            worktree="/tmp",
+            task="fix",
+            thread_id="thread-1",
+            checkpointer=object(),
+            interrupt_result_sink=interruptions.append,
+        )
+        == ""
+    )
+    assert interruptions[0]["occurrence_key"] == "occ-1"
+    assert (
+        run_task(
+            model="provider:model",
+            worktree="/tmp",
+            task="fix",
+            thread_id="thread-1",
+            checkpointer=object(),
+            resume_value="east",
+            interrupt_result_sink=interruptions.append,
+        )
+        == ""
+    )
+    assert len(interruptions) == 2
+    assert interruptions[1]["occurrence_key"] == "occ-2"
+    assert (
+        run_task(
+            model="provider:model",
+            worktree="/tmp",
+            task="fix",
+            thread_id="thread-1",
+            checkpointer=object(),
+            resume_value="west",
+            interrupt_result_sink=interruptions.append,
+        )
+        == "done"
+    )
+    assert len(interruptions) == 2

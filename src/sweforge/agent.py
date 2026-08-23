@@ -110,7 +110,15 @@ def _invoke_agent(agent, state, *, config=None, durability=None, context=None):
         kwargs["durability"] = durability
     if context is not None:
         kwargs["context"] = context
-    return agent.invoke(state, **kwargs)
+    try:
+        return agent.invoke(state, **kwargs)
+    except TypeError as exc:
+        # Keep small offline doubles written for older LangGraph APIs usable;
+        # real LangGraph agents receive sync durability above.
+        if durability is None or "durability" not in str(exc):
+            raise
+        kwargs.pop("durability", None)
+        return agent.invoke(state, **kwargs)
 
 
 def _build_backend(
@@ -173,6 +181,7 @@ def run_task(
     live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
     live_delivered_event_keys: set[str] | None = None,
     clarification_request_sink: Callable[[dict[str, Any]], None] | None = None,
+    interrupt_result_sink: Callable[[dict[str, Any]], None] | None = None,
     resume_value: Any | None = None,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
@@ -196,6 +205,8 @@ def run_task(
         )
     else:
         isolated_backend = None
+    if interrupt_result_sink is None:
+        interrupt_result_sink = clarification_request_sink
     effective_skills_store = skills_store or memory_store
     backend = _build_backend(
         worktree,
@@ -225,7 +236,7 @@ def run_task(
     )
     mcp_tools = []
     clarification_tools = []
-    if clarification_request_sink is not None:
+    if interrupt_result_sink is not None:
 
         @tool
         def request_clarification(
@@ -242,21 +253,13 @@ def run_task(
             normalized_choices = tuple(str(item) for item in (choices or ()))
             if normalized_type == "CHOICE" and not normalized_choices:
                 raise ValueError("CHOICE clarification requires choices")
-            clarification_request_sink(
-                {
-                    "question": question[:2_000],
-                    "reason": reason[:2_000],
-                    "answer_type": normalized_type,
-                    "choices": normalized_choices,
-                    "occurrence_key": tool_call_id or message_id or "clarification",
-                }
-            )
             answer = interrupt(
                 {
                     "question": question[:2_000],
                     "reason": reason[:2_000],
                     "answer_type": normalized_type,
                     "choices": normalized_choices,
+                    "occurrence_key": tool_call_id or message_id or "clarification",
                 }
             )
             return f"Clarification answer received: {answer}"
@@ -304,6 +307,10 @@ def run_task(
                 durability="sync",
                 context=repo_context,
             )
+            if interrupt_result_sink is not None:
+                for item in result.get("__interrupt__", ()):
+                    if isinstance(getattr(item, "value", None), Mapping):
+                        interrupt_result_sink(dict(item.value))
             messages = result.get("messages", [])
             return _normalize_response_text(messages[-1]) if messages else ""
         if message_id:
@@ -330,11 +337,19 @@ def run_task(
             )
         else:
             result = _invoke_agent(
-                agent, input_state, config=config, context=repo_context
+                agent,
+                input_state,
+                config=config,
+                durability="sync",
+                context=repo_context,
             )
     else:
         result = _invoke_agent(agent, input_state, context=repo_context)
     messages = result.get("messages", [])
+    if interrupt_result_sink is not None:
+        for item in result.get("__interrupt__", ()):
+            if isinstance(getattr(item, "value", None), Mapping):
+                interrupt_result_sink(dict(item.value))
     if not messages:
         return ""
     return _normalize_response_text(messages[-1])

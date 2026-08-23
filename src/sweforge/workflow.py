@@ -1742,20 +1742,6 @@ class WorkflowEngine:
                     message="orphaned repair recovered",
                 )
             state = self.store.workflow_state(thread_id)
-            open_clarification = self.store.clarification_for_thread(thread_id)
-            if (
-                state
-                and state.phase == WorkflowPhase.EXECUTING
-                and open_clarification is not None
-            ):
-                permit = self.store.permit_for_plan(state.current_plan_id or "")
-                if permit is not None:
-                    self.store.interrupt_execution_for_clarification(
-                        permit_id=permit.permit_id,
-                        event_key=permit.root_event_key,
-                        now=self.clock(),
-                    )
-                    state = self.store.workflow_state(thread_id)
             if state and state.phase == WorkflowPhase.WAITING_FOR_INPUT:
                 pending_clarification = self.store.clarification_for_thread(thread_id)
                 if (
@@ -1771,6 +1757,7 @@ class WorkflowEngine:
                             choices=tuple(
                                 json.loads(pending_clarification.choices_json)
                             ),
+                            occurrence_key=pending_clarification.occurrence_key,
                         ),
                     )
                 self._resolve_open_clarification(state)

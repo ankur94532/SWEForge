@@ -743,24 +743,94 @@ class SQLiteGitHubStore:
                 "ALTER TABLE clarification_requests ADD COLUMN occurrence_key "
                 "TEXT NOT NULL DEFAULT ''"
             )
-        if "residual_text" not in deferred_columns:
+        deferred_pk = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(deferred_followups)")
+            if row[5]
+        }
+        if "source_event_key" in deferred_pk:
+            # 76e3504 made source_event_key the table primary key.  Adding a
+            # column cannot remove that constraint, so rebuild the table.
+            self.connection.execute("PRAGMA foreign_keys=OFF")
             self.connection.execute(
-                "ALTER TABLE deferred_followups ADD COLUMN residual_text TEXT"
+                "ALTER TABLE deferred_followups RENAME TO deferred_followups_legacy"
             )
-        if "deferred_id" not in deferred_columns:
             self.connection.execute(
-                "ALTER TABLE deferred_followups ADD COLUMN deferred_id TEXT"
+                """CREATE TABLE deferred_followups(
+                   deferred_id TEXT PRIMARY KEY,
+                   source_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+                   thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+                   originating_cycle_id INTEGER NOT NULL,
+                   status TEXT NOT NULL DEFAULT 'QUEUED',
+                   residual_text TEXT,
+                   queued_at TEXT NOT NULL,
+                   consumed_cycle_id INTEGER,
+                   consumed_at TEXT)"""
             )
-            for row in self.connection.execute(
-                "SELECT source_event_key FROM deferred_followups WHERE deferred_id IS NULL"
-            ).fetchall():
-                deferred_id = (
-                    "deferred-" + hashlib.sha256(row[0].encode()).hexdigest()[:24]
+            legacy_columns = {
+                row[1]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(deferred_followups_legacy)"
                 )
+            }
+            residual = "residual_text" if "residual_text" in legacy_columns else "NULL"
+            deferred_id = (
+                "deferred_id"
+                if "deferred_id" in legacy_columns
+                else "'deferred-' || substr(hex(randomblob(16)), 1, 24)"
+            )
+            self.connection.execute(
+                f"""INSERT INTO deferred_followups(
+                   deferred_id, source_event_key, thread_id, originating_cycle_id,
+                   status, residual_text, queued_at, consumed_cycle_id, consumed_at)
+                   SELECT {deferred_id},
+                          source_event_key, thread_id, originating_cycle_id,
+                          status, {residual}, queued_at, consumed_cycle_id, consumed_at
+                   FROM deferred_followups_legacy"""
+            )
+            # Replace random backfill IDs with deterministic IDs, including
+            # rowid as a tie-breaker for any legacy duplicate rows.
+            if "deferred_id" not in legacy_columns:
+                for row in self.connection.execute(
+                    "SELECT rowid, source_event_key, residual_text FROM deferred_followups"
+                ).fetchall():
+                    suffix = f"{row[1]}\0{row[2] or ''}\0{row[0]}"
+                    self.connection.execute(
+                        "UPDATE deferred_followups SET deferred_id=? WHERE rowid=?",
+                        (
+                            "deferred-"
+                            + hashlib.sha256(suffix.encode()).hexdigest()[:24],
+                            row[0],
+                        ),
+                    )
+            self.connection.execute("DROP TABLE deferred_followups_legacy")
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_deferred_followups_source "
+                "ON deferred_followups(source_event_key)"
+            )
+            self.connection.execute("PRAGMA foreign_keys=ON")
+        else:
+            if "residual_text" not in deferred_columns:
                 self.connection.execute(
-                    "UPDATE deferred_followups SET deferred_id=? WHERE source_event_key=?",
-                    (deferred_id, row[0]),
+                    "ALTER TABLE deferred_followups ADD COLUMN residual_text TEXT"
                 )
+            if "deferred_id" not in deferred_columns:
+                self.connection.execute(
+                    "ALTER TABLE deferred_followups ADD COLUMN deferred_id TEXT"
+                )
+                for row in self.connection.execute(
+                    "SELECT rowid, source_event_key FROM deferred_followups WHERE deferred_id IS NULL"
+                ).fetchall():
+                    deferred_id = (
+                        "deferred-"
+                        + hashlib.sha256(f"{row[1]}\0{row[0]}".encode()).hexdigest()[
+                            :24
+                        ]
+                    )
+                    self.connection.execute(
+                        "UPDATE deferred_followups SET deferred_id=? WHERE rowid=?",
+                        (deferred_id, row[0]),
+                    )
         self.connection.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_deferred_followups_id "
             "ON deferred_followups(deferred_id)"
@@ -3647,22 +3717,51 @@ class SQLiteGitHubStore:
         self, record: ClarificationRequestRecord
     ) -> ClarificationRequestRecord:
         with self.transaction(immediate=True) as db:
-            db.execute(
-                """INSERT INTO clarification_requests(
-                   clarification_id, thread_id, cycle_id, root_event_key,
-                   occurrence_key, requested_from_phase, question, reason, answer_type,
-                   choices_json, origin_surface, response_subject_number,
-                   response_comment_id, response_url, review_thread_root_id,
-                   status, created_at, answered_at, answer_event_key, answer_json)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(clarification_id) DO UPDATE SET
-                   response_comment_id=excluded.response_comment_id,
-                   response_url=excluded.response_url,
-                   status=excluded.status, answered_at=excluded.answered_at,
-                   answer_event_key=excluded.answer_event_key,
-                   answer_json=excluded.answer_json""",
-                tuple(record.__dict__.values()),
-            )
+            existing = db.execute(
+                "SELECT * FROM clarification_requests WHERE clarification_id=?",
+                (record.clarification_id,),
+            ).fetchone()
+            if existing is None:
+                db.execute(
+                    """INSERT INTO clarification_requests(
+                       clarification_id, thread_id, cycle_id, root_event_key,
+                       occurrence_key, requested_from_phase, question, reason, answer_type,
+                       choices_json, origin_surface, response_subject_number,
+                       response_comment_id, response_url, review_thread_root_id,
+                       status, created_at, answered_at, answer_event_key, answer_json)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    tuple(record.__dict__.values()),
+                )
+            else:
+                immutable = (
+                    "thread_id",
+                    "cycle_id",
+                    "root_event_key",
+                    "occurrence_key",
+                    "requested_from_phase",
+                    "question",
+                    "reason",
+                    "answer_type",
+                    "choices_json",
+                    "origin_surface",
+                    "response_subject_number",
+                    "review_thread_root_id",
+                )
+                if any(existing[name] != getattr(record, name) for name in immutable):
+                    raise ValueError("conflicting clarification occurrence data")
+                # Request state is monotonic.  A replay can add posting metadata,
+                # but can never reopen an answered or cancelled occurrence.
+                db.execute(
+                    """UPDATE clarification_requests SET
+                       response_comment_id=COALESCE(?, response_comment_id),
+                       response_url=COALESCE(?, response_url)
+                       WHERE clarification_id=?""",
+                    (
+                        record.response_comment_id,
+                        record.response_url,
+                        record.clarification_id,
+                    ),
+                )
         return self.clarification(record.clarification_id)  # type: ignore[return-value]
 
     def defer_followup(
@@ -3695,28 +3794,47 @@ class SQLiteGitHubStore:
                     queued_at,
                 ),
             )
-        return self.deferred_followup(source_event_key)  # type: ignore[return-value]
+        return self.deferred_followup(source_event_key, deferred_id=deferred_id)  # type: ignore[return-value]
 
-    def deferred_followup(self, source_event_key: str) -> DeferredFollowupRecord | None:
-        row = self.connection.execute(
-            "SELECT * FROM deferred_followups WHERE source_event_key = ? "
-            "ORDER BY queued_at, deferred_id LIMIT 1",
-            (source_event_key,),
-        ).fetchone()
+    def deferred_followup(
+        self, source_event_key: str, *, deferred_id: str | None = None
+    ) -> DeferredFollowupRecord | None:
+        if deferred_id is None:
+            row = self.connection.execute(
+                "SELECT * FROM deferred_followups WHERE source_event_key = ? "
+                "ORDER BY queued_at, deferred_id LIMIT 1",
+                (source_event_key,),
+            ).fetchone()
+        else:
+            row = self.connection.execute(
+                "SELECT * FROM deferred_followups WHERE deferred_id = ? "
+                "AND source_event_key = ?",
+                (deferred_id, source_event_key),
+            ).fetchone()
         return DeferredFollowupRecord(**dict(row)) if row else None
 
-    def deferred_text_for_event(self, source_event_key: str) -> str | None:
+    def deferred_text_for_event(
+        self, source_event_key: str, *, deferred_id: str | None = None
+    ) -> str | None:
+        condition = (
+            "deferred_id = ? AND source_event_key = ?"
+            if deferred_id
+            else "source_event_key = ?"
+        )
+        params = (deferred_id, source_event_key) if deferred_id else (source_event_key,)
         row = self.connection.execute(
-            "SELECT residual_text FROM deferred_followups "
-            "WHERE source_event_key = ? AND residual_text IS NOT NULL "
-            "ORDER BY queued_at, deferred_id DESC LIMIT 1",
-            (source_event_key,),
+            "SELECT residual_text FROM deferred_followups WHERE "
+            + condition
+            + " AND residual_text IS NOT NULL "
+            + ("" if deferred_id else "ORDER BY queued_at, deferred_id DESC LIMIT 1"),
+            params,
         ).fetchone()
         return str(row["residual_text"]) if row else None
 
     def deferred_followups(self, thread_id: str) -> list[sqlite3.Row]:
         return self.connection.execute(
-            """SELECT se.*, COALESCE(df.residual_text, se.body) AS body FROM deferred_followups df
+            """SELECT se.*, df.deferred_id AS deferred_id,
+                      COALESCE(df.residual_text, se.body) AS body FROM deferred_followups df
                JOIN source_events se ON se.event_key = df.source_event_key
                WHERE df.thread_id = ? AND df.status = 'QUEUED'
                ORDER BY se.source_updated_at, se.discovered_at, se.event_key""",
@@ -3724,14 +3842,31 @@ class SQLiteGitHubStore:
         ).fetchall()
 
     def consume_deferred_followup(
-        self, source_event_key: str, *, cycle_id: int, consumed_at: str
+        self,
+        source_event_key: str,
+        *,
+        cycle_id: int,
+        consumed_at: str,
+        deferred_id: str | None = None,
     ) -> None:
         with self.transaction(immediate=True) as db:
+            predicate = (
+                "deferred_id=? AND source_event_key=?"
+                if deferred_id
+                else "source_event_key=?"
+            )
+            params = (
+                (cycle_id, consumed_at, deferred_id, source_event_key)
+                if deferred_id
+                else (cycle_id, consumed_at, source_event_key)
+            )
             db.execute(
                 """UPDATE deferred_followups SET status='CONSUMED',
                    consumed_cycle_id=?, consumed_at=?
-                   WHERE source_event_key=? AND status='QUEUED'""",
-                (cycle_id, consumed_at, source_event_key),
+                   WHERE """
+                + predicate
+                + " AND status='QUEUED'",
+                params,
             )
 
     def consume_input(

@@ -372,7 +372,7 @@ def _execute_claim(
             ensure_repo_memory(memory_store, memory_namespace)
         clarification_holder: dict[str, dict] = {}
 
-        def capture_clarification(proposal: dict) -> None:
+        def capture_interrupt(proposal: dict) -> None:
             clarification_holder["proposal"] = proposal
             if clarification_request_sink is not None:
                 clarification_request_sink(proposal)
@@ -396,7 +396,7 @@ def _execute_claim(
             "sandbox_backend_provider": sandbox_backend_provider,
             "secure_execution": secure_execution,
             "unsafe_local_shell": unsafe_local_shell,
-            "clarification_request_sink": capture_clarification,
+            "interrupt_result_sink": capture_interrupt,
             "resume_value": resume_value,
         }
         if not clarification_enabled:
