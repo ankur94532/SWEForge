@@ -23,7 +23,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--lock-root", type=Path, default=Path("~/.sweforge/locks").expanduser()
     )
     parser.add_argument(
-        "--retry", metavar="EVENT_KEY", help="retry one FAILED publication"
+        "--retry",
+        metavar="PUBLICATION_ID",
+        help="retry one FAILED publication (an unambiguous event key also works)",
     )
     parser.add_argument(
         "--api-url",
@@ -61,16 +63,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     store = SQLiteGitHubStore(args.db)
     try:
+        publication_id = None
         if args.retry:
             now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-            store.retry_publication(args.retry, now=now)
+            publication_id = store.resolve_publication_id(args.retry)
+            store.retry_publication(publication_id, now=now)
         result = GitHubPublisher(
             store=store,
             client=client,
             token_provider=authenticator,
             lock_root=args.lock_root,
             api_url=args.api_url,
-        ).publish_one(args.retry)
+        ).publish_one(publication_id)
     except (GitHubAPIError, OSError, RuntimeError, ValueError) as exc:
         print(f"sweforge-github-publish: {exc}", file=sys.stderr)
         return 1
@@ -79,8 +83,10 @@ def main(argv: list[str] | None = None) -> int:
         client.close()
         authenticator.close()
     print(f"publication status: {result.status}")
-    if result.event_key:
-        print(f"event key: {result.event_key}")
+    if result.publication_id:
+        print(f"publication id: {result.publication_id}")
+    if result.source_event_key:
+        print(f"source event key: {result.source_event_key}")
     if result.error:
         print(f"error: {result.error}", file=sys.stderr)
     return (

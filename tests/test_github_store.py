@@ -399,5 +399,5 @@ def test_publication_uses_issue_thread_number_for_pr_event(tmp_path):
         )
     )
     with pytest.raises(ValueError, match="ACCEPT review"):
-        store.ensure_publication(pr_event.event_key, now="latest")
+        store.ensure_publication(thread_id="github:12345:issue:7", now="latest")
     store.close()

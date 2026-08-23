@@ -235,6 +235,9 @@ def test_publish_commits_pushes_and_reconciles_comment(tmp_path):
     assert result.status == "COMPLETED", result.error
     publication = store.publication_for_event(event_key)
     assert publication and publication.local_commit_sha and publication.pr_number == 41
+    assert publication.publication_id == result.publication_id
+    assert publication.source_event_key == event_key
+    assert publication.root_input_id == event_key
     assert git(remote, "show-ref", "refs/heads/sweforge/issue-7")
     assert publisher.publish_one().status == "NO_WORK"
     store.close()
@@ -245,7 +248,7 @@ def test_publication_state_survives_reopen(tmp_path):
     store.close()
     reopened = SQLiteGitHubStore(tmp_path / "state.db")
     publication = reopened.next_publication()
-    assert publication and publication.event_key == event_key
+    assert publication and publication.source_event_key == event_key
     reopened.close()
 
 
@@ -253,18 +256,20 @@ def test_failed_publication_requires_explicit_retry(tmp_path):
     store, event_key, _ = setup_publication(tmp_path)
     publication = store.next_publication()
     assert publication
+    publication_id = publication.publication_id
     store.update_publication(
-        event_key,
+        publication_id,
         status=PublicationStatus.FAILED,
         now="failed",
         error_message="ambiguous remote state",
     )
     assert store.next_publication() is None
     assert (
-        store.retry_publication(event_key, now="retry").status
+        store.retry_publication(publication_id, now="retry").status
         == PublicationStatus.PENDING
     )
-    assert store.next_publication().event_key == event_key
+    assert store.next_publication().publication_id == publication_id
+    assert store.resolve_publication_id(event_key) == publication_id
     store.close()
 
 

@@ -273,10 +273,10 @@ def test_direct_success_without_review_is_not_publishable(tmp_path):
         response_text="done",
         workspace_path="/tmp",
     )
-    assert not store.publication_is_eligible(root.event_key)
+    assert store.eligible_publication_id(claim.thread_id) is None
     assert store.next_publication() is None
     with pytest.raises(ValueError, match="ACCEPT review"):
-        store.ensure_publication(root.event_key, now="later")
+        store.ensure_publication(thread_id=claim.thread_id, now="later")
 
 
 def test_review_evidence_keeps_plan_before_large_diff():
@@ -386,7 +386,7 @@ def test_repair_ready_executes_same_workspace_and_reaches_accept(tmp_path):
     assert len(calls) == 2
     assert calls[0]["thread_id"] == calls[1]["thread_id"]
     assert calls[0]["message_id"] != calls[1]["message_id"]
-    assert store.publication_is_eligible(root.event_key)
+    assert store.eligible_publication_id("github:1:issue:7") is not None
 
 
 def test_execution_review_requirement_coverage_is_durable(tmp_path):

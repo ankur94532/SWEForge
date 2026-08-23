@@ -302,7 +302,60 @@ task. Each cycle persists both the originating `root_event_key` and the
 selected logical root identity so restart and later execution retain the same
 provenance and input selection.
 
-Executable state is scoped to the cycle and logical input. `SourceEvent` is
-provenance, not the unique identity of executable work; publication and
-post-cycle memory identity remain event-key compatible until the next
-migration milestone.
+## Lifecycle identity
+
+`SourceEvent` is provenance, not the unique identity of any work. Every layer
+below it is scoped to the exact lifecycle it belongs to:
+
+| Layer | Question it answers | Identity |
+| --- | --- | --- |
+| SourceEvent | Which GitHub event originated this? | `root_event_key` / `source_event_key` |
+| Logical input | What actionable task was this? | `root_input_id` (event key, or a durable `deferred_id`) |
+| Cycle | Which workflow lifecycle? | `thread_id` + `cycle_id` |
+| Execution | Which execution? | `execution_id` |
+| Publication | Which output/idempotency state? | `publication_id` |
+| Memory learning | Which post-publication learning? | `learning_id` |
+
+`execution_id`, `publication_id` and `learning_id` are all deterministic over
+`(thread_id, cycle_id, root_input_id)`, so a restart or retry recomputes the
+same identity and never invents a second one.
+
+One SourceEvent may back several cycles. A mixed human reply can answer an open
+clarification for the running cycle and leave a residual follow-up that becomes
+the next cycle, and one event can queue several residual tasks. Those cycles
+each get their own execution, publication, execution-summary comment and
+learning record, while all of them retain the same `source_event_key`:
+
+```
+SourceEvent S
+  ├── logical input D1 → cycle A → execution E1 → publication P1 → learning M1
+  └── logical input D2 → cycle B → execution E2 → publication P2 → learning M2
+```
+
+Publication is authorized from the current cycle only. Eligibility proves that
+this exact thread, cycle, logical input, plan version, execution, attempt and
+ACCEPT review all agree; an ACCEPT for `D1` therefore cannot authorize `D2`, and
+`D2` cannot reuse `D1`'s publication. Finalization is a single guarded
+mutation: it marks that cycle's plan `EXECUTED`, creates that cycle's learning
+record and returns the thread to `IDLE`, all under exact
+thread/cycle/logical-input predicates. A stale publication fails closed — it
+stays readable and reconcilable, but it can never finalize, publish for, or
+otherwise mutate a newer cycle. Queued sibling logical inputs stay queued and
+are discovered by `next_workflow_input`.
+
+The execution-summary comment marker is scoped to `publication_id`, so retrying
+one publication finds and reuses its own comment while a different lifecycle
+from the same SourceEvent legitimately posts its own. Publication comments use
+the same scoping. Repository-memory learning belongs to the completed
+lifecycle: it is only ever written through its own `learning_id`, and the
+`IDLE` retry finishes the oldest unfinished record for the thread before the
+next logical input is selected, so a stalled record from an earlier cycle can
+neither block nor overwrite a newer one and can never mutate workflow state.
+
+Databases written before this model are migrated in place. An event-keyed
+publication or learning row is an ordinary lifecycle, so its logical input is
+its event key; every field, status, SHA, PR, comment id and proposal is
+retained, the SourceEvent stays as provenance, and reopening is idempotent.
+Event-key lookups survive as diagnostics (`publication_for_event`,
+`repo_memory_learning`) and fail closed when a SourceEvent turns out to back
+more than one lifecycle.

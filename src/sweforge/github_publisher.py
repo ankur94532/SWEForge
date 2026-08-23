@@ -23,11 +23,25 @@ DEFAULT_GIT_NAME = "SWEForge"
 DEFAULT_GIT_EMAIL = "sweforge@users.noreply.github.com"
 
 
+def publication_comment_marker(publication_id: str) -> str:
+    """Deterministic marker scoping a publication comment to one lifecycle."""
+    return f"<!-- sweforge:publication:{publication_id} -->"
+
+
+def publication_comment_markers(publication: PublicationRecord) -> tuple[str, ...]:
+    """Markers a lifecycle may own, including its pre-migration event marker."""
+    markers = [publication_comment_marker(publication.publication_id)]
+    if publication.root_input_id == publication.source_event_key:
+        markers.append(f"<!-- sweforge:publication:{publication.source_event_key} -->")
+    return tuple(markers)
+
+
 @dataclass(frozen=True)
 class PublicationResult:
     status: str
-    event_key: str | None = None
+    publication_id: str | None = None
     error: str | None = None
+    source_event_key: str | None = None
 
 
 def _now() -> str:
@@ -57,32 +71,48 @@ class GitHubPublisher:
             lambda full_name: expected_github_remote(api_url, full_name)
         )
 
-    def publish_one(self, event_key: str | None = None) -> PublicationResult:
-        publication = self.store.next_publication(event_key)
+    def publish_one(self, publication_id: str | None = None) -> PublicationResult:
+        publication = self.store.next_publication(publication_id)
         if publication is None:
-            return PublicationResult("NO_WORK", event_key)
+            return PublicationResult("NO_WORK", publication_id)
         try:
             with thread_lock(self.lock_root, publication.thread_id):
                 return self._publish(publication)
         except ThreadLockUnavailable:
-            return PublicationResult("BUSY", publication.event_key)
+            return self._result("BUSY", publication)
         except Exception as exc:
             error = self._safe_error(exc)
             self.store.update_publication(
-                publication.event_key,
+                publication.publication_id,
                 status=PublicationStatus.FAILED,
                 now=_now(),
                 error_message=error,
             )
-            return PublicationResult("FAILED", publication.event_key, error)
+            return self._result("FAILED", publication, error)
+
+    @staticmethod
+    def _result(
+        status: str, publication: PublicationRecord, error: str | None = None
+    ) -> PublicationResult:
+        return PublicationResult(
+            status,
+            publication.publication_id,
+            error,
+            publication.source_event_key,
+        )
 
     def _publish(self, publication: PublicationRecord) -> PublicationResult:
-        if not self.store.publication_is_eligible(publication.event_key):
+        if not self.store.publication_is_eligible(publication.publication_id):
             raise WorkspaceError(
                 "publication is not authorized by an ACCEPT execution review"
             )
         workspace = self.store.thread_workspace(publication.thread_id)
-        execution = self.store.execution_for_event(publication.event_key)
+        execution = self.store.execution_for_cycle(
+            thread_id=publication.thread_id,
+            cycle_id=publication.cycle_id,
+            root_event_key=publication.source_event_key,
+            root_input_id=publication.root_input_id,
+        )
         if workspace is None or execution is None or execution["status"] != "SUCCEEDED":
             raise WorkspaceError("successful execution workspace is unavailable")
         path = Path(workspace.workspace_path).expanduser().resolve()
@@ -104,16 +134,20 @@ class GitHubPublisher:
             if current_dirty:
                 raise WorkspaceError("workspace became dirty after execution")
             self.store.update_publication(
-                publication.event_key, status=PublicationStatus.NO_CHANGES, now=_now()
+                publication.publication_id,
+                status=PublicationStatus.NO_CHANGES,
+                now=_now(),
             )
-            return PublicationResult("NO_CHANGES", publication.event_key)
+            return self._result("NO_CHANGES", publication)
 
         changed = self._changed_files(path, start_head_sha)
         if not changed:
             self.store.update_publication(
-                publication.event_key, status=PublicationStatus.NO_CHANGES, now=_now()
+                publication.publication_id,
+                status=PublicationStatus.NO_CHANGES,
+                now=_now(),
             )
-            return PublicationResult("NO_CHANGES", publication.event_key)
+            return self._result("NO_CHANGES", publication)
         self._validate_paths(changed)
 
         commit_sha = publication.local_commit_sha
@@ -134,7 +168,7 @@ class GitHubPublisher:
             if commit_sha == workspace.base_commit:
                 raise WorkspaceError("changed files did not produce a commit")
             publication = self.store.update_publication(
-                publication.event_key,
+                publication.publication_id,
                 status=PublicationStatus.COMMITTED,
                 now=_now(),
                 local_commit_sha=commit_sha,
@@ -150,7 +184,7 @@ class GitHubPublisher:
         if self._git(path, "status", "--porcelain"):
             raise WorkspaceError("workspace is dirty after publication commit")
         publication = self.store.update_publication(
-            publication.event_key,
+            publication.publication_id,
             status=PublicationStatus.PUSHED,
             now=_now(),
             remote_commit_sha=remote_sha,
@@ -181,7 +215,7 @@ class GitHubPublisher:
                 )
                 pr_number, pr_url = int(created["number"]), created.get("html_url")
             publication = self.store.update_publication(
-                publication.event_key,
+                publication.publication_id,
                 status=PublicationStatus.PR_CREATED,
                 now=_now(),
                 pr_number=pr_number,
@@ -191,31 +225,43 @@ class GitHubPublisher:
             publication.repo_id, pr_number, publication.thread_id
         )
 
-        marker = f"<!-- sweforge:publication:{publication.event_key} -->"
-        comments = self.client.comments(repo, publication.issue_number)
-        matching = [item for item in comments if marker in (item.get("body") or "")]
-        if len(matching) > 1:
-            raise WorkspaceError("multiple publication comments are ambiguous")
-        if matching:
-            comment_id = int(matching[0]["id"])
+        marker = publication_comment_marker(publication.publication_id)
+        if publication.comment_id is not None:
+            comment_id = publication.comment_id
         else:
-            comment = self.client.create_comment(
-                repo,
-                publication.issue_number,
-                f"{marker}\nSWEForge published PR #{pr_number}: "
-                f"{pr_url or '(URL unavailable)'}",
-            )
-            comment_id = int(comment["id"])
+            comments = self.client.comments(repo, publication.issue_number)
+            matching = [
+                item
+                for item in comments
+                if any(
+                    token in (item.get("body") or "")
+                    for token in publication_comment_markers(publication)
+                )
+            ]
+            if len(matching) > 1:
+                raise WorkspaceError("multiple publication comments are ambiguous")
+            if matching:
+                comment_id = int(matching[0]["id"])
+            else:
+                comment = self.client.create_comment(
+                    repo,
+                    publication.issue_number,
+                    f"{marker}\nSWEForge published PR #{pr_number}: "
+                    f"{pr_url or '(URL unavailable)'}",
+                )
+                comment_id = int(comment["id"])
         self.store.update_publication(
-            publication.event_key,
+            publication.publication_id,
             status=PublicationStatus.COMMENTED,
             now=_now(),
             comment_id=comment_id,
         )
         self.store.update_publication(
-            publication.event_key, status=PublicationStatus.COMPLETED, now=_now()
+            publication.publication_id,
+            status=PublicationStatus.COMPLETED,
+            now=_now(),
         )
-        return PublicationResult("COMPLETED", publication.event_key)
+        return self._result("COMPLETED", publication)
 
     def _push(
         self, path: Path, remote: str, branch: str, local_sha: str, token: str

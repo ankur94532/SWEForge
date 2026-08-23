@@ -25,6 +25,7 @@ from sweforge.github_store import (
     ThreadWorkspaceRecord,
     WorkflowPhase,
     WorkflowStateRecord,
+    memory_learning_id_for,
 )
 from sweforge.memory_learning import (
     MemoryLearningStatus,
@@ -356,9 +357,15 @@ def test_workflow_learning_pending_retry_updates_memory_and_is_idempotent(tmp_pa
     store.save_workflow_state(idle)
     store.save_repo_memory_learning(
         RepoMemoryLearningRecord(
-            event_key=event.event_key,
+            learning_id=memory_learning_id_for(
+                thread_id=thread_id,
+                cycle_id=plan.cycle_id,
+                root_input_id=event.event_key,
+            ),
+            source_event_key=event.event_key,
             thread_id=thread_id,
             cycle_id=plan.cycle_id,
+            root_input_id=event.event_key,
             repo_id=repo.repo_id,
             status="PENDING",
             accepted_candidates=0,

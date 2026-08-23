@@ -43,6 +43,7 @@ from .github_store import (
     PermitSource,
     PlanRecord,
     PlanStatus,
+    PublicationTarget,
     RepoMemoryLearningRecord,
     SQLiteGitHubStore,
     ThreadWorkspaceRecord,
@@ -123,6 +124,19 @@ def _is_actionable_feedback(event: dict) -> bool:
     return starts_with_agent_invocation(event["body"]) and not is_exact_approval(
         event["body"]
     )
+
+
+def execution_summary_markers(target: PublicationTarget) -> tuple[str, ...]:
+    """Execution-summary markers owned by one exact publication lifecycle.
+
+    The first marker is authoritative.  Ordinary lifecycles also answer to the
+    pre-migration event-keyed marker so an upgrade cannot duplicate a summary
+    that was already posted.
+    """
+    markers = [f"<!-- sweforge:execution-summary:{target.publication_id} -->"]
+    if target.root_input_id == target.source_event_key:
+        markers.append(f"<!-- sweforge:execution-summary:{target.source_event_key} -->")
+    return tuple(markers)
 
 
 def _stable_id(*parts: object) -> str:
@@ -990,6 +1004,13 @@ class WorkflowEngine:
                         event_key, thread_id=permit.thread_id, cycle_id=permit.cycle_id
                     )
                 if result.status == "SUCCEEDED" and result.workspace:
+                    repaired_plan = self.store.plan(permit.plan_id)
+                    baseline = self.store.execution_for_cycle(
+                        thread_id=permit.thread_id,
+                        cycle_id=permit.cycle_id,
+                        root_event_key=repaired_plan.root_event_key,
+                        root_input_id=repaired_plan.root_input_id,
+                    )
                     self.store.finish_repair_attempt_success(
                         permit_id,
                         attempt_id=attempt.attempt_id,
@@ -998,9 +1019,7 @@ class WorkflowEngine:
                         end_head_sha=result.workspace.head_sha(),
                         end_dirty=not result.workspace.is_clean(),
                         workspace_path=str(result.workspace.path),
-                        start_head_sha=self.store.execution_for_event(
-                            permit.root_event_key
-                        )["start_head_sha"],
+                        start_head_sha=baseline["start_head_sha"],
                     )
                 else:
                     self.store.mark_repair_attempt_failed(
@@ -1241,6 +1260,7 @@ class WorkflowEngine:
         *,
         thread_id: str,
         publication_status: str,
+        publication_id: str | None = None,
         response_text: str = "",
         changed_files: tuple[str, ...] = (),
         pr_url: str | None = None,
@@ -1253,9 +1273,13 @@ class WorkflowEngine:
         state = self.store.workflow_state(thread_id)
         if state is None or self.client is None:
             raise ValueError("workflow and GitHub client are required")
-        if not self.store.publication_is_eligible(state.root_event_key):
+        target = self.store.publication_target(thread_id)
+        if target is None or (
+            publication_id is not None and target.publication_id != publication_id
+        ):
             raise ValueError("execution summary is blocked until review ACCEPT")
-        marker = f"<!-- sweforge:execution-summary:{state.root_event_key} -->"
+        markers = execution_summary_markers(target)
+        marker = markers[0]
         repo = self.client.repository(state.repo_full_name)
         inline = state.response_surface == "PR_INLINE_REVIEW"
         comments = (
@@ -1267,7 +1291,11 @@ class WorkflowEngine:
                 repo, state.response_subject_number or state.issue_number
             )
         )
-        matching = [item for item in comments if marker in (item.get("body") or "")]
+        matching = [
+            item
+            for item in comments
+            if any(token in (item.get("body") or "") for token in markers)
+        ]
         if len(matching) > 1:
             raise WorkspaceError("multiple execution summary comments are ambiguous")
         if matching:
@@ -1305,36 +1333,15 @@ class WorkflowEngine:
                         rendered,
                     )["id"]
                 )
-        plan = self.store.current_plan(thread_id)
-        if plan:
-            self.store.update_plan(plan.plan_id, status=PlanStatus.EXECUTED)
-        learning_now = self.clock()
-        self.store.save_repo_memory_learning(
-            RepoMemoryLearningRecord(
-                event_key=state.root_event_key,
-                thread_id=state.thread_id,
-                cycle_id=state.cycle_id,
-                repo_id=state.repo_id,
-                status=MemoryLearningStatus.PENDING.value,
-                accepted_candidates=0,
-                rejected_candidates=0,
-                error_message=None,
-                created_at=learning_now,
-                updated_at=learning_now,
-                proposal_json="{}",
-            )
-        )
-        self.store.save_workflow_state(
-            WorkflowStateRecord(
-                **{
-                    **state.__dict__,
-                    "phase": WorkflowPhase.IDLE,
-                    "updated_at": self.clock(),
-                }
-            )
+        # One atomic, exactly-targeted mutation closes the lifecycle: the
+        # cycle's own plan becomes EXECUTED, its learning record is created and
+        # the thread returns to IDLE.  A stale publication fails closed here.
+        learning = self.store.finalize_publication(
+            target.publication_id, now=self.clock()
         )
         workspace = self.store.thread_workspace(thread_id)
         self._learn_repository_memory(
+            learning=learning,
             state=state,
             workspace_path=workspace.workspace_path if workspace else None,
             memory_store=memory_store,
@@ -1346,14 +1353,21 @@ class WorkflowEngine:
     def _learn_repository_memory(
         self,
         *,
+        learning: RepoMemoryLearningRecord,
         state: WorkflowStateRecord,
         workspace_path: str | None,
         memory_store: BaseStore | None,
         lock_root: str | Path,
         memory_model: str | None,
     ) -> None:
+        """Run one lifecycle's learning, writing only that lifecycle's record.
+
+        `learning` carries the exact thread/cycle/logical-input identity, so a
+        retry for an older cycle can never observe or overwrite a newer one and
+        never mutates workflow state.
+        """
         now = self.clock()
-        existing = self.store.repo_memory_learning(state.root_event_key)
+        existing = self.store.memory_learning_for_id(learning.learning_id)
         proposal_json = existing.proposal_json if existing else "{}"
         if existing is not None and existing.status in {
             MemoryLearningStatus.UPDATED.value,
@@ -1375,8 +1389,8 @@ class WorkflowEngine:
                     [candidate.model_dump() for candidate in candidates], sort_keys=True
                 )
             elif memory_model and workspace_path and memory_store is not None:
-                workspace_record = self.store.thread_workspace(state.thread_id)
-                plan = self.store.current_plan(state.thread_id)
+                workspace_record = self.store.thread_workspace(learning.thread_id)
+                plan = self.store.plan_for_cycle(learning.thread_id, learning.cycle_id)
                 if workspace_record is None:
                     raise ValueError("repository workspace metadata is missing")
                 inspection = Workspace(
@@ -1388,12 +1402,12 @@ class WorkflowEngine:
 
                 curator_output = curate_repository_memory(
                     model=memory_model,
-                    repo_id=state.repo_id,
+                    repo_id=learning.repo_id,
                     worktree=workspace_path,
                     changed_files=inspection.changed_files()[:100],
                     diff=inspection.diff()[:40_000],
                     existing_memory=read_repo_memory(
-                        memory_store, repo_memory_namespace(state.repo_id)
+                        memory_store, repo_memory_namespace(learning.repo_id)
                     )
                     or "",
                     plan_text=plan.plan_text if plan else "",
@@ -1404,16 +1418,12 @@ class WorkflowEngine:
                 candidates = []
                 proposal_json = "[]"
             self.store.save_repo_memory_learning(
-                RepoMemoryLearningRecord(
-                    event_key=state.root_event_key,
-                    thread_id=state.thread_id,
-                    cycle_id=state.cycle_id,
-                    repo_id=state.repo_id,
+                replace(
+                    learning,
                     status=MemoryLearningStatus.PENDING.value,
                     accepted_candidates=0,
                     rejected_candidates=0,
                     error_message=None,
-                    created_at=existing.created_at if existing else now,
                     updated_at=now,
                     proposal_json=proposal_json,
                 )
@@ -1426,7 +1436,7 @@ class WorkflowEngine:
             else:
                 result = apply_memory_candidates(
                     memory_store,
-                    repo_id=state.repo_id,
+                    repo_id=learning.repo_id,
                     worktree=workspace_path,
                     candidates=candidates,
                     lock_root=lock_root,
@@ -1437,16 +1447,12 @@ class WorkflowEngine:
                 error=str(exc)[:500],
             )
         self.store.save_repo_memory_learning(
-            RepoMemoryLearningRecord(
-                event_key=state.root_event_key,
-                thread_id=state.thread_id,
-                cycle_id=state.cycle_id,
-                repo_id=state.repo_id,
+            replace(
+                learning,
                 status=result.status.value,
                 accepted_candidates=result.accepted_candidates,
                 rejected_candidates=result.rejected_candidates,
                 error_message=result.error,
-                created_at=existing.created_at if existing else now,
                 updated_at=now,
                 proposal_json=proposal_json,
             )
@@ -1844,13 +1850,15 @@ class WorkflowEngine:
             if state:
                 self._defer_active_followups(state)
         if state and state.phase == WorkflowPhase.IDLE:
-            learning = self.store.repo_memory_learning(state.root_event_key)
-            if learning and learning.status in {
-                MemoryLearningStatus.PENDING.value,
-                MemoryLearningStatus.FAILED.value,
-            }:
+            # Learning is finished before the next logical input is selected.
+            # The oldest unfinished record is retried through its own identity,
+            # so a stalled record from a previous cycle is completed rather
+            # than being confused with, or blocking, a newer lifecycle.
+            learning = self.store.pending_memory_learning(thread_id)
+            if learning is not None:
                 workspace = self.store.thread_workspace(thread_id)
                 self._learn_repository_memory(
+                    learning=learning,
                     state=state,
                     workspace_path=workspace.workspace_path if workspace else None,
                     memory_store=memory_store,
@@ -1877,7 +1885,12 @@ class WorkflowEngine:
                 WorkflowPhase.REVIEW_BLOCKED, thread_id, message="blocked"
             )
         if state and state.phase == WorkflowPhase.AWAITING_PUBLICATION:
-            publication = self.store.publication_for_event(state.root_event_key)
+            publication = self.store.publication_for_cycle(
+                thread_id=thread_id,
+                cycle_id=state.cycle_id,
+                root_event_key=state.root_event_key,
+                root_input_id=state.root_input_id,
+            )
             if publication is None or publication.status.value not in {
                 "COMPLETED",
                 "NO_CHANGES",
@@ -1885,16 +1898,17 @@ class WorkflowEngine:
                 return WorkflowAdvanceResult(
                     WorkflowPhase.AWAITING_PUBLICATION, thread_id, message="publishing"
                 )
+            execution = self.store.execution_for_cycle(
+                thread_id=thread_id,
+                cycle_id=state.cycle_id,
+                root_event_key=state.root_event_key,
+                root_input_id=state.root_input_id,
+            )
             self.complete_publication(
                 thread_id=thread_id,
+                publication_id=publication.publication_id,
                 publication_status=publication.status.value,
-                response_text=(
-                    self.store.execution_for_event(state.root_event_key)[
-                        "response_text"
-                    ]
-                    if self.store.execution_for_event(state.root_event_key)
-                    else ""
-                ),
+                response_text=execution["response_text"] if execution else "",
                 pr_url=publication.pr_url,
                 memory_store=memory_store,
                 memory_lock_root=(execute_kwargs or {}).get(

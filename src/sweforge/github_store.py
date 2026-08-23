@@ -121,9 +121,12 @@ CREATE TABLE IF NOT EXISTS logical_executions (
     end_dirty INTEGER NOT NULL DEFAULT 0,
     UNIQUE(thread_id, cycle_id, root_input_id)
 );
-CREATE TABLE IF NOT EXISTS event_publications (
-    event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
+CREATE TABLE IF NOT EXISTS logical_publications (
+    publication_id TEXT PRIMARY KEY,
+    source_event_key TEXT NOT NULL REFERENCES source_events(event_key),
     thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    root_input_id TEXT NOT NULL,
     repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
     repo_full_name TEXT NOT NULL,
     issue_number INTEGER NOT NULL,
@@ -136,8 +139,11 @@ CREATE TABLE IF NOT EXISTS event_publications (
     comment_id INTEGER,
     error_message TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(thread_id, cycle_id, root_input_id)
 );
+CREATE INDEX IF NOT EXISTS idx_logical_publications_source
+    ON logical_publications(source_event_key);
 CREATE TABLE IF NOT EXISTS issue_workflow_state (
     thread_id TEXT PRIMARY KEY REFERENCES issue_threads(thread_id),
     repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
@@ -290,10 +296,15 @@ CREATE TABLE IF NOT EXISTS deferred_followups (
     consumed_cycle_id INTEGER,
     consumed_at TEXT
 );
+"""
+
+REPO_MEMORY_LEARNING_DDL = """
 CREATE TABLE IF NOT EXISTS repo_memory_learning (
-    event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
+    learning_id TEXT PRIMARY KEY,
+    source_event_key TEXT NOT NULL REFERENCES source_events(event_key),
     thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
     cycle_id INTEGER NOT NULL,
+    root_input_id TEXT NOT NULL,
     repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
     status TEXT NOT NULL,
     accepted_candidates INTEGER NOT NULL DEFAULT 0,
@@ -301,9 +312,12 @@ CREATE TABLE IF NOT EXISTS repo_memory_learning (
     proposal_json TEXT NOT NULL DEFAULT '{}',
     error_message TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    UNIQUE(thread_id, cycle_id, root_input_id)
 );
 """
+
+SCHEMA += REPO_MEMORY_LEARNING_DDL
 
 
 @dataclass
@@ -408,6 +422,15 @@ class PendingRepairInputError(PendingWorkflowInputError):
     """A repair was prevented by new user input that must not be consumed."""
 
 
+class AmbiguousLifecycleError(ValueError):
+    """A SourceEvent backs several lifecycles, so it is not a valid key."""
+
+
+# Mirrors memory_learning.MemoryLearningStatus.PENDING without importing the
+# model-dependent learning module into the persistence layer.
+MEMORY_LEARNING_PENDING = "PENDING"
+
+
 RESUMABLE_PUBLICATION_STATUSES = (
     PublicationStatus.PENDING,
     PublicationStatus.COMMITTED,
@@ -417,12 +440,25 @@ RESUMABLE_PUBLICATION_STATUSES = (
 )
 
 
-def execution_id_for(*, thread_id: str, cycle_id: int, root_input_id: str) -> str:
-    """Return the stable identity for one executable workflow input."""
-    digest = hashlib.sha256(
+def _lifecycle_digest(thread_id: str, cycle_id: int, root_input_id: str) -> str:
+    return hashlib.sha256(
         f"{thread_id}\0{cycle_id}\0{root_input_id}".encode()
     ).hexdigest()[:24]
-    return f"execution-{digest}"
+
+
+def execution_id_for(*, thread_id: str, cycle_id: int, root_input_id: str) -> str:
+    """Return the stable identity for one executable workflow input."""
+    return f"execution-{_lifecycle_digest(thread_id, cycle_id, root_input_id)}"
+
+
+def publication_id_for(*, thread_id: str, cycle_id: int, root_input_id: str) -> str:
+    """Return the stable identity for one lifecycle's publication."""
+    return f"publication-{_lifecycle_digest(thread_id, cycle_id, root_input_id)}"
+
+
+def memory_learning_id_for(*, thread_id: str, cycle_id: int, root_input_id: str) -> str:
+    """Return the stable identity for one lifecycle's memory learning."""
+    return f"learning-{_lifecycle_digest(thread_id, cycle_id, root_input_id)}"
 
 
 @dataclass(frozen=True)
@@ -526,8 +562,11 @@ class ThreadWorkspaceRecord:
 
 @dataclass(frozen=True)
 class PublicationRecord:
-    event_key: str
+    publication_id: str
+    source_event_key: str
     thread_id: str
+    cycle_id: int
+    root_input_id: str
     repo_id: int
     repo_full_name: str
     issue_number: int
@@ -541,6 +580,26 @@ class PublicationRecord:
     error_message: str | None
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class PublicationTarget:
+    """The exact lifecycle a publication is authorized to act for."""
+
+    publication_id: str
+    source_event_key: str
+    thread_id: str
+    cycle_id: int
+    root_input_id: str
+    repo_id: int
+    repo_full_name: str
+    issue_number: int
+    branch_name: str
+    plan_id: str
+    plan_version: int
+    attempt_id: str
+    review_id: str
+    execution_completed_at: str | None
 
 
 @dataclass(frozen=True)
@@ -651,9 +710,11 @@ class DeferredFollowupRecord:
 
 @dataclass(frozen=True)
 class RepoMemoryLearningRecord:
-    event_key: str
+    learning_id: str
+    source_event_key: str
     thread_id: str
     cycle_id: int
+    root_input_id: str
     repo_id: int
     status: str
     accepted_candidates: int
@@ -706,6 +767,7 @@ class SQLiteGitHubStore:
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(SCHEMA)
         self._migrate_execution_baselines()
+        self._migrate_post_execution_identity()
         self.connection.commit()
 
     def _migrate_execution_baselines(self) -> None:
@@ -1067,6 +1129,125 @@ class SQLiteGitHubStore:
             ) WHERE root_event_key IS NULL"""
         )
 
+    def _legacy_publication_cycle(self, thread_id: str, event_key: str) -> int:
+        """Deterministically recover the cycle an event-keyed publication served."""
+        row = self.connection.execute(
+            """SELECT cycle_id FROM issue_workflow_state
+               WHERE thread_id = ? AND root_event_key = ?""",
+            (thread_id, event_key),
+        ).fetchone()
+        if row is not None:
+            return int(row["cycle_id"])
+        row = self.connection.execute(
+            """SELECT MAX(cycle_id) AS cycle_id FROM issue_plans
+               WHERE thread_id = ? AND root_event_key = ?""",
+            (thread_id, event_key),
+        ).fetchone()
+        if row is not None and row["cycle_id"] is not None:
+            return int(row["cycle_id"])
+        return 1
+
+    def _migrate_post_execution_identity(self) -> None:
+        """Move event-keyed publication/learning rows onto lifecycle identity.
+
+        Legacy rows are ordinary lifecycles, so their logical input is their
+        event key.  Every field is preserved and the SourceEvent is retained as
+        provenance; the migration is idempotent because it runs only while the
+        legacy shape is still present.
+        """
+        tables = {
+            row[0]
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if "event_publications" in tables:
+            for row in self.connection.execute(
+                "SELECT * FROM event_publications"
+            ).fetchall():
+                cycle_id = self._legacy_publication_cycle(
+                    row["thread_id"], row["event_key"]
+                )
+                self.connection.execute(
+                    """INSERT OR IGNORE INTO logical_publications(
+                       publication_id, source_event_key, thread_id, cycle_id,
+                       root_input_id, repo_id, repo_full_name, issue_number,
+                       status, branch_name, local_commit_sha, remote_commit_sha,
+                       pr_number, pr_url, comment_id, error_message,
+                       created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        publication_id_for(
+                            thread_id=row["thread_id"],
+                            cycle_id=cycle_id,
+                            root_input_id=row["event_key"],
+                        ),
+                        row["event_key"],
+                        row["thread_id"],
+                        cycle_id,
+                        row["event_key"],
+                        row["repo_id"],
+                        row["repo_full_name"],
+                        row["issue_number"],
+                        row["status"],
+                        row["branch_name"],
+                        row["local_commit_sha"],
+                        row["remote_commit_sha"],
+                        row["pr_number"],
+                        row["pr_url"],
+                        row["comment_id"],
+                        row["error_message"],
+                        row["created_at"],
+                        row["updated_at"],
+                    ),
+                )
+            self.connection.execute("DROP TABLE event_publications")
+        memory_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(repo_memory_learning)"
+            )
+        }
+        if "event_key" in memory_columns:
+            legacy = self.connection.execute(
+                "SELECT * FROM repo_memory_learning"
+            ).fetchall()
+            self.connection.execute("DROP TABLE repo_memory_learning")
+            self.connection.execute(REPO_MEMORY_LEARNING_DDL)
+            for row in legacy:
+                cycle_id = int(row["cycle_id"])
+                self.connection.execute(
+                    """INSERT OR IGNORE INTO repo_memory_learning(
+                       learning_id, source_event_key, thread_id, cycle_id,
+                       root_input_id, repo_id, status, accepted_candidates,
+                       rejected_candidates, proposal_json, error_message,
+                       created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        memory_learning_id_for(
+                            thread_id=row["thread_id"],
+                            cycle_id=cycle_id,
+                            root_input_id=row["event_key"],
+                        ),
+                        row["event_key"],
+                        row["thread_id"],
+                        cycle_id,
+                        row["event_key"],
+                        row["repo_id"],
+                        row["status"],
+                        row["accepted_candidates"],
+                        row["rejected_candidates"],
+                        row["proposal_json"],
+                        row["error_message"],
+                        row["created_at"],
+                        row["updated_at"],
+                    ),
+                )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_repo_memory_learning_source "
+            "ON repo_memory_learning(source_event_key)"
+        )
+
     def close(self) -> None:
         self.connection.close()
 
@@ -1194,16 +1375,20 @@ class SQLiteGitHubStore:
                    FROM source_events earlier
                    JOIN event_executions execution
                      ON execution.event_key = earlier.event_key
-                   LEFT JOIN event_publications publication
-                     ON publication.event_key = earlier.event_key
                    WHERE earlier.repo_id = ?
                      AND earlier.source_kind = 'issue'
                      AND earlier.source_id = ?
                      AND earlier.body = ?
                      AND (
                          execution.status = ? OR (
-                             execution.status = ? AND
-                             publication.status IN (?, ?)
+                             execution.status = ? AND EXISTS (
+                                 SELECT 1 FROM logical_publications publication
+                                 WHERE publication.source_event_key
+                                       = earlier.event_key
+                                   AND publication.root_input_id
+                                       = earlier.event_key
+                                   AND publication.status IN (?, ?)
+                             )
                          )
                      )
                    LIMIT 1""",
@@ -1242,15 +1427,19 @@ class SQLiteGitHubStore:
                 )
                JOIN event_executions prior_execution
                  ON prior_execution.event_key = earlier.event_key
-               LEFT JOIN event_publications prior_publication
-                 ON prior_publication.event_key = earlier.event_key
                LEFT JOIN event_executions later_execution
                  ON later_execution.event_key = later.event_key
                WHERE later_execution.event_key IS NULL
                  AND (
                      prior_execution.status = ? OR (
-                         prior_execution.status = ? AND
-                         prior_publication.status IN (?, ?)
+                         prior_execution.status = ? AND EXISTS (
+                             SELECT 1 FROM logical_publications prior_publication
+                             WHERE prior_publication.source_event_key
+                                   = earlier.event_key
+                               AND prior_publication.root_input_id
+                                   = earlier.event_key
+                               AND prior_publication.status IN (?, ?)
+                         )
                      )
                  )""",
             (
@@ -1286,8 +1475,6 @@ class SQLiteGitHubStore:
                          FROM source_events AS earlier
                          LEFT JOIN event_executions AS prior
                            ON prior.event_key = earlier.event_key
-                         LEFT JOIN event_publications AS prior_publication
-                           ON prior_publication.event_key = prior.event_key
                          WHERE earlier.thread_id = se.thread_id
                            AND (
                                earlier.source_updated_at < se.source_updated_at
@@ -1304,8 +1491,17 @@ class SQLiteGitHubStore:
                            AND (
                                prior.event_key IS NULL OR NOT (
                                    prior.status = ? OR (
-                                       prior.status = ? AND
-                                       prior_publication.status IN (?, ?)
+                                       prior.status = ? AND (
+                                           SELECT prior_publication.status
+                                           FROM logical_publications
+                                                AS prior_publication
+                                           WHERE prior_publication
+                                                 .source_event_key
+                                                 = earlier.event_key
+                                             AND prior_publication.root_input_id
+                                                 = earlier.event_key
+                                           LIMIT 1
+                                       ) IN (?, ?)
                                    )
                                )
                            )
@@ -2706,123 +2902,279 @@ class SQLiteGitHubStore:
                 ),
             )
 
-    def publication_is_eligible(self, event_key: str) -> bool:
+    # ------------------------------------------------------------------
+    # Publication identity
+    #
+    # A publication belongs to one exact lifecycle -- thread, cycle and
+    # logical workflow input -- never to a SourceEvent.  One SourceEvent can
+    # back several logical inputs, so `source_event_key` is provenance only.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _execution_row(
+        db: sqlite3.Connection,
+        *,
+        thread_id: str,
+        cycle_id: int,
+        root_event_key: str,
+        root_input_id: str,
+    ) -> sqlite3.Row | None:
+        if root_input_id != root_event_key:
+            return db.execute(
+                "SELECT * FROM logical_executions WHERE execution_id = ?",
+                (
+                    execution_id_for(
+                        thread_id=thread_id,
+                        cycle_id=cycle_id,
+                        root_input_id=root_input_id,
+                    ),
+                ),
+            ).fetchone()
+        return db.execute(
+            "SELECT * FROM event_executions WHERE event_key = ?", (root_event_key,)
+        ).fetchone()
+
+    @staticmethod
+    def _publication_target(
+        db: sqlite3.Connection, thread_id: str
+    ) -> PublicationTarget | None:
+        """Resolve the exact lifecycle a thread is currently allowed to publish.
+
+        Every predicate is bound to the current thread/cycle/logical input, so
+        an ACCEPT from one logical input can never authorize another one that
+        happens to share the same SourceEvent.
+        """
+        state = db.execute(
+            "SELECT * FROM issue_workflow_state WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
+        if state is None or state["phase"] != WorkflowPhase.AWAITING_PUBLICATION.value:
+            return None
+        if not state["current_plan_id"]:
+            return None
+        plan = db.execute(
+            "SELECT * FROM issue_plans WHERE plan_id = ?", (state["current_plan_id"],)
+        ).fetchone()
+        if plan is None:
+            return None
+        if (
+            plan["thread_id"] != thread_id
+            or plan["cycle_id"] != state["cycle_id"]
+            or plan["root_event_key"] != state["root_event_key"]
+            or plan["status"]
+            not in (PlanStatus.APPROVED.value, PlanStatus.AUTO_APPROVED.value)
+        ):
+            return None
+        root_input_id = (
+            state["root_input_id"] or plan["root_input_id"] or state["root_event_key"]
+        )
+        if plan["root_input_id"] and plan["root_input_id"] != root_input_id:
+            return None
+        execution = SQLiteGitHubStore._execution_row(
+            db,
+            thread_id=thread_id,
+            cycle_id=state["cycle_id"],
+            root_event_key=state["root_event_key"],
+            root_input_id=root_input_id,
+        )
+        if execution is None or execution["status"] != ExecutionStatus.SUCCEEDED.value:
+            return None
+        attempt = db.execute(
+            """SELECT * FROM execution_attempts WHERE thread_id = ? AND cycle_id = ?
+               ORDER BY attempt_number DESC LIMIT 1""",
+            (thread_id, state["cycle_id"]),
+        ).fetchone()
+        if (
+            attempt is None
+            or attempt["status"] != AttemptStatus.SUCCEEDED.value
+            or attempt["plan_id"] != plan["plan_id"]
+            or attempt["plan_version"] != plan["version"]
+            or attempt["root_event_key"] != state["root_event_key"]
+        ):
+            return None
+        review = db.execute(
+            "SELECT * FROM execution_reviews WHERE attempt_id = ?",
+            (attempt["attempt_id"],),
+        ).fetchone()
+        if (
+            review is None
+            or review["verdict"] != "ACCEPT"
+            or review["thread_id"] != thread_id
+            or review["cycle_id"] != state["cycle_id"]
+            or review["root_event_key"] != state["root_event_key"]
+            or review["plan_id"] != plan["plan_id"]
+            or review["plan_version"] != plan["version"]
+        ):
+            return None
+        workspace = db.execute(
+            "SELECT branch_name FROM thread_workspaces WHERE thread_id = ?",
+            (thread_id,),
+        ).fetchone()
+        if workspace is None:
+            return None
+        return PublicationTarget(
+            publication_id=publication_id_for(
+                thread_id=thread_id,
+                cycle_id=state["cycle_id"],
+                root_input_id=root_input_id,
+            ),
+            source_event_key=state["root_event_key"],
+            thread_id=thread_id,
+            cycle_id=state["cycle_id"],
+            root_input_id=root_input_id,
+            repo_id=state["repo_id"],
+            repo_full_name=state["repo_full_name"],
+            issue_number=state["issue_number"],
+            branch_name=workspace["branch_name"],
+            plan_id=plan["plan_id"],
+            plan_version=plan["version"],
+            attempt_id=attempt["attempt_id"],
+            review_id=review["review_id"],
+            execution_completed_at=execution["completed_at"],
+        )
+
+    def publication_target(self, thread_id: str) -> PublicationTarget | None:
+        return self._publication_target(self.connection, thread_id)
+
+    def eligible_publication_id(self, thread_id: str) -> str | None:
+        """Return the publication identity this thread may publish right now."""
+        target = self._publication_target(self.connection, thread_id)
+        return target.publication_id if target else None
+
+    def publication_is_eligible(self, publication_id: str) -> bool:
+        """True only when this exact publication is the thread's current one."""
         row = self.connection.execute(
-            "SELECT ee.status execution_status, s.thread_id, s.cycle_id, s.root_event_key, s.current_plan_id, s.phase, "
-            "p.version plan_version, p.status plan_status, a.attempt_id, a.status attempt_status, "
-            "a.plan_id attempt_plan, a.plan_version attempt_plan_version, a.root_event_key attempt_root, "
-            "a.thread_id attempt_thread, a.cycle_id attempt_cycle, r.verdict, r.thread_id review_thread, "
-            "r.cycle_id review_cycle, r.root_event_key review_root, r.plan_id review_plan, r.plan_version review_plan_version, r.attempt_id review_attempt "
-            "FROM source_events e JOIN event_executions ee ON ee.event_key=e.event_key "
-            "LEFT JOIN issue_workflow_state s ON s.thread_id=e.thread_id "
-            "LEFT JOIN issue_plans p ON p.plan_id=s.current_plan_id "
-            "LEFT JOIN execution_attempts a ON a.thread_id=s.thread_id AND a.cycle_id=s.cycle_id "
-            "AND a.attempt_number=(SELECT MAX(a2.attempt_number) FROM execution_attempts a2 WHERE a2.thread_id=s.thread_id AND a2.cycle_id=s.cycle_id) "
-            "LEFT JOIN execution_reviews r ON r.attempt_id=a.attempt_id WHERE e.event_key=?",
-            (event_key,),
+            "SELECT thread_id FROM logical_publications WHERE publication_id = ?",
+            (publication_id,),
         ).fetchone()
         if row is None:
             return False
-        return bool(
-            row
-            and row["execution_status"] == ExecutionStatus.SUCCEEDED.value
-            and row["root_event_key"] == event_key
-            and row["phase"] == WorkflowPhase.AWAITING_PUBLICATION.value
-            and row["attempt_status"] == AttemptStatus.SUCCEEDED.value
-            and row["attempt_plan"] == row["current_plan_id"]
-            and row["attempt_plan_version"] == row["plan_version"]
-            and row["attempt_root"] == row["root_event_key"]
-            and row["attempt_thread"] == row["thread_id"]
-            and row["attempt_cycle"] == row["cycle_id"]
-            and row["plan_status"]
-            in (PlanStatus.APPROVED.value, PlanStatus.AUTO_APPROVED.value)
-            and row["verdict"] == "ACCEPT"
-            and row["review_thread"] == row["thread_id"]
-            and row["review_cycle"] == row["cycle_id"]
-            and row["review_root"] == row["root_event_key"]
-            and row["review_plan"] == row["current_plan_id"]
-            and row["review_plan_version"] == row["plan_version"]
-            and row["review_attempt"] == row["attempt_id"]
-        )
+        target = self._publication_target(self.connection, row["thread_id"])
+        return target is not None and target.publication_id == publication_id
 
-    def publication_for_event(self, event_key: str) -> PublicationRecord | None:
+    def publication_for_id(self, publication_id: str) -> PublicationRecord | None:
         row = self.connection.execute(
-            "SELECT * FROM event_publications WHERE event_key = ?", (event_key,)
+            "SELECT * FROM logical_publications WHERE publication_id = ?",
+            (publication_id,),
         ).fetchone()
         return self._publication_record(row) if row else None
 
-    def next_publication(
-        self, event_key: str | None = None
+    def publication_for_cycle(
+        self,
+        *,
+        thread_id: str,
+        cycle_id: int,
+        root_event_key: str,
+        root_input_id: str | None,
     ) -> PublicationRecord | None:
-        query = """SELECT ee.event_key FROM event_executions ee
-                   JOIN source_events se ON se.event_key = ee.event_key
-                   LEFT JOIN issue_workflow_state ws ON ws.thread_id = se.thread_id
-                   LEFT JOIN event_publications ep ON ep.event_key = ee.event_key
-                   LEFT JOIN execution_attempts ea ON ea.attempt_id = (
-                     SELECT attempt_id FROM execution_attempts a2 WHERE a2.thread_id=ws.thread_id AND a2.cycle_id=ws.cycle_id ORDER BY attempt_number DESC LIMIT 1)
-                   LEFT JOIN execution_reviews er ON er.attempt_id = ea.attempt_id
-                   WHERE ee.status = ? AND ws.thread_id IS NOT NULL AND se.event_key = ws.root_event_key AND ws.phase = ? AND er.verdict = 'ACCEPT' AND ea.status = 'SUCCEEDED' AND ea.plan_id = ws.current_plan_id AND (ep.event_key IS NULL OR
-                         ep.status IN (?, ?, ?, ?, ?))"""
-        args: list[object] = [
-            ExecutionStatus.SUCCEEDED.value,
-            WorkflowPhase.AWAITING_PUBLICATION.value,
-        ]
-        args.extend(status.value for status in RESUMABLE_PUBLICATION_STATUSES)
-        if event_key is not None:
-            query += " AND ee.event_key = ?"
-            args.append(event_key)
-        query += " ORDER BY ee.completed_at, ee.event_key LIMIT 1"
-        row = self.connection.execute(query, args).fetchone()
-        if row is None:
-            return None
-        return self.ensure_publication(
-            row["event_key"], now=datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        return self.publication_for_id(
+            publication_id_for(
+                thread_id=thread_id,
+                cycle_id=cycle_id,
+                root_input_id=root_input_id or root_event_key,
+            )
         )
 
-    def ensure_publication(self, event_key: str, *, now: str) -> PublicationRecord:
-        if not self.publication_is_eligible(event_key):
-            raise ValueError("publication is blocked until a matching ACCEPT review")
-        existing = self.publication_for_event(event_key)
-        if existing:
-            return existing
-        with self.transaction() as db:
-            if not self.publication_is_eligible(event_key):
-                raise ValueError(
-                    "publication eligibility changed during publication creation"
-                )
-            row = db.execute(
-                """SELECT se.event_key, se.thread_id, se.repo_id, se.repo_full_name,
-                          thread.issue_number, tw.branch_name
-                   FROM source_events se
-                   JOIN issue_threads thread ON thread.thread_id = se.thread_id
-                   JOIN thread_workspaces tw ON tw.thread_id = se.thread_id
-                   JOIN event_executions ee ON ee.event_key = se.event_key
-                   WHERE se.event_key = ? AND ee.status = ?""",
-                (event_key, ExecutionStatus.SUCCEEDED.value),
-            ).fetchone()
-            if row is None:
-                raise ValueError("successful execution or workspace not found")
-            db.execute(
-                """INSERT INTO event_publications(
-                   event_key, thread_id, repo_id, repo_full_name, issue_number,
-                   status, branch_name, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    event_key,
-                    row["thread_id"],
-                    row["repo_id"],
-                    row["repo_full_name"],
-                    row["issue_number"],
-                    PublicationStatus.PENDING.value,
-                    row["branch_name"],
-                    now,
-                    now,
-                ),
+    def publications_for_event(self, event_key: str) -> list[PublicationRecord]:
+        """Diagnostic: every publication that retains this SourceEvent."""
+        rows = self.connection.execute(
+            """SELECT * FROM logical_publications WHERE source_event_key = ?
+               ORDER BY cycle_id, publication_id""",
+            (event_key,),
+        ).fetchall()
+        return [self._publication_record(row) for row in rows]
+
+    def publication_for_event(self, event_key: str) -> PublicationRecord | None:
+        """Diagnostic lookup; fails closed when a SourceEvent is ambiguous."""
+        records = self.publications_for_event(event_key)
+        if len(records) > 1:
+            raise AmbiguousLifecycleError(
+                f"SourceEvent {event_key} backs {len(records)} publications; "
+                "use publication_for_id or publication_for_cycle"
             )
-        return self.publication_for_event(event_key)  # type: ignore[return-value]
+        return records[0] if records else None
+
+    def resolve_publication_id(self, identifier: str) -> str:
+        """Accept a publication id or an unambiguous legacy event key."""
+        if identifier.startswith("publication-"):
+            return identifier
+        record = self.publication_for_event(identifier)
+        if record is None:
+            raise ValueError(f"no publication exists for {identifier}")
+        return record.publication_id
+
+    def next_publication(
+        self, publication_id: str | None = None
+    ) -> PublicationRecord | None:
+        rows = self.connection.execute(
+            "SELECT thread_id FROM issue_workflow_state WHERE phase = ? "
+            "ORDER BY thread_id",
+            (WorkflowPhase.AWAITING_PUBLICATION.value,),
+        ).fetchall()
+        targets: list[PublicationTarget] = []
+        for row in rows:
+            target = self._publication_target(self.connection, row["thread_id"])
+            if target is None:
+                continue
+            if publication_id is not None and target.publication_id != publication_id:
+                continue
+            existing = self.publication_for_id(target.publication_id)
+            if existing is not None and existing.status not in (
+                RESUMABLE_PUBLICATION_STATUSES
+            ):
+                continue
+            targets.append(target)
+        if not targets:
+            return None
+        targets.sort(
+            key=lambda item: (item.execution_completed_at or "", item.publication_id)
+        )
+        return self.ensure_publication(
+            thread_id=targets[0].thread_id,
+            now=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        )
+
+    def ensure_publication(self, *, thread_id: str, now: str) -> PublicationRecord:
+        with self.transaction(immediate=True) as db:
+            target = self._publication_target(db, thread_id)
+            if target is None:
+                raise ValueError(
+                    "publication is blocked until a matching ACCEPT review"
+                )
+            existing = db.execute(
+                "SELECT 1 FROM logical_publications WHERE publication_id = ?",
+                (target.publication_id,),
+            ).fetchone()
+            if existing is None:
+                db.execute(
+                    """INSERT INTO logical_publications(
+                       publication_id, source_event_key, thread_id, cycle_id,
+                       root_input_id, repo_id, repo_full_name, issue_number,
+                       status, branch_name, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        target.publication_id,
+                        target.source_event_key,
+                        target.thread_id,
+                        target.cycle_id,
+                        target.root_input_id,
+                        target.repo_id,
+                        target.repo_full_name,
+                        target.issue_number,
+                        PublicationStatus.PENDING.value,
+                        target.branch_name,
+                        now,
+                        now,
+                    ),
+                )
+        return self.publication_for_id(target.publication_id)  # type: ignore[return-value]
 
     def update_publication(
-        self, event_key: str, *, status: PublicationStatus, now: str, **fields: object
+        self,
+        publication_id: str,
+        *,
+        status: PublicationStatus,
+        now: str,
+        **fields: object,
     ) -> PublicationRecord:
         allowed = {
             "local_commit_sha",
@@ -2840,28 +3192,111 @@ class SQLiteGitHubStore:
         for key, value in fields.items():
             assignments.append(f"{key} = ?")
             values.append(value)
-        values.append(event_key)
+        values.append(publication_id)
         with self.transaction() as db:
             if (
                 db.execute(
-                    "UPDATE event_publications SET "
-                    f"{', '.join(assignments)} WHERE event_key = ?",
+                    "UPDATE logical_publications SET "
+                    f"{', '.join(assignments)} WHERE publication_id = ?",
                     values,
                 ).rowcount
                 != 1
             ):
                 raise ValueError("publication does not exist")
-        return self.publication_for_event(event_key)  # type: ignore[return-value]
+        return self.publication_for_id(publication_id)  # type: ignore[return-value]
 
-    def retry_publication(self, event_key: str, *, now: str) -> PublicationRecord:
-        publication = self.publication_for_event(event_key)
+    def retry_publication(self, publication_id: str, *, now: str) -> PublicationRecord:
+        publication = self.publication_for_id(publication_id)
         if publication is None:
-            return self.ensure_publication(event_key, now=now)
+            raise ValueError("publication does not exist")
         if publication.status != PublicationStatus.FAILED:
             raise ValueError("only failed publications can be retried")
         return self.update_publication(
-            event_key, status=PublicationStatus.PENDING, now=now, error_message=None
+            publication_id,
+            status=PublicationStatus.PENDING,
+            now=now,
+            error_message=None,
         )
+
+    def finalize_publication(
+        self, publication_id: str, *, now: str
+    ) -> RepoMemoryLearningRecord:
+        """Close one lifecycle: mark its plan executed and return it to IDLE.
+
+        Fails closed when the publication is not the thread's current one, so a
+        stale completion can never finalize a newer cycle.
+        """
+        with self.transaction(immediate=True) as db:
+            publication = db.execute(
+                "SELECT * FROM logical_publications WHERE publication_id = ?",
+                (publication_id,),
+            ).fetchone()
+            if publication is None:
+                raise ValueError("publication does not exist")
+            if publication["status"] not in (
+                PublicationStatus.COMPLETED.value,
+                PublicationStatus.NO_CHANGES.value,
+            ):
+                raise ValueError("publication has no publishable outcome yet")
+            target = self._publication_target(db, publication["thread_id"])
+            if target is None or target.publication_id != publication_id:
+                raise ValueError("publication is stale for the current workflow cycle")
+            db.execute(
+                """UPDATE issue_plans SET status = ?
+                   WHERE plan_id = ? AND thread_id = ? AND cycle_id = ?
+                     AND status IN (?, ?)""",
+                (
+                    PlanStatus.EXECUTED.value,
+                    target.plan_id,
+                    target.thread_id,
+                    target.cycle_id,
+                    PlanStatus.APPROVED.value,
+                    PlanStatus.AUTO_APPROVED.value,
+                ),
+            )
+            learning_id = memory_learning_id_for(
+                thread_id=target.thread_id,
+                cycle_id=target.cycle_id,
+                root_input_id=target.root_input_id,
+            )
+            db.execute(
+                """INSERT INTO repo_memory_learning(
+                   learning_id, source_event_key, thread_id, cycle_id,
+                   root_input_id, repo_id, status, accepted_candidates,
+                   rejected_candidates, proposal_json, error_message,
+                   created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, '{}', NULL, ?, ?)
+                   ON CONFLICT(learning_id) DO NOTHING""",
+                (
+                    learning_id,
+                    target.source_event_key,
+                    target.thread_id,
+                    target.cycle_id,
+                    target.root_input_id,
+                    target.repo_id,
+                    MEMORY_LEARNING_PENDING,
+                    now,
+                    now,
+                ),
+            )
+            finalized = db.execute(
+                """UPDATE issue_workflow_state SET phase = ?, updated_at = ?
+                   WHERE thread_id = ? AND cycle_id = ? AND phase = ?
+                     AND root_event_key = ?
+                     AND COALESCE(root_input_id, root_event_key) = ?""",
+                (
+                    WorkflowPhase.IDLE.value,
+                    now,
+                    target.thread_id,
+                    target.cycle_id,
+                    WorkflowPhase.AWAITING_PUBLICATION.value,
+                    target.source_event_key,
+                    target.root_input_id,
+                ),
+            )
+            if finalized.rowcount != 1:
+                raise ValueError("workflow state changed during finalization")
+        return self.memory_learning_for_id(learning_id)  # type: ignore[return-value]
 
     @staticmethod
     def _publication_record(row: sqlite3.Row) -> PublicationRecord:
@@ -3014,32 +3449,101 @@ class SQLiteGitHubStore:
         ).fetchone()
         return self._workflow_state_record(row) if row else None
 
-    def repo_memory_learning(self, event_key: str) -> RepoMemoryLearningRecord | None:
+    # ------------------------------------------------------------------
+    # Repository-memory learning identity
+    #
+    # Learning belongs to one completed lifecycle.  A record is only ever
+    # written through its own `learning_id`, so an unfinished record from an
+    # older cycle can never overwrite or block a newer cycle's learning.
+    # ------------------------------------------------------------------
+
+    def memory_learning_for_id(
+        self, learning_id: str
+    ) -> RepoMemoryLearningRecord | None:
         row = self.connection.execute(
-            "SELECT * FROM repo_memory_learning WHERE event_key = ?", (event_key,)
+            "SELECT * FROM repo_memory_learning WHERE learning_id = ?", (learning_id,)
+        ).fetchone()
+        return RepoMemoryLearningRecord(**dict(row)) if row else None
+
+    def memory_learning_for_cycle(
+        self,
+        *,
+        thread_id: str,
+        cycle_id: int,
+        root_event_key: str,
+        root_input_id: str | None,
+    ) -> RepoMemoryLearningRecord | None:
+        return self.memory_learning_for_id(
+            memory_learning_id_for(
+                thread_id=thread_id,
+                cycle_id=cycle_id,
+                root_input_id=root_input_id or root_event_key,
+            )
+        )
+
+    def memory_learnings_for_event(
+        self, event_key: str
+    ) -> list[RepoMemoryLearningRecord]:
+        """Diagnostic: every learning lifecycle that retains this SourceEvent."""
+        rows = self.connection.execute(
+            """SELECT * FROM repo_memory_learning WHERE source_event_key = ?
+               ORDER BY cycle_id, learning_id""",
+            (event_key,),
+        ).fetchall()
+        return [RepoMemoryLearningRecord(**dict(row)) for row in rows]
+
+    def repo_memory_learning(self, event_key: str) -> RepoMemoryLearningRecord | None:
+        """Diagnostic lookup; fails closed when a SourceEvent is ambiguous."""
+        records = self.memory_learnings_for_event(event_key)
+        if len(records) > 1:
+            raise AmbiguousLifecycleError(
+                f"SourceEvent {event_key} backs {len(records)} learning "
+                "lifecycles; use memory_learning_for_cycle or _for_id"
+            )
+        return records[0] if records else None
+
+    def pending_memory_learning(
+        self, thread_id: str
+    ) -> RepoMemoryLearningRecord | None:
+        """Oldest unfinished learning lifecycle for a thread, if any."""
+        row = self.connection.execute(
+            """SELECT * FROM repo_memory_learning
+               WHERE thread_id = ? AND status IN ('PENDING', 'FAILED')
+               ORDER BY cycle_id, created_at, learning_id LIMIT 1""",
+            (thread_id,),
         ).fetchone()
         return RepoMemoryLearningRecord(**dict(row)) if row else None
 
     def save_repo_memory_learning(
         self, record: RepoMemoryLearningRecord
     ) -> RepoMemoryLearningRecord:
+        expected = memory_learning_id_for(
+            thread_id=record.thread_id,
+            cycle_id=record.cycle_id,
+            root_input_id=record.root_input_id,
+        )
+        if record.learning_id != expected:
+            raise ValueError("memory learning id does not match its lifecycle")
         with self.transaction(immediate=True) as db:
             db.execute(
                 """INSERT INTO repo_memory_learning(
-                   event_key, thread_id, cycle_id, repo_id, status,
-                   accepted_candidates, rejected_candidates, error_message,
-                   proposal_json, created_at, updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(event_key) DO UPDATE SET status=excluded.status,
+                   learning_id, source_event_key, thread_id, cycle_id,
+                   root_input_id, repo_id, status, accepted_candidates,
+                   rejected_candidates, error_message, proposal_json,
+                   created_at, updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(learning_id) DO UPDATE SET status=excluded.status,
                    accepted_candidates=excluded.accepted_candidates,
                    rejected_candidates=excluded.rejected_candidates,
                    error_message=excluded.error_message,
                    proposal_json=excluded.proposal_json,
                    updated_at=excluded.updated_at""",
                 (
-                    record.event_key,
+                    record.learning_id,
+                    record.source_event_key,
                     record.thread_id,
                     record.cycle_id,
+                    record.root_input_id,
                     record.repo_id,
                     record.status,
                     record.accepted_candidates,
@@ -3050,7 +3554,7 @@ class SQLiteGitHubStore:
                     record.updated_at,
                 ),
             )
-        return self.repo_memory_learning(record.event_key)  # type: ignore[return-value]
+        return self.memory_learning_for_id(record.learning_id)  # type: ignore[return-value]
 
     def save_workflow_state(self, record: WorkflowStateRecord) -> WorkflowStateRecord:
         with self.transaction(immediate=True) as db:
@@ -3643,6 +4147,15 @@ class SQLiteGitHubStore:
     def plan(self, plan_id: str) -> PlanRecord | None:
         row = self.connection.execute(
             "SELECT * FROM issue_plans WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        return self._plan_record(row) if row else None
+
+    def plan_for_cycle(self, thread_id: str, cycle_id: int) -> PlanRecord | None:
+        """Latest plan version of one exact cycle, independent of the current one."""
+        row = self.connection.execute(
+            """SELECT * FROM issue_plans WHERE thread_id = ? AND cycle_id = ?
+               ORDER BY version DESC LIMIT 1""",
+            (thread_id, cycle_id),
         ).fetchone()
         return self._plan_record(row) if row else None
 
@@ -4275,10 +4788,14 @@ class SQLiteGitHubStore:
     @staticmethod
     def _assert_event_ordering(db: sqlite3.Connection, row: sqlite3.Row) -> None:
         earlier = db.execute(
-            """SELECT se.event_key, ee.status, ep.status AS publication_status
+            """SELECT se.event_key, ee.status, EXISTS (
+                   SELECT 1 FROM logical_publications ep
+                   WHERE ep.source_event_key = se.event_key
+                     AND ep.root_input_id = se.event_key
+                     AND ep.status IN ('COMPLETED', 'NO_CHANGES')
+               ) AS publication_resolved
                FROM source_events se
                LEFT JOIN event_executions ee ON ee.event_key = se.event_key
-               LEFT JOIN event_publications ep ON ep.event_key = se.event_key
                WHERE se.thread_id = ? AND (
                  se.source_updated_at < ? OR
                  (se.source_updated_at = ? AND se.discovered_at < ?) OR
@@ -4298,11 +4815,9 @@ class SQLiteGitHubStore:
         for item in earlier:
             if item["status"] == ExecutionStatus.SKIPPED.value:
                 continue
-            if item["status"] == ExecutionStatus.SUCCEEDED.value and item[
-                "publication_status"
-            ] in (
-                PublicationStatus.COMPLETED.value,
-                PublicationStatus.NO_CHANGES.value,
+            if (
+                item["status"] == ExecutionStatus.SUCCEEDED.value
+                and item["publication_resolved"]
             ):
                 continue
             raise ValueError("earlier IssueThread event is unresolved")
