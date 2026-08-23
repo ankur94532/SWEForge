@@ -103,6 +103,24 @@ CREATE TABLE IF NOT EXISTS event_executions (
     end_head_sha TEXT,
     end_dirty INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS logical_executions (
+    execution_id TEXT PRIMARY KEY,
+    source_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    root_input_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    response_text TEXT,
+    error_message TEXT,
+    workspace_path TEXT,
+    start_head_sha TEXT,
+    end_head_sha TEXT,
+    end_dirty INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(thread_id, cycle_id, root_input_id)
+);
 CREATE TABLE IF NOT EXISTS event_publications (
     event_key TEXT PRIMARY KEY REFERENCES source_events(event_key),
     thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
@@ -399,6 +417,14 @@ RESUMABLE_PUBLICATION_STATUSES = (
 )
 
 
+def execution_id_for(*, thread_id: str, cycle_id: int, root_input_id: str) -> str:
+    """Return the stable identity for one executable workflow input."""
+    digest = hashlib.sha256(
+        f"{thread_id}\0{cycle_id}\0{root_input_id}".encode()
+    ).hexdigest()[:24]
+    return f"execution-{digest}"
+
+
 @dataclass(frozen=True)
 class ClaimedEvent:
     event_key: str
@@ -421,6 +447,7 @@ class ClaimedEvent:
     in_reply_to_id: str | None = None
     pull_request_review_id: str | None = None
     review_thread_root_id: str | None = None
+    execution_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -432,6 +459,9 @@ class ExecutionRecord:
     started_at: str
     completed_at: str | None
     error_message: str | None
+    execution_id: str | None = None
+    cycle_id: int | None = None
+    root_input_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1339,25 +1369,48 @@ class SQLiteGitHubStore:
     def running_executions_before(self, started_before: str) -> list[ExecutionRecord]:
         rows = self.connection.execute(
             """SELECT event_key, thread_id, status, attempt_count, started_at,
-                      completed_at, error_message
+                      completed_at, error_message, NULL AS execution_id,
+                      NULL AS cycle_id, NULL AS root_input_id
                FROM event_executions WHERE status = ? AND started_at < ?
+               UNION ALL
+               SELECT source_event_key AS event_key, thread_id, status, attempt_count,
+                      started_at, completed_at, error_message, execution_id, cycle_id,
+                      root_input_id
+               FROM logical_executions WHERE status = ? AND started_at < ?
                ORDER BY started_at, event_key""",
-            (ExecutionStatus.RUNNING.value, started_before),
+            (
+                ExecutionStatus.RUNNING.value,
+                started_before,
+                ExecutionStatus.RUNNING.value,
+                started_before,
+            ),
         ).fetchall()
         return [self._execution_record(row) for row in rows]
 
     def mark_execution_interrupted(
-        self, event_key: str, *, completed_at: str, error_message: str
+        self,
+        event_key: str,
+        *,
+        completed_at: str,
+        error_message: str,
+        execution_id: str | None = None,
     ) -> None:
         with self.transaction() as db:
+            target = execution_id or event_key
+            table = (
+                "logical_executions"
+                if target.startswith("execution-")
+                else "event_executions"
+            )
+            key = "execution_id" if table == "logical_executions" else "event_key"
             cursor = db.execute(
-                """UPDATE event_executions SET status = ?, completed_at = ?,
-                   error_message = ? WHERE event_key = ? AND status = ?""",
+                f"""UPDATE {table} SET status = ?, completed_at = ?,
+                   error_message = ? WHERE {key} = ? AND status = ?""",
                 (
                     ExecutionStatus.INTERRUPTED.value,
                     completed_at,
                     error_message,
-                    event_key,
+                    target,
                     ExecutionStatus.RUNNING.value,
                 ),
             )
@@ -1366,8 +1419,11 @@ class SQLiteGitHubStore:
 
     def retry_execution(self, event_key: str) -> ExecutionStatus:
         with self.transaction() as db:
+            logical = event_key.startswith("execution-")
+            table = "logical_executions" if logical else "event_executions"
+            key = "execution_id" if logical else "event_key"
             row = db.execute(
-                "SELECT status FROM event_executions WHERE event_key = ?",
+                f"SELECT status FROM {table} WHERE {key} = ?",
                 (event_key,),
             ).fetchone()
             if row is None:
@@ -1378,16 +1434,24 @@ class SQLiteGitHubStore:
             if status not in (ExecutionStatus.FAILED, ExecutionStatus.INTERRUPTED):
                 raise ValueError(f"cannot retry execution in {status.value} status")
             db.execute(
-                "UPDATE event_executions SET status = ?, completed_at = NULL "
-                "WHERE event_key = ?",
+                f"UPDATE {table} SET status = ?, completed_at = NULL WHERE {key} = ?",
                 (ExecutionStatus.RETRY_PENDING.value, event_key),
             )
-            db.execute(
-                "UPDATE execution_permits SET consumed_at = NULL "
-                "WHERE root_event_key = ? AND consumed_at IS NOT NULL "
-                "AND invalidated_at IS NULL",
-                (event_key,),
-            )
+            if logical:
+                db.execute(
+                    "UPDATE execution_permits SET consumed_at = NULL "
+                    "WHERE root_event_key = (SELECT source_event_key FROM logical_executions WHERE execution_id=?) "
+                    "AND cycle_id=(SELECT cycle_id FROM logical_executions WHERE execution_id=?) "
+                    "AND consumed_at IS NOT NULL AND invalidated_at IS NULL",
+                    (event_key, event_key),
+                )
+            else:
+                db.execute(
+                    "UPDATE execution_permits SET consumed_at = NULL "
+                    "WHERE root_event_key = ? AND consumed_at IS NOT NULL "
+                    "AND invalidated_at IS NULL",
+                    (event_key,),
+                )
             db.execute(
                 """UPDATE issue_workflow_state SET phase = ?, updated_at = ?
                    WHERE root_event_key = ? AND phase = ?""",
@@ -1422,7 +1486,12 @@ class SQLiteGitHubStore:
     def execution_records(self) -> list[ExecutionRecord]:
         rows = self.connection.execute(
             """SELECT event_key, thread_id, status, attempt_count, started_at,
-                      completed_at, error_message FROM event_executions
+                      completed_at, error_message, NULL AS execution_id,
+                      NULL AS cycle_id, NULL AS root_input_id FROM event_executions
+               UNION ALL
+               SELECT source_event_key AS event_key, thread_id, status, attempt_count,
+                      started_at, completed_at, error_message, execution_id,
+                      cycle_id, root_input_id FROM logical_executions
                ORDER BY started_at, event_key"""
         ).fetchall()
         return [self._execution_record(row) for row in rows]
@@ -1437,12 +1506,18 @@ class SQLiteGitHubStore:
             started_at=row["started_at"],
             completed_at=row["completed_at"],
             error_message=row["error_message"],
+            execution_id=row["execution_id"] if "execution_id" in row.keys() else None,
+            cycle_id=row["cycle_id"] if "cycle_id" in row.keys() else None,
+            root_input_id=row["root_input_id"]
+            if "root_input_id" in row.keys()
+            else None,
         )
 
     def mark_execution_succeeded(
         self,
         event_key: str,
         *,
+        execution_id: str | None = None,
         completed_at: str,
         response_text: str,
         workspace_path: str,
@@ -1453,7 +1528,7 @@ class SQLiteGitHubStore:
         with self.transaction() as db:
             self._update_execution(
                 db,
-                event_key,
+                execution_id or event_key,
                 ExecutionStatus.SUCCEEDED,
                 completed_at=completed_at,
                 response_text=response_text,
@@ -1468,6 +1543,7 @@ class SQLiteGitHubStore:
         self,
         event_key: str,
         *,
+        execution_id: str | None = None,
         completed_at: str,
         error_message: str,
         workspace_path: str | None,
@@ -1475,7 +1551,7 @@ class SQLiteGitHubStore:
         with self.transaction() as db:
             self._update_execution(
                 db,
-                event_key,
+                execution_id or event_key,
                 ExecutionStatus.FAILED,
                 completed_at=completed_at,
                 response_text=None,
@@ -1701,24 +1777,44 @@ class SQLiteGitHubStore:
         end_head_sha: str | None = None,
         end_dirty: bool = False,
     ) -> None:
-        cursor = db.execute(
-            """UPDATE event_executions SET status = ?, completed_at = ?,
+        if event_key.startswith("execution-"):
+            cursor = db.execute(
+                """UPDATE logical_executions SET status=?, completed_at=?,
+                   response_text=?, error_message=?, workspace_path=?,
+                   start_head_sha=?, end_head_sha=?, end_dirty=?
+                   WHERE execution_id=? AND status=?""",
+                (
+                    status.value,
+                    completed_at,
+                    response_text,
+                    error_message,
+                    workspace_path,
+                    start_head_sha,
+                    end_head_sha,
+                    int(end_dirty),
+                    event_key,
+                    ExecutionStatus.RUNNING.value,
+                ),
+            )
+        else:
+            cursor = db.execute(
+                """UPDATE event_executions SET status = ?, completed_at = ?,
                response_text = ?, error_message = ?, workspace_path = ?,
                start_head_sha = ?, end_head_sha = ?, end_dirty = ?
                WHERE event_key = ? AND status = ?""",
-            (
-                status.value,
-                completed_at,
-                response_text,
-                error_message,
-                workspace_path,
-                start_head_sha,
-                end_head_sha,
-                int(end_dirty),
-                event_key,
-                ExecutionStatus.RUNNING.value,
-            ),
-        )
+                (
+                    status.value,
+                    completed_at,
+                    response_text,
+                    error_message,
+                    workspace_path,
+                    start_head_sha,
+                    end_head_sha,
+                    int(end_dirty),
+                    event_key,
+                    ExecutionStatus.RUNNING.value,
+                ),
+            )
         if cursor.rowcount != 1:
             raise ValueError("event execution is not currently running")
 
@@ -1726,6 +1822,31 @@ class SQLiteGitHubStore:
         return self.connection.execute(
             "SELECT * FROM event_executions WHERE event_key = ?", (event_key,)
         ).fetchone()
+
+    def execution_for_id(self, execution_id: str):
+        if execution_id.startswith("execution-"):
+            return self.connection.execute(
+                "SELECT * FROM logical_executions WHERE execution_id=?",
+                (execution_id,),
+            ).fetchone()
+        return self.execution_for_event(execution_id)
+
+    def execution_for_cycle(
+        self,
+        *,
+        thread_id: str,
+        cycle_id: int,
+        root_event_key: str,
+        root_input_id: str | None,
+    ):
+        effective = root_input_id or root_event_key
+        if effective != root_event_key:
+            return self.execution_for_id(
+                execution_id_for(
+                    thread_id=thread_id, cycle_id=cycle_id, root_input_id=effective
+                )
+            )
+        return self.execution_for_event(root_event_key)
 
     @staticmethod
     def _attempt_record(row: sqlite3.Row) -> ExecutionAttemptRecord:
@@ -3616,6 +3737,13 @@ class SQLiteGitHubStore:
             ).fetchone()
             if row is None or row["thread_id"] != expected_thread_id:
                 raise ValueError("permit root event does not match the thread")
+            root_input_id = plan["root_input_id"] or plan["root_event_key"]
+            logical_execution_id = execution_id_for(
+                thread_id=expected_thread_id,
+                cycle_id=permit["cycle_id"],
+                root_input_id=root_input_id,
+            )
+            logical = root_input_id != permit["root_event_key"]
             pending = db.execute(
                 """SELECT event_key, body FROM source_events
                    WHERE thread_id = ? AND event_key != ?
@@ -3650,7 +3778,7 @@ class SQLiteGitHubStore:
                     continue
                 if starts_with_agent_invocation(candidate["body"]):
                     raise PendingWorkflowInputError(candidate["event_key"])
-            if row["execution_status"] not in (
+            if not logical and row["execution_status"] not in (
                 None,
                 ExecutionStatus.RETRY_PENDING.value,
             ):
@@ -3661,8 +3789,46 @@ class SQLiteGitHubStore:
             ):
                 raise ValueError("execution permit was already consumed")
             self._assert_event_ordering(db, row)
-            retrying = row["execution_status"] == ExecutionStatus.RETRY_PENDING.value
-            if retrying:
+            logical_row = db.execute(
+                "SELECT status FROM logical_executions WHERE execution_id=?",
+                (logical_execution_id,),
+            ).fetchone()
+            retrying = logical_row is not None or (
+                not logical
+                and row["execution_status"] == ExecutionStatus.RETRY_PENDING.value
+            )
+            if logical:
+                if logical_row and logical_row["status"] not in (
+                    ExecutionStatus.RETRY_PENDING.value,
+                    ExecutionStatus.INTERRUPTED.value,
+                ):
+                    raise ValueError("logical execution is not claimable")
+                if logical_row:
+                    db.execute(
+                        """UPDATE logical_executions SET status=?, attempt_count=attempt_count+1,
+                           started_at=?, completed_at=NULL, error_message=NULL
+                           WHERE execution_id=?""",
+                        (ExecutionStatus.RUNNING.value, now, logical_execution_id),
+                    )
+                    retrying = True
+                else:
+                    db.execute(
+                        """INSERT INTO logical_executions(
+                           execution_id, source_event_key, thread_id, cycle_id,
+                           root_input_id, status, attempt_count, started_at)
+                           VALUES(?,?,?,?,?,?,1,?)""",
+                        (
+                            logical_execution_id,
+                            permit["root_event_key"],
+                            expected_thread_id,
+                            permit["cycle_id"],
+                            root_input_id,
+                            ExecutionStatus.RUNNING.value,
+                            now,
+                        ),
+                    )
+                    retrying = False
+            elif retrying:
                 db.execute(
                     """UPDATE event_executions SET status = ?, attempt_count =
                        attempt_count + 1, started_at = ?, completed_at = NULL,
@@ -3713,7 +3879,11 @@ class SQLiteGitHubStore:
                     now,
                 ),
             )
-            return self._claimed_event(row, retrying=retrying)
+            return self._claimed_event(
+                row,
+                retrying=retrying,
+                execution_id=logical_execution_id if logical else row["event_key"],
+            )
 
     def invalidate_permits(self, thread_id: str, cycle_id: int, *, now: str) -> None:
         with self.transaction(immediate=True) as db:
@@ -4060,7 +4230,9 @@ class SQLiteGitHubStore:
             raise ValueError("earlier IssueThread event is unresolved")
 
     @staticmethod
-    def _claimed_event(row: sqlite3.Row, *, retrying: bool) -> ClaimedEvent:
+    def _claimed_event(
+        row: sqlite3.Row, *, retrying: bool, execution_id: str | None = None
+    ) -> ClaimedEvent:
         return ClaimedEvent(
             event_key=row["event_key"],
             thread_id=row["thread_id"],
@@ -4082,6 +4254,7 @@ class SQLiteGitHubStore:
             in_reply_to_id=row["in_reply_to_id"],
             pull_request_review_id=row["pull_request_review_id"],
             review_thread_root_id=row["review_thread_root_id"],
+            execution_id=execution_id,
         )
 
     def unconsumed_inputs(self, thread_id: str, *, after_event_key: str | None = None):

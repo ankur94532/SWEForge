@@ -301,3 +301,8 @@ produce multiple logical inputs, such as a clarification answer and a residual
 task. Each cycle persists both the originating `root_event_key` and the
 selected logical root identity so restart and later execution retain the same
 provenance and input selection.
+
+Executable state is scoped to the cycle and logical input. `SourceEvent` is
+provenance, not the unique identity of executable work; publication and
+post-cycle memory identity remain event-key compatible until the next
+migration milestone.

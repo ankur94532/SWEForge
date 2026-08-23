@@ -16,6 +16,7 @@ from sweforge.github_store import (
     InputPurpose,
     SQLiteGitHubStore,
     WorkflowPhase,
+    execution_id_for,
 )
 from sweforge.workflow import WorkflowEngine
 
@@ -314,6 +315,59 @@ def test_deferred_ids_from_one_source_event_are_consumed_independently(tmp_path)
         ).status
         == "QUEUED"
     )
+    store.close()
+
+
+def test_logical_executions_share_provenance_but_not_cycle_identity(tmp_path):
+    store, _repo, events = _store_with_cycle(tmp_path)
+    thread_id = store.source_event(events[0].event_key)["thread_id"]
+    ids = [
+        execution_id_for(thread_id=thread_id, cycle_id=cycle, root_input_id=logical)
+        for cycle, logical in ((2, "deferred-one"), (3, "deferred-two"))
+    ]
+    for execution_id, cycle, logical in zip(
+        ids, (2, 3), ("deferred-one", "deferred-two")
+    ):
+        store.connection.execute(
+            """INSERT INTO logical_executions(
+               execution_id, source_event_key, thread_id, cycle_id, root_input_id,
+               status, attempt_count, started_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (
+                execution_id,
+                events[1].event_key,
+                thread_id,
+                cycle,
+                logical,
+                "RUNNING",
+                1,
+                "same-time",
+            ),
+        )
+    store.connection.commit()
+    first = store.execution_for_cycle(
+        thread_id=thread_id,
+        cycle_id=2,
+        root_event_key=events[1].event_key,
+        root_input_id="deferred-one",
+    )
+    second = store.execution_for_cycle(
+        thread_id=thread_id,
+        cycle_id=3,
+        root_event_key=events[1].event_key,
+        root_input_id="deferred-two",
+    )
+    assert first["execution_id"] != second["execution_id"]
+    assert (
+        first["source_event_key"] == second["source_event_key"] == events[1].event_key
+    )
+    store.mark_execution_succeeded(
+        events[1].event_key,
+        execution_id=first["execution_id"],
+        completed_at="done",
+        response_text="one",
+        workspace_path="/one",
+    )
+    assert store.execution_for_id(second["execution_id"])["status"] == "RUNNING"
     store.close()
 
 

@@ -568,7 +568,16 @@ class WorkflowEngine:
         permit = self.store.permit(permit_id)
         if permit is None or permit.invalidated_at:
             raise ValueError("execution permit is unavailable")
-        execution = self.store.execution_for_event(permit.root_event_key)
+        execution = self.store.execution_for_cycle(
+            thread_id=permit.thread_id,
+            cycle_id=permit.cycle_id,
+            root_event_key=permit.root_event_key,
+            root_input_id=(
+                self.store.plan(permit.plan_id).root_input_id
+                if self.store.plan(permit.plan_id)
+                else None
+            ),
+        )
         reusable_retry = bool(
             permit.consumed_at and execution and execution["status"] == "RETRY_PENDING"
         )
@@ -733,7 +742,12 @@ class WorkflowEngine:
                     )
                 current = self.store.workflow_state(permit.thread_id)
                 if result.status == "SUCCEEDED":
-                    execution = self.store.execution_for_event(permit.root_event_key)
+                    execution = self.store.execution_for_cycle(
+                        thread_id=permit.thread_id,
+                        cycle_id=permit.cycle_id,
+                        root_event_key=permit.root_event_key,
+                        root_input_id=plan.root_input_id,
+                    )
                     self.store.finish_execution_attempt(
                         attempt.attempt_id,
                         status=AttemptStatus.SUCCEEDED,
@@ -1501,7 +1515,15 @@ class WorkflowEngine:
 
     def _recover_initial_execution(self, state: WorkflowStateRecord):
         """Recover only an INITIAL attempt from root execution evidence."""
-        execution = self.store.execution_for_event(state.root_event_key)
+        if hasattr(self.store, "execution_for_cycle"):
+            execution = self.store.execution_for_cycle(
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                root_event_key=state.root_event_key,
+                root_input_id=state.root_input_id,
+            )
+        else:
+            execution = self.store.execution_for_event(state.root_event_key)
         if not execution or execution["status"] != "SUCCEEDED":
             return state
         latest = self.store.latest_attempt(state.thread_id, state.cycle_id)
@@ -1642,7 +1664,12 @@ class WorkflowEngine:
         model: str,
     ) -> ExecutionReviewRecord:
         workspace = self.store.thread_workspace(state.thread_id)
-        execution = self.store.execution_for_event(state.root_event_key)
+        execution = self.store.execution_for_cycle(
+            thread_id=state.thread_id,
+            cycle_id=state.cycle_id,
+            root_event_key=state.root_event_key,
+            root_input_id=state.root_input_id,
+        )
         if execution is None or workspace is None:
             raise ValueError("review evidence is unavailable")
         evidence = {

@@ -195,6 +195,7 @@ def recover_stale(
             with thread_lock(lock_root, record.thread_id):
                 store.mark_execution_interrupted(
                     record.event_key,
+                    execution_id=record.execution_id,
                     completed_at=utc_timestamp(current),
                     error_message="executor lock was free after stale RUNNING claim",
                 )
@@ -265,6 +266,7 @@ def execute_one(
         error = _safe_error(exc)
         store.mark_execution_failed(
             event.event_key,
+            execution_id=event.execution_id,
             completed_at=utc_timestamp(clock()),
             error_message=error,
             workspace_path=None,
@@ -436,6 +438,7 @@ def _execute_claim(
         if persist_execution:
             store.mark_execution_succeeded(
                 event.event_key,
+                execution_id=event.execution_id,
                 completed_at=utc_timestamp(now()),
                 response_text=response,
                 workspace_path=str(workspace.path),
@@ -457,6 +460,7 @@ def _execute_claim(
         if persist_execution:
             store.mark_execution_failed(
                 event.event_key,
+                execution_id=event.execution_id,
                 completed_at=utc_timestamp(now()),
                 error_message=error,
                 workspace_path=str(workspace.path) if workspace else None,
