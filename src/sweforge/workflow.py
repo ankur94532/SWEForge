@@ -1293,11 +1293,8 @@ class WorkflowEngine:
             if not starts_with_agent_invocation(row["body"]):
                 continue
             if not self._clarification_target_matches(row, clarification):
-                self.store.defer_followup(
-                    source_event_key=row["event_key"],
-                    thread_id=state.thread_id,
-                    originating_cycle_id=state.cycle_id,
-                    queued_at=self.clock(),
+                self._route_clarification_input(
+                    state, row, deferred=True, status="DEFERRED"
                 )
                 continue
             answer = self._deterministic_clarification_answer(
@@ -1320,11 +1317,12 @@ class WorkflowEngine:
                         "UNRELATED_FOLLOWUP",
                         "CHANGES_SCOPE",
                     }:
-                        self.store.defer_followup(
-                            source_event_key=row["event_key"],
-                            thread_id=state.thread_id,
-                            originating_cycle_id=state.cycle_id,
-                            queued_at=self.clock(),
+                        self._route_clarification_input(
+                            state, row, deferred=True, status="DEFERRED"
+                        )
+                    elif classification.get("relationship") == "AMBIGUOUS":
+                        self._route_clarification_input(
+                            state, row, deferred=False, status="AMBIGUOUS"
                         )
                     continue
                 answer = classification.get("extracted_answer")
@@ -1349,6 +1347,31 @@ class WorkflowEngine:
                 now=self.clock(),
             )
             return
+
+    def _route_clarification_input(
+        self,
+        state: WorkflowStateRecord,
+        row,
+        *,
+        deferred: bool,
+        status: str,
+    ) -> None:
+        if deferred:
+            self.store.defer_followup(
+                source_event_key=row["event_key"],
+                thread_id=state.thread_id,
+                originating_cycle_id=state.cycle_id,
+                queued_at=self.clock(),
+                disposition_status=status,
+            )
+        else:
+            self.store.record_input_disposition(
+                row["event_key"],
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                status=status,
+                recorded_at=self.clock(),
+            )
 
     def acknowledge_live_inputs(
         self,

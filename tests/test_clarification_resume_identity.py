@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 from typing import Annotated, TypedDict
 
+import pytest
 from langchain_core.messages import AIMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -20,6 +21,7 @@ from sweforge.context import RepoAgentContext
 from sweforge.execution import SQLiteCheckpointer
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import ClarificationStatus, SQLiteGitHubStore, WorkflowPhase
+from sweforge.server import ServerConfig, SWEForgeServer
 from sweforge.workflow import WorkflowEngine
 
 THREAD_ID = "github:1:issue:7"
@@ -256,6 +258,164 @@ def test_resume_fails_closed_when_the_pending_occurrence_has_no_answer(
     assert pending.status == ClarificationStatus.OPEN.value
     checkpointer.close()
     store.close()
+
+
+def test_unrelated_clarification_input_is_deferred_and_routed_once(
+    tmp_path, monkeypatch
+):
+    resumed: list[tuple[str, str]] = []
+    store, engine, repo, permit, checkpointer, kwargs = clarification_fixture(
+        tmp_path, monkeypatch, resumed
+    )
+    engine.execute_authorized(permit_id=permit.permit_id, **kwargs)
+    calls = 0
+
+    def classify(**_):
+        nonlocal calls
+        calls += 1
+        return {"relationship": "UNRELATED_FOLLOWUP", "extracted_answer": ""}
+
+    engine.clarification_classifier = classify
+    event = answer(
+        store, engine, repo, "3", "@agent unrelated work", "2026-01-01T02:00:00Z"
+    )
+    engine._resolve_open_clarification(store.workflow_state(THREAD_ID))
+    engine._resolve_open_clarification(store.workflow_state(THREAD_ID))
+    assert calls == 1
+    assert len(store.deferred_followups(THREAD_ID)) == 1
+    assert (
+        store.clarification_for_thread(THREAD_ID).status
+        == ClarificationStatus.OPEN.value
+    )
+    assert not store.is_thread_runnable(THREAD_ID, now=FIXED_CLOCK)
+    disposition = store.input_consumption(event.event_key)
+    assert disposition.purpose.value == "CLARIFICATION_ROUTED"
+    checkpointer.close()
+    store.close()
+
+
+def test_ambiguous_clarification_input_is_routed_once_and_later_answer_wakes(
+    tmp_path, monkeypatch
+):
+    resumed: list[tuple[str, str]] = []
+    store, engine, repo, permit, checkpointer, kwargs = clarification_fixture(
+        tmp_path, monkeypatch, resumed
+    )
+    engine.execute_authorized(permit_id=permit.permit_id, **kwargs)
+    clarification_id = store.clarification_for_thread(THREAD_ID).clarification_id
+    calls = 0
+
+    def classify(**_):
+        nonlocal calls
+        calls += 1
+        return {"relationship": "AMBIGUOUS", "extracted_answer": ""}
+
+    engine.clarification_classifier = classify
+    ambiguous = answer(
+        store,
+        engine,
+        repo,
+        "3",
+        "@agent probably the first one",
+        "2026-01-01T02:00:00Z",
+    )
+    engine._resolve_open_clarification(store.workflow_state(THREAD_ID))
+    engine._resolve_open_clarification(store.workflow_state(THREAD_ID))
+    assert calls == 1
+    assert store.input_consumption(ambiguous.event_key).purpose.value == (
+        "CLARIFICATION_ROUTED"
+    )
+    assert (
+        store.clarification_for_thread(THREAD_ID).status
+        == ClarificationStatus.OPEN.value
+    )
+    assert not store.is_thread_runnable(THREAD_ID, now=FIXED_CLOCK)
+
+    valid = source_event(repo, "4", "@agent us-east-1", "2026-01-01T03:00:00Z")
+    store.record_batch(
+        1, "issue_comments", [valid], since="now", etag=None, polled_at="now"
+    )
+    assert store.is_thread_runnable(THREAD_ID, now=FIXED_CLOCK)
+    engine.clarification_classifier = lambda **_: {
+        "relationship": "ANSWERS_CLARIFICATION",
+        "extracted_answer": "us-east-1",
+    }
+    engine._resolve_open_clarification(store.workflow_state(THREAD_ID))
+    assert (
+        store.clarification(clarification_id).status
+        == ClarificationStatus.ANSWERED.value
+    )
+    assert store.workflow_state(THREAD_ID).phase == WorkflowPhase.EXECUTION_READY
+    checkpointer.close()
+    store.close()
+
+
+@pytest.mark.parametrize("relationship", ["UNRELATED_FOLLOWUP", "AMBIGUOUS"])
+def test_once_terminates_after_disposing_human_wait_input(
+    tmp_path, monkeypatch, relationship
+):
+    resumed: list[tuple[str, str]] = []
+    store, engine, repo, permit, checkpointer, _kwargs = clarification_fixture(
+        tmp_path, monkeypatch, resumed
+    )
+    engine.execute_authorized(permit_id=permit.permit_id, **_kwargs)
+    event = source_event(
+        repo, "3", "@agent probably the first one", "2026-01-01T02:00:00Z"
+    )
+    store.record_batch(
+        1, "issue_comments", [event], since="now", etag=None, polled_at="now"
+    )
+    state_db = store.path
+    store.close()
+    checkpointer.close()
+    calls = 0
+
+    def worker(thread_id):
+        nonlocal calls
+        worker_store = SQLiteGitHubStore(state_db)
+
+        def classify(**_):
+            nonlocal calls
+            calls += 1
+            return {"relationship": relationship, "extracted_answer": ""}
+
+        worker_engine = WorkflowEngine(
+            store=worker_store, clarification_classifier=classify
+        )
+        worker_engine._resolve_open_clarification(
+            worker_store.workflow_state(thread_id)
+        )
+        worker_store.close()
+
+    class Poller:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def poll(self, repositories):
+            return None
+
+    class Client:
+        def close(self):
+            pass
+
+    config = ServerConfig(
+        repositories=(repo.full_name,),
+        repo_paths={repo.full_name: tmp_path},
+        db=state_db,
+        model="test-model",
+        once=True,
+    )
+    SWEForgeServer(
+        config,
+        client_factory=lambda _: (Client(), None),
+        poller_factory=Poller,
+        worker_runner=worker,
+    ).run()
+    assert calls == 1
+    final_store = SQLiteGitHubStore(state_db)
+    assert not final_store.is_thread_runnable("github:1:issue:7", now=FIXED_CLOCK)
+    assert final_store.input_consumption(event.event_key) is not None
+    final_store.close()
 
 
 def test_answered_clarification_lookup_is_occurrence_exact(tmp_path, monkeypatch):

@@ -479,6 +479,7 @@ class InputPurpose(StrEnum):
     PLANNING_INPUT = "PLANNING_INPUT"
     CLARIFICATION_RESPONSE = "CLARIFICATION_RESPONSE"
     DEFERRED_FOLLOWUP = "DEFERRED_FOLLOWUP"
+    CLARIFICATION_ROUTED = "CLARIFICATION_ROUTED"
 
 
 class ClarificationStatus(StrEnum):
@@ -5337,6 +5338,7 @@ class SQLiteGitHubStore:
         originating_cycle_id: int,
         queued_at: str,
         residual_text: str | None = None,
+        disposition_status: str | None = None,
     ) -> DeferredFollowupRecord:
         deferred_id = (
             "deferred-"
@@ -5359,7 +5361,51 @@ class SQLiteGitHubStore:
                     queued_at,
                 ),
             )
+            if disposition_status is not None:
+                db.execute(
+                    """INSERT INTO thread_input_consumptions(
+                       event_key, thread_id, cycle_id, purpose, status,
+                       claimed_at, consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(event_key) DO NOTHING""",
+                    (
+                        source_event_key,
+                        thread_id,
+                        originating_cycle_id,
+                        InputPurpose.CLARIFICATION_ROUTED.value,
+                        disposition_status,
+                        queued_at,
+                        queued_at,
+                    ),
+                )
         return self.deferred_followup(source_event_key, deferred_id=deferred_id)  # type: ignore[return-value]
+
+    def record_input_disposition(
+        self,
+        event_key: str,
+        *,
+        thread_id: str,
+        cycle_id: int,
+        status: str,
+        recorded_at: str,
+    ) -> WorkflowInputRecord:
+        """Durably remove one routed human input from current-wait candidates."""
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO thread_input_consumptions(
+                   event_key, thread_id, cycle_id, purpose, status, claimed_at,
+                   consumed_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(event_key) DO NOTHING""",
+                (
+                    event_key,
+                    thread_id,
+                    cycle_id,
+                    InputPurpose.CLARIFICATION_ROUTED.value,
+                    status,
+                    recorded_at,
+                    recorded_at,
+                ),
+            )
+        return self.input_consumption(event_key)  # type: ignore[return-value]
 
     def deferred_followup(
         self, source_event_key: str, *, deferred_id: str | None = None
@@ -5757,13 +5803,12 @@ class SQLiteGitHubStore:
         if phase == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL:
             if state.mode == WorkflowMode.AUTO:
                 return True
-            return any(
-                is_exact_agent_approval(item["body"])
-                or is_actionable_source_event(item["source_kind"], item["body"])
-                for item in pending
-            )
+            plan = self.current_plan(thread_id)
+            if plan is None or not plan.posted_at:
+                return False
+            return any(self._current_plan_input(item, state, plan) for item in pending)
         if phase == WorkflowPhase.WAITING_FOR_INPUT:
-            return actionable
+            return any(self._current_wait_input(item, state) for item in pending)
         if phase == WorkflowPhase.AWAITING_PUBLICATION:
             publication = self.publication_for_cycle(
                 thread_id=thread_id,
@@ -5775,3 +5820,36 @@ class SQLiteGitHubStore:
                 return self.publication_target(thread_id) is not None
             return publication.status in RESUMABLE_PUBLICATION_STATUSES
         return False
+
+    @staticmethod
+    def _same_conversation_target(item, state) -> bool:
+        if item["origin_surface"] != state.response_surface:
+            return False
+        if item["subject_number"] != state.response_subject_number:
+            return False
+        if state.response_surface == "PR_INLINE_REVIEW":
+            return item["review_thread_root_id"] == state.review_thread_root_id
+        return True
+
+    @staticmethod
+    def _after_posted_at(item, posted_at: str) -> bool:
+        try:
+            created = datetime.fromisoformat(
+                (item["source_created_at"] or "").replace("Z", "+00:00")
+            )
+            posted = datetime.fromisoformat(posted_at.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return False
+        return created > posted
+
+    def _current_plan_input(self, item, state, plan) -> bool:
+        return (
+            self._same_conversation_target(item, state)
+            and self._after_posted_at(item, plan.posted_at)
+            and starts_with_agent_invocation(item["body"])
+        )
+
+    def _current_wait_input(self, item, state) -> bool:
+        return self._same_conversation_target(
+            item, state
+        ) and starts_with_agent_invocation(item["body"])
