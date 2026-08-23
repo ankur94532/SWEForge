@@ -504,3 +504,21 @@ retained, the SourceEvent stays as provenance, and reopening is idempotent.
 Event-key lookups survive as diagnostics (`publication_for_event`,
 `repo_memory_learning`) and fail closed when a SourceEvent turns out to back
 more than one lifecycle.
+
+### Running the durable dispatcher
+
+`sweforge-serve` runs polling and workflow advancement in one process. It uses
+one SQLite state database, a bounded worker pool, a host-local singleton lock,
+and separate SQLite resources per worker. `--once` performs one poll, drains
+the discovered work, and exits; normal mode keeps polling until interrupted.
+
+```bash
+sweforge-serve --repo-path owner/repository=/path/to/checkout \
+  --model provider/model --once
+```
+
+Use `--planning-model`, `--execution-model`, and `--review-model` to set role
+models independently. Worker failures are persisted with bounded exponential
+backoff, so restarting the process does not create a retry storm. GitHub
+credentials use the same App or legacy-token environment variables as the
+one-shot poll/workflow commands; secrets are never printed.

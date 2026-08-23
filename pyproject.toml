@@ -18,6 +18,7 @@ sweforge-github-poll = "sweforge.github_poll_cli:main"
 sweforge-github-workflow = "sweforge.workflow_cli:main"
 sweforge-github-execution = "sweforge.github_execution_cli:main"
 sweforge-github-publish = "sweforge.github_publish_cli:main"
+sweforge-serve = "sweforge.server_cli:main"
 sweforge-repo-memory = "sweforge.repo_memory_cli:main"
 sweforge-repo-skills = "sweforge.skills_cli:main"
 

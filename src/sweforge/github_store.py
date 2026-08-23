@@ -10,7 +10,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
@@ -164,6 +164,13 @@ CREATE TABLE IF NOT EXISTS issue_workflow_state (
     review_thread_root_id TEXT,
     planning_feedback_event_key TEXT REFERENCES source_events(event_key),
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS dispatcher_failures (
+    thread_id TEXT PRIMARY KEY REFERENCES issue_threads(thread_id),
+    failure_count INTEGER NOT NULL,
+    next_eligible_at TEXT NOT NULL,
+    last_error TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS issue_plans (
@@ -5652,3 +5659,92 @@ class SQLiteGitHubStore:
         return self.connection.execute(
             "SELECT * FROM issue_threads ORDER BY repo_id, issue_number"
         ).fetchall()
+
+    def dispatcher_failure(self, thread_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM dispatcher_failures WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
+
+    def record_dispatcher_failure(
+        self, thread_id: str, *, now: str, error: str, base_seconds: int = 5
+    ) -> None:
+        """Persist bounded worker backoff so restarts cannot hot-loop a failure."""
+        with self.transaction(immediate=True) as db:
+            row = db.execute(
+                "SELECT failure_count FROM dispatcher_failures WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            count = int(row[0]) + 1 if row else 1
+            delay = min(3600, base_seconds * (2 ** min(count - 1, 10)))
+            current = datetime.fromisoformat(now.replace("Z", "+00:00"))
+            eligible = (current + timedelta(seconds=delay)).isoformat().replace(
+                "+00:00", "Z"
+            )
+            db.execute(
+                "INSERT INTO dispatcher_failures "
+                "(thread_id, failure_count, next_eligible_at, last_error, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(thread_id) DO UPDATE SET failure_count=excluded.failure_count, "
+                "next_eligible_at=excluded.next_eligible_at, last_error=excluded.last_error, "
+                "updated_at=excluded.updated_at",
+                (thread_id, count, eligible, error[:1000], now),
+            )
+
+    def clear_dispatcher_failure(self, thread_id: str) -> None:
+        with self.transaction(immediate=True) as db:
+            db.execute("DELETE FROM dispatcher_failures WHERE thread_id = ?", (thread_id,))
+
+    def runnable_thread_ids(self, *, now: str, limit: int | None = None) -> list[str]:
+        """Return durable work candidates in stable update-time order.
+
+        Waiting states are selected only when an unconsumed @agent input can
+        change them.  This is deliberately a conservative query: a worker may
+        still decide that an input is stale or irrelevant, but unchanged waits
+        are never repeatedly submitted to the model.
+        """
+        rows = self.connection.execute(
+            "SELECT t.thread_id, t.updated_at, s.phase, s.mode "
+            "FROM issue_threads AS t LEFT JOIN issue_workflow_state AS s "
+            "ON s.thread_id = t.thread_id "
+            "LEFT JOIN dispatcher_failures AS f ON f.thread_id = t.thread_id "
+            "WHERE f.thread_id IS NULL OR f.next_eligible_at <= ? "
+            "ORDER BY COALESCE(s.updated_at, t.updated_at), t.thread_id",
+            (now,),
+        ).fetchall()
+        selected: list[str] = []
+        active = {
+            WorkflowPhase.PLANNING.value,
+            WorkflowPhase.EXECUTION_READY.value,
+            WorkflowPhase.EXECUTING.value,
+            WorkflowPhase.AWAITING_PUBLICATION.value,
+            WorkflowPhase.REVIEW_EXECUTION.value,
+            WorkflowPhase.REPAIR_READY.value,
+        }
+        for row in rows:
+            phase = row["phase"]
+            pending = self.unconsumed_inputs(row["thread_id"])
+            actionable = any(
+                starts_with_agent_invocation(item["body"]) for item in pending
+            )
+            if phase in active or (
+                phase in {
+                    None,
+                    WorkflowPhase.IDLE.value,
+                    WorkflowPhase.WAITING_FOR_PLAN_APPROVAL.value,
+                    WorkflowPhase.WAITING_FOR_INPUT.value,
+                }
+                and (
+                    actionable
+                    or (
+                        phase == WorkflowPhase.IDLE.value
+                        and (
+                            self.pending_memory_learning(row["thread_id"]) is not None
+                            or self.pending_issue_resolution(row["thread_id"]) is not None
+                        )
+                    )
+                )
+            ):
+                selected.append(row["thread_id"])
+                if limit is not None and len(selected) >= limit:
+                    break
+        return selected
