@@ -72,6 +72,7 @@ class TaskRunner(Protocol):
         repo_memory_proposal_sink: Callable[..., str] | None = None,
         issue_memory_search: Callable[[str, int], str] | None = None,
         execution_evidence_sink: Callable[..., Any] | None = None,
+        repair_mode: bool = False,
     ) -> str: ...
 
 
@@ -226,6 +227,7 @@ def execute_one(
     issue_memory_search: Callable[[str, int], str] | None = None,
     clarification_enabled: bool = True,
     execution_evidence_sink: Callable[..., Any] | None = None,
+    repair_mode: bool = False,
 ) -> ExecutionResult:
     clock = now or (lambda: datetime.now(UTC))
     event = store.claim_next_event(now=utc_timestamp(clock()))
@@ -312,6 +314,7 @@ def _execute_claim(
     issue_memory_search: Callable[[str, int], str] | None = None,
     clarification_enabled: bool = True,
     execution_evidence_sink: Callable[..., Any] | None = None,
+    repair_mode: bool = False,
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
     try:
@@ -411,6 +414,7 @@ def _execute_claim(
             "secure_execution": secure_execution,
             "unsafe_local_shell": unsafe_local_shell,
             "execution_evidence_sink": execution_evidence_sink,
+            "repair_mode": repair_mode,
             "resume_value": resume_value,
             "resume_resolver": resume_resolver,
         }

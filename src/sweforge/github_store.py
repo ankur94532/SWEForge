@@ -228,6 +228,7 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
     created_at TEXT NOT NULL,
     completed_at TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
+    repair_recovery_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE(thread_id, cycle_id, attempt_number)
 );
 CREATE TABLE IF NOT EXISTS execution_tool_evidence (
@@ -558,6 +559,9 @@ MAX_MEMORY_LEARNING_ATTEMPTS = 3
 # recovery fails closed, which bounds the spend of a permanently crashing run.
 MAX_INITIAL_EXECUTION_RECOVERIES = 3
 
+# Crash recovery is bounded separately from executions started for an attempt.
+MAX_REPAIR_EXECUTION_RECOVERIES = 3
+
 # Historical case generation is model-dependent, so it is bounded the same way.
 MAX_ISSUE_RESOLUTION_ATTEMPTS = 3
 
@@ -735,6 +739,7 @@ class ExecutionAttemptRecord:
     created_at: str
     completed_at: str | None
     retry_count: int
+    repair_recovery_count: int
 
 
 @dataclass(frozen=True)
@@ -1107,6 +1112,15 @@ class SQLiteGitHubStore:
         }.items():
             if column not in review_columns:
                 self.connection.execute(statement)
+        attempt_columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(execution_attempts)")
+        }
+        if "repair_recovery_count" not in attempt_columns:
+            self.connection.execute(
+                "ALTER TABLE execution_attempts ADD COLUMN "
+                "repair_recovery_count INTEGER NOT NULL DEFAULT 0"
+            )
         repair_columns = {
             row[1]
             for row in self.connection.execute(
@@ -2876,6 +2890,7 @@ class SQLiteGitHubStore:
             created_at=row["created_at"],
             completed_at=row["completed_at"],
             retry_count=row["retry_count"],
+            repair_recovery_count=row["repair_recovery_count"],
         )
 
     def execution_attempt(self, attempt_id: str) -> ExecutionAttemptRecord | None:
@@ -3621,8 +3636,14 @@ class SQLiteGitHubStore:
                 (AttemptStatus.FAILED.value, now, attempt_id),
             )
             db.execute(
+                "UPDATE review_repair_permits SET invalidated_at=? "
+                "WHERE permit_id=(SELECT authorization_id FROM execution_attempts WHERE attempt_id=?) "
+                "AND consumed_at IS NULL",
+                (now, attempt_id),
+            )
+            db.execute(
                 "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=(SELECT thread_id FROM execution_attempts WHERE attempt_id=?)",
-                (WorkflowPhase.REPAIR_READY.value, now, attempt_id),
+                (WorkflowPhase.REVIEW_BLOCKED.value, now, attempt_id),
             )
 
     def recover_orphaned_repair_attempt(self, attempt_id: str, *, now: str) -> None:
@@ -3702,14 +3723,30 @@ class SQLiteGitHubStore:
                 or latest["attempt_id"] != attempt["attempt_id"]
             ):
                 raise ValueError("orphaned repair attempt binding is stale")
-            db.execute(
-                "UPDATE execution_attempts SET status=?,completed_at=? WHERE attempt_id=?",
-                (AttemptStatus.FAILED.value, now, attempt_id),
-            )
-            db.execute(
-                "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
-                (WorkflowPhase.REPAIR_READY.value, now, attempt["thread_id"]),
-            )
+            if attempt["repair_recovery_count"] >= MAX_REPAIR_EXECUTION_RECOVERIES:
+                db.execute(
+                    "UPDATE execution_attempts SET status=?,completed_at=? WHERE attempt_id=?",
+                    (AttemptStatus.FAILED.value, now, attempt_id),
+                )
+                db.execute(
+                    "UPDATE review_repair_permits SET invalidated_at=? "
+                    "WHERE permit_id=? AND consumed_at IS NULL",
+                    (now, attempt["authorization_id"]),
+                )
+                db.execute(
+                    "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
+                    (WorkflowPhase.REVIEW_BLOCKED.value, now, attempt["thread_id"]),
+                )
+            else:
+                db.execute(
+                    "UPDATE execution_attempts SET repair_recovery_count=repair_recovery_count+1, "
+                    "status=?,completed_at=? WHERE attempt_id=?",
+                    (AttemptStatus.FAILED.value, now, attempt_id),
+                )
+                db.execute(
+                    "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
+                    (WorkflowPhase.REPAIR_READY.value, now, attempt["thread_id"]),
+                )
 
     def recover_orphaned_initial_attempt(
         self, attempt_id: str, *, now: str, max_recoveries: int

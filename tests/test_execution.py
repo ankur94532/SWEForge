@@ -108,6 +108,32 @@ def test_run_task_uses_native_checkpointer_and_thread_config(monkeypatch):
     assert calls["invoke"][1] == {"configurable": {"thread_id": "github:1:issue:7"}}
 
 
+def test_repair_mode_removes_delegation_target(monkeypatch):
+    created = []
+
+    class FakeAgent:
+        def invoke(self, state, config=None, durability=None):
+            return {"messages": [SimpleNamespace(content="done")]}
+
+    def fake_create(**kwargs):
+        created.append(kwargs)
+        return FakeAgent()
+
+    monkeypatch.setattr("sweforge.agent.create_deep_agent", fake_create)
+    common = dict(
+        model="provider:model",
+        worktree="/tmp/worktree",
+        task="repair it",
+        thread_id="github:1:issue:7",
+        checkpointer=None,
+    )
+    run_task(**common)
+    run_task(**common, repair_mode=True)
+    assert len(created[0]["subagents"]) == 1
+    assert created[1]["subagents"] == []
+    assert "do not delegate" in created[1]["system_prompt"]
+
+
 def test_normalize_task_removes_only_invocation_token():
     assert normalize_task("@agent fix the failing test") == "fix the failing test"
     assert normalize_task("Please @AGENT investigate this") == "Please investigate this"

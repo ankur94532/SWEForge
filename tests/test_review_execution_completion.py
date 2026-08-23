@@ -762,6 +762,18 @@ def test_sqlite_orphaned_repair_recovery_validates_parent_attempt(tmp_path):
     assert latest is not None
     assert latest.attempt_id == bound.attempt_id
 
+    store.mark_repair_attempt_failed(bound.attempt_id, now="2026-01-01T00:03:00Z")
+    assert (
+        store.workflow_state("github:1:issue:7").phase == WorkflowPhase.REVIEW_BLOCKED
+    )
+    terminal_permit = store.repair_permit(permit.permit_id)
+    assert terminal_permit is not None
+    assert terminal_permit.invalidated_at is not None
+    with pytest.raises(ValueError, match="unavailable"):
+        store.begin_or_resume_repair_attempt(
+            permit.permit_id, now="2026-01-01T00:04:00Z"
+        )
+
 
 @pytest.mark.parametrize("verdict", ["ACCEPT", "NEEDS_FIXES", "BLOCKED"])
 def test_review_result_verdicts_are_bounded(verdict):

@@ -211,6 +211,7 @@ def run_task(
     repo_memory_proposal_sink: Callable[..., str] | None = None,
     issue_memory_search: Callable[[str, int], str] | None = None,
     execution_evidence_sink: Callable[..., Any] | None = None,
+    repair_mode: bool = False,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
@@ -353,22 +354,26 @@ def run_task(
     # knowledge and interrupting for a human stay with the main agent, which
     # owns the lifecycle.  Overriding the default subagent is what withholds
     # them; by default deepagents grants a subagent every parent tool.
-    subagents = [
-        {
-            "name": "general-purpose",
-            "description": (
-                "Read-only investigator for researching questions, searching "
-                "code and gathering evidence. Returns a written report; it "
-                "cannot propose repository memory or ask the human anything."
-            ),
-            "system_prompt": (
-                "Investigate the request within this repository worktree and "
-                "report concise, concrete findings with file paths and line "
-                "numbers. Do not modify application state."
-            ),
-            "tools": [*mcp_tools, *research_tools],
-        }
-    ]
+    subagents = (
+        []
+        if repair_mode
+        else [
+            {
+                "name": "general-purpose",
+                "description": (
+                    "Read-only investigator for researching questions, searching "
+                    "code and gathering evidence. Returns a written report; it "
+                    "cannot propose repository memory or ask the human anything."
+                ),
+                "system_prompt": (
+                    "Investigate the request within this repository worktree and "
+                    "report concise, concrete findings with file paths and line "
+                    "numbers. Do not modify application state."
+                ),
+                "tools": [*mcp_tools, *research_tools],
+            }
+        ]
+    )
     agent = create_deep_agent(
         model=model,
         tools=[*mcp_tools, *clarification_tools, *memory_tools, *research_tools],
@@ -382,6 +387,12 @@ def run_task(
             "working directory, so use relative repository paths in shell commands "
             "rather than virtual absolute paths. "
             "Summarize what you changed and any validation results."
+            + (
+                " This is a repair execution: perform the authorized repair directly; "
+                "do not delegate work to another agent."
+                if repair_mode
+                else ""
+            )
         ),
         memory=memory,
         skills=[SKILLS_VIRTUAL_PATH]

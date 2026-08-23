@@ -1133,6 +1133,7 @@ class WorkflowEngine:
                     secure_execution=secure_execution,
                     unsafe_local_shell=unsafe_local_shell,
                     execution_evidence_sink=record_execution_evidence,
+                    repair_mode=True,
                 )
                 for event_key in delivered:
                     self._acknowledge_delivered(
