@@ -680,6 +680,23 @@ class ReviewRepairPermit:
 
 
 class SQLiteGitHubStore:
+    @staticmethod
+    def _execution_target(
+        db: sqlite3.Connection, *, thread_id: str, cycle_id: int, root_event_key: str
+    ) -> str:
+        row = db.execute(
+            """SELECT root_input_id FROM issue_plans
+               WHERE thread_id=? AND cycle_id=?
+               ORDER BY version DESC LIMIT 1""",
+            (thread_id, cycle_id),
+        ).fetchone()
+        root_input_id = (row["root_input_id"] if row else None) or root_event_key
+        if root_input_id == root_event_key:
+            return root_event_key
+        return execution_id_for(
+            thread_id=thread_id, cycle_id=cycle_id, root_input_id=root_input_id
+        )
+
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).expanduser()
         if str(self.path) != ":memory:":
@@ -1452,16 +1469,38 @@ class SQLiteGitHubStore:
                     "AND invalidated_at IS NULL",
                     (event_key,),
                 )
-            db.execute(
-                """UPDATE issue_workflow_state SET phase = ?, updated_at = ?
-                   WHERE root_event_key = ? AND phase = ?""",
-                (
-                    WorkflowPhase.EXECUTION_READY.value,
-                    datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-                    event_key,
-                    WorkflowPhase.EXECUTING.value,
-                ),
-            )
+            timestamp = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            if logical:
+                cursor = db.execute(
+                    """UPDATE issue_workflow_state SET phase=?, updated_at=?
+                       WHERE thread_id=(SELECT thread_id FROM logical_executions WHERE execution_id=?)
+                         AND cycle_id=(SELECT cycle_id FROM logical_executions WHERE execution_id=?)
+                         AND root_input_id=(SELECT root_input_id FROM logical_executions WHERE execution_id=?)
+                         AND phase=?""",
+                    (
+                        WorkflowPhase.EXECUTION_READY.value,
+                        timestamp,
+                        event_key,
+                        event_key,
+                        event_key,
+                        WorkflowPhase.EXECUTING.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError(
+                        "logical execution is not the current retry target"
+                    )
+            else:
+                db.execute(
+                    """UPDATE issue_workflow_state SET phase = ?, updated_at = ?
+                       WHERE root_event_key = ? AND phase = ?""",
+                    (
+                        WorkflowPhase.EXECUTION_READY.value,
+                        timestamp,
+                        event_key,
+                        WorkflowPhase.EXECUTING.value,
+                    ),
+                )
             return ExecutionStatus.RETRY_PENDING
 
     def skip_execution(self, event_key: str, *, completed_at: str, reason: str) -> None:
@@ -1563,9 +1602,24 @@ class SQLiteGitHubStore:
         self, *, permit_id: str, event_key: str, now: str
     ) -> None:
         with self.transaction(immediate=True) as db:
+            permit = db.execute(
+                """SELECT p.thread_id, p.cycle_id, p.root_event_key
+                   FROM execution_permits p WHERE p.permit_id=?""",
+                (permit_id,),
+            ).fetchone()
+            target = (
+                self._execution_target(
+                    db,
+                    thread_id=permit["thread_id"],
+                    cycle_id=permit["cycle_id"],
+                    root_event_key=permit["root_event_key"],
+                )
+                if permit
+                else event_key
+            )
             self._update_execution(
                 db,
-                event_key,
+                target,
                 ExecutionStatus.INTERRUPTED,
                 completed_at=now,
                 response_text=None,
@@ -1624,14 +1678,26 @@ class SQLiteGitHubStore:
                 (row["thread_id"], row["cycle_id"]),
             ).fetchone()
             if permit:
+                target = self._execution_target(
+                    db,
+                    thread_id=row["thread_id"],
+                    cycle_id=row["cycle_id"],
+                    root_event_key=permit["root_event_key"],
+                )
                 db.execute(
                     "UPDATE execution_permits SET consumed_at=NULL WHERE permit_id=?",
                     (permit["permit_id"],),
                 )
+                table = (
+                    "logical_executions"
+                    if target.startswith("execution-")
+                    else "event_executions"
+                )
+                key = "execution_id" if table == "logical_executions" else "event_key"
                 db.execute(
-                    "UPDATE event_executions SET status=?, completed_at=NULL, "
-                    "error_message=NULL WHERE event_key=?",
-                    (ExecutionStatus.RETRY_PENDING.value, permit["root_event_key"]),
+                    f"UPDATE {table} SET status=?, completed_at=NULL, "
+                    f"error_message=NULL WHERE {key}=?",
+                    (ExecutionStatus.RETRY_PENDING.value, target),
                 )
                 db.execute(
                     "UPDATE issue_workflow_state SET phase=?, updated_at=? WHERE thread_id=?",
@@ -1708,14 +1774,26 @@ class SQLiteGitHubStore:
                 (row["thread_id"], row["cycle_id"]),
             ).fetchone()
             if permit:
+                target = self._execution_target(
+                    db,
+                    thread_id=row["thread_id"],
+                    cycle_id=row["cycle_id"],
+                    root_event_key=permit["root_event_key"],
+                )
                 db.execute(
                     "UPDATE execution_permits SET consumed_at=NULL WHERE permit_id=?",
                     (permit["permit_id"],),
                 )
+                table = (
+                    "logical_executions"
+                    if target.startswith("execution-")
+                    else "event_executions"
+                )
+                key = "execution_id" if table == "logical_executions" else "event_key"
                 db.execute(
-                    "UPDATE event_executions SET status=?, completed_at=NULL, "
-                    "error_message=NULL WHERE event_key=?",
-                    (ExecutionStatus.RETRY_PENDING.value, permit["root_event_key"]),
+                    f"UPDATE {table} SET status=?, completed_at=NULL, "
+                    f"error_message=NULL WHERE {key}=?",
+                    (ExecutionStatus.RETRY_PENDING.value, target),
                 )
                 db.execute(
                     "UPDATE issue_workflow_state SET phase=?, updated_at=? WHERE thread_id=?",

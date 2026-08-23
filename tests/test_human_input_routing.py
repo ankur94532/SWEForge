@@ -121,6 +121,40 @@ def test_planning_delivers_and_acknowledges_sibling_deferred_ids_exactly(tmp_pat
     store.close()
 
 
+def test_next_workflow_input_preserves_deferred_identity(tmp_path):
+    store, _repo, events = _store_with_cycle(tmp_path)
+    thread_id = store.source_event(events[0].event_key)["thread_id"]
+    first = store.defer_followup(
+        source_event_key=events[1].event_key,
+        thread_id=thread_id,
+        originating_cycle_id=1,
+        queued_at="one",
+        residual_text="first",
+    )
+    second = store.defer_followup(
+        source_event_key=events[1].event_key,
+        thread_id=thread_id,
+        originating_cycle_id=1,
+        queued_at="two",
+        residual_text="second",
+    )
+    engine = WorkflowEngine(store=store)
+    selected = engine.next_workflow_input(thread_id)
+    assert selected is not None
+    assert selected.input_id == first.deferred_id
+    assert selected.source_event_key == second.source_event_key
+    engine._acknowledge_delivered(
+        first.deferred_id,
+        thread_id=thread_id,
+        cycle_id=1,
+        purpose=InputPurpose.PLANNING_INPUT,
+    )
+    selected = engine.next_workflow_input(thread_id)
+    assert selected is not None
+    assert selected.input_id == second.deferred_id
+    store.close()
+
+
 def test_clarification_answer_and_replay_state_are_durable(tmp_path):
     store, _repo, events = _store_with_cycle(tmp_path)
     thread_id = store.source_event(events[0].event_key)["thread_id"]

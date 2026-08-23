@@ -71,6 +71,13 @@ MAX_REPAIR_REVIEW_CHARS = 30_000
 MAX_REPAIR_TASK_CHARS = 50_000
 
 
+@dataclass(frozen=True)
+class WorkflowInputRef:
+    input_id: str
+    source_event_key: str
+    body: str
+
+
 def is_exact_approval(body: str) -> bool:
     """Only the complete ``@agent approve`` command authorizes a plan."""
     return is_exact_agent_approval(body)
@@ -1616,7 +1623,7 @@ class WorkflowEngine:
                 return state, True
         return self._recover_initial_execution(state), False
 
-    def next_root(self, thread_id: str) -> str | None:
+    def next_workflow_input(self, thread_id: str) -> WorkflowInputRef | None:
         state = self.store.workflow_state(thread_id)
         self._drain_approval_controls(thread_id, state)
         if state:
@@ -1629,9 +1636,19 @@ class WorkflowEngine:
             self.store.unconsumed_inputs(thread_id, after_event_key=after)
         )
         for row in candidates:
+            logical_id = (
+                row["deferred_id"] if "deferred_id" in row.keys() else row["event_key"]
+            )
+            if logical_id.startswith("deferred-"):
+                return WorkflowInputRef(logical_id, row["event_key"], row["body"])
             if self.store.execution_for_event(row["event_key"]) is None:
-                return row["event_key"]
+                return WorkflowInputRef(logical_id, row["event_key"], row["body"])
         return None
+
+    def next_root(self, thread_id: str) -> str | None:
+        """Compatibility wrapper; new scheduling must use next_workflow_input."""
+        ref = self.next_workflow_input(thread_id)
+        return ref.source_event_key if ref else None
 
     def begin_next_cycle(self, *, thread_id: str, **plan_kwargs) -> PlanRecord | None:
         state = self.store.workflow_state(thread_id)
