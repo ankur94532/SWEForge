@@ -735,6 +735,15 @@ class WorkflowEngine:
                     created_at=utc_timestamp(clock()),
                 )
 
+                def record_execution_evidence(**observation) -> None:
+                    self.store.record_execution_tool_evidence(
+                        attempt_id=attempt.attempt_id,
+                        thread_id=permit.thread_id,
+                        cycle_id=permit.cycle_id,
+                        kind="SHELL",
+                        **observation,
+                    )
+
                 def resolve_resume(pending: tuple[dict, ...]):
                     """Answer the interrupt that is pending, or nothing at all.
 
@@ -869,6 +878,7 @@ class WorkflowEngine:
                     sandbox_backend_provider=sandbox_backend_provider,
                     secure_execution=secure_execution,
                     unsafe_local_shell=unsafe_local_shell,
+                    execution_evidence_sink=record_execution_evidence,
                 )
                 for event_key in delivered:
                     self._acknowledge_delivered(
@@ -1086,6 +1096,16 @@ class WorkflowEngine:
                     expected_thread_id=permit.thread_id,
                     now=utc_timestamp(clock()),
                 )
+
+                def record_execution_evidence(**observation) -> None:
+                    self.store.record_execution_tool_evidence(
+                        attempt_id=attempt.attempt_id,
+                        thread_id=permit.thread_id,
+                        cycle_id=permit.cycle_id,
+                        kind="SHELL",
+                        **observation,
+                    )
+
                 result = _execute_claim(
                     store=self.store,
                     event=event,
@@ -1112,6 +1132,7 @@ class WorkflowEngine:
                     sandbox_backend_provider=sandbox_backend_provider,
                     secure_execution=secure_execution,
                     unsafe_local_shell=unsafe_local_shell,
+                    execution_evidence_sink=record_execution_evidence,
                 )
                 for event_key in delivered:
                     self._acknowledge_delivered(
@@ -2154,6 +2175,12 @@ class WorkflowEngine:
             "attempt": attempt.__dict__,
             "current_head": execution["end_head_sha"],
             "base_head": workspace.base_commit,
+            "execution_observations": [
+                record.__dict__
+                for record in self.store.execution_tool_evidence_for_cycle(
+                    state.thread_id, state.cycle_id
+                )
+            ],
         }
         inspection = Workspace(
             Path(workspace.workspace_path),

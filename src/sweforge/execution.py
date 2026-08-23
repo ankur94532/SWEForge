@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -71,6 +71,7 @@ class TaskRunner(Protocol):
         resume_resolver: Callable[[tuple[dict, ...]], object] | None = None,
         repo_memory_proposal_sink: Callable[..., str] | None = None,
         issue_memory_search: Callable[[str, int], str] | None = None,
+        execution_evidence_sink: Callable[..., Any] | None = None,
     ) -> str: ...
 
 
@@ -224,6 +225,7 @@ def execute_one(
     repo_memory_proposal_sink: Callable[..., str] | None = None,
     issue_memory_search: Callable[[str, int], str] | None = None,
     clarification_enabled: bool = True,
+    execution_evidence_sink: Callable[..., Any] | None = None,
 ) -> ExecutionResult:
     clock = now or (lambda: datetime.now(UTC))
     event = store.claim_next_event(now=utc_timestamp(clock()))
@@ -257,6 +259,7 @@ def execute_one(
                 repo_memory_proposal_sink=repo_memory_proposal_sink,
                 issue_memory_search=issue_memory_search,
                 clarification_enabled=clarification_enabled,
+                execution_evidence_sink=execution_evidence_sink,
                 now=clock,
             )
     except ThreadLockUnavailable:
@@ -308,6 +311,7 @@ def _execute_claim(
     repo_memory_proposal_sink: Callable[..., str] | None = None,
     issue_memory_search: Callable[[str, int], str] | None = None,
     clarification_enabled: bool = True,
+    execution_evidence_sink: Callable[..., Any] | None = None,
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
     try:
@@ -406,6 +410,7 @@ def _execute_claim(
             "sandbox_backend_provider": sandbox_backend_provider,
             "secure_execution": secure_execution,
             "unsafe_local_shell": unsafe_local_shell,
+            "execution_evidence_sink": execution_evidence_sink,
             "resume_value": resume_value,
             "resume_resolver": resume_resolver,
         }

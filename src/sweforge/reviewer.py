@@ -1331,8 +1331,12 @@ def _resolved_evidence(
                     "diff:" + hashlib.sha256(identity.encode()).hexdigest()[:24]
                 )
             elif ref.kind is EvidenceKind.EXECUTION:
-                excerpt = json.dumps(evidence.get("execution", {}), sort_keys=True)
-                evidence_id = "execution:current"
+                excerpt = json.dumps(
+                    evidence.get("execution_observations")
+                    or evidence.get("execution", {}),
+                    sort_keys=True,
+                )
+                evidence_id = "execution:observations"
             else:
                 continue
             if not excerpt:
@@ -2926,6 +2930,8 @@ def render_review_evidence(evidence: dict) -> str:
             },
             sort_keys=True,
         ),
+        "\n[Authoritative execution observations]\n"
+        + json.dumps(evidence.get("execution_observations", []), sort_keys=True),
         "\n[Previous review — regression/history only; not current review scope]\n"
         + json.dumps(evidence.get("previous_review", {}), sort_keys=True),
         "\n[Changed files]\n"

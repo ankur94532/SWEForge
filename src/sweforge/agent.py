@@ -23,6 +23,7 @@ from langgraph.types import Command, interrupt
 
 from .capabilities import RepoCapabilityRegistry, load_repo_mcp_tools
 from .context import RepoAgentContext
+from .execution_evidence import RecordingSandboxBackend
 from .execution_security import (
     SandboxBackendProvider,
     require_secure_backend,
@@ -149,6 +150,7 @@ def _build_backend(
     memory_namespace: tuple[str, ...] | None = None,
     skills_store: BaseStore | None = None,
     sandbox_backend: SandboxBackendProtocol | None = None,
+    execution_evidence_sink: Callable[..., Any] | None = None,
 ) -> CompositeBackend:
     local = sandbox_backend or LocalShellBackend(
         root_dir=worktree,
@@ -156,6 +158,8 @@ def _build_backend(
         env={"PATH": os.environ.get("PATH", "")},
         inherit_env=False,
     )
+    if execution_evidence_sink is not None:
+        local = RecordingSandboxBackend(local, execution_evidence_sink)
     routes = {"/sweforge_internal/": StateBackend()}
     if repo_context is None and (memory_store is None) != (memory_namespace is None):
         raise ValueError("memory_store and memory_namespace must be supplied together")
@@ -206,6 +210,7 @@ def run_task(
     resume_resolver: Callable[[tuple[dict[str, Any], ...]], Any] | None = None,
     repo_memory_proposal_sink: Callable[..., str] | None = None,
     issue_memory_search: Callable[[str, int], str] | None = None,
+    execution_evidence_sink: Callable[..., Any] | None = None,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
@@ -238,6 +243,7 @@ def run_task(
         memory_namespace=memory_namespace,
         skills_store=effective_skills_store,
         sandbox_backend=isolated_backend,
+        execution_evidence_sink=execution_evidence_sink,
     )
     memory = [MEMORY_VIRTUAL_PATH] if memory_store is not None else None
     permissions = (

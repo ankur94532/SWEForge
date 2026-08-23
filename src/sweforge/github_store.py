@@ -230,6 +230,23 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
     retry_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE(thread_id, cycle_id, attempt_number)
 );
+CREATE TABLE IF NOT EXISTS execution_tool_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    attempt_id TEXT NOT NULL REFERENCES execution_attempts(attempt_id),
+    thread_id TEXT NOT NULL,
+    cycle_id INTEGER NOT NULL,
+    sequence_number INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'SHELL',
+    command TEXT NOT NULL,
+    exit_code INTEGER,
+    output TEXT NOT NULL,
+    output_hash TEXT NOT NULL,
+    truncated INTEGER NOT NULL DEFAULT 0,
+    recorded_at TEXT NOT NULL,
+    UNIQUE(attempt_id, sequence_number)
+);
+CREATE INDEX IF NOT EXISTS idx_execution_tool_evidence_attempt
+    ON execution_tool_evidence(attempt_id, sequence_number);
 CREATE TABLE IF NOT EXISTS execution_reviews (
     review_id TEXT PRIMARY KEY,
     thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
@@ -307,6 +324,8 @@ CREATE TABLE IF NOT EXISTS deferred_followups (
     consumed_at TEXT
 );
 """
+
+MAX_EXECUTION_EVIDENCE_PER_ATTEMPT = 96_000
 
 REPO_MEMORY_LEARNING_DDL = """
 CREATE TABLE IF NOT EXISTS repo_memory_learning (
@@ -716,6 +735,22 @@ class ExecutionAttemptRecord:
     created_at: str
     completed_at: str | None
     retry_count: int
+
+
+@dataclass(frozen=True)
+class ExecutionToolEvidenceRecord:
+    evidence_id: str
+    attempt_id: str
+    thread_id: str
+    cycle_id: int
+    sequence_number: int
+    kind: str
+    command: str
+    exit_code: int | None
+    output: str
+    output_hash: str
+    truncated: bool
+    recorded_at: str
 
 
 @dataclass(frozen=True)
@@ -2848,6 +2883,103 @@ class SQLiteGitHubStore:
             "SELECT * FROM execution_attempts WHERE attempt_id = ?", (attempt_id,)
         ).fetchone()
         return self._attempt_record(row) if row else None
+
+    @staticmethod
+    def _tool_evidence_record(row: sqlite3.Row) -> ExecutionToolEvidenceRecord:
+        return ExecutionToolEvidenceRecord(
+            evidence_id=row["evidence_id"],
+            attempt_id=row["attempt_id"],
+            thread_id=row["thread_id"],
+            cycle_id=row["cycle_id"],
+            sequence_number=row["sequence_number"],
+            kind=row["kind"],
+            command=row["command"],
+            exit_code=row["exit_code"],
+            output=row["output"],
+            output_hash=row["output_hash"],
+            truncated=bool(row["truncated"]),
+            recorded_at=row["recorded_at"],
+        )
+
+    def record_execution_tool_evidence(
+        self,
+        *,
+        attempt_id: str,
+        thread_id: str,
+        cycle_id: int,
+        kind: str,
+        command: str,
+        exit_code: int | None,
+        output: str,
+        output_hash: str,
+        truncated: bool,
+        recorded_at: str,
+    ) -> ExecutionToolEvidenceRecord:
+        with self.transaction(immediate=True) as db:
+            used = db.execute(
+                "SELECT COALESCE(SUM(length(output)), 0) FROM execution_tool_evidence WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()[0]
+            remaining = max(0, MAX_EXECUTION_EVIDENCE_PER_ATTEMPT - int(used))
+            if len(output) > remaining:
+                output = output[:remaining]
+                truncated = True
+            sequence = db.execute(
+                "SELECT COALESCE(MAX(sequence_number), 0) + 1 FROM execution_tool_evidence WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()[0]
+            evidence_id = (
+                "exec-evidence-"
+                + hashlib.sha256(
+                    f"{attempt_id}:{sequence}:{output_hash}".encode()
+                ).hexdigest()[:32]
+            )
+            db.execute(
+                """INSERT INTO execution_tool_evidence
+                (evidence_id,attempt_id,thread_id,cycle_id,sequence_number,kind,
+                 command,exit_code,output,output_hash,truncated,recorded_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    evidence_id,
+                    attempt_id,
+                    thread_id,
+                    cycle_id,
+                    sequence,
+                    kind,
+                    command,
+                    exit_code,
+                    output,
+                    output_hash,
+                    int(truncated),
+                    recorded_at,
+                ),
+            )
+            row = db.execute(
+                "SELECT * FROM execution_tool_evidence WHERE evidence_id=?",
+                (evidence_id,),
+            ).fetchone()
+        return self._tool_evidence_record(row)  # type: ignore[arg-type]
+
+    def execution_tool_evidence_for_attempt(
+        self, attempt_id: str
+    ) -> tuple[ExecutionToolEvidenceRecord, ...]:
+        rows = self.connection.execute(
+            "SELECT * FROM execution_tool_evidence WHERE attempt_id=? ORDER BY sequence_number",
+            (attempt_id,),
+        ).fetchall()
+        return tuple(self._tool_evidence_record(row) for row in rows)
+
+    def execution_tool_evidence_for_cycle(
+        self, thread_id: str, cycle_id: int
+    ) -> tuple[ExecutionToolEvidenceRecord, ...]:
+        rows = self.connection.execute(
+            """SELECT e.* FROM execution_tool_evidence e
+               JOIN execution_attempts a ON a.attempt_id=e.attempt_id
+               WHERE e.thread_id=? AND e.cycle_id=?
+               ORDER BY a.attempt_number, e.sequence_number""",
+            (thread_id, cycle_id),
+        ).fetchall()
+        return tuple(self._tool_evidence_record(row) for row in rows)
 
     def latest_attempt(
         self, thread_id: str, cycle_id: int
