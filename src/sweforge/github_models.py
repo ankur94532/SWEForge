@@ -115,6 +115,16 @@ def starts_with_agent_invocation(body: str | None, token: str = "@agent") -> boo
     return re.match(rf"^\s*{escaped}(?![A-Za-z0-9_])", body, re.IGNORECASE) is not None
 
 
+def is_actionable_source_event(source_kind: SourceKind | str, body: str | None) -> bool:
+    """Apply the same actionability policy at ingestion and dispatch."""
+    kind = (
+        source_kind.value if isinstance(source_kind, SourceKind) else str(source_kind)
+    )
+    if kind == SourceKind.ISSUE.value:
+        return contains_agent_mention(body)
+    return starts_with_agent_invocation(body)
+
+
 def format_source_context(
     event: SourceEvent | dict, task: str, current_context: str | None = None
 ) -> str:

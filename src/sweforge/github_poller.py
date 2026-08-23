@@ -14,9 +14,8 @@ from .github_models import (
     SourceKind,
     SubjectKind,
     classify_subject,
-    contains_agent_mention,
+    is_actionable_source_event,
     parse_timestamp,
-    starts_with_agent_invocation,
 )
 from .github_store import RecordBatchResult, SQLiteGitHubStore
 
@@ -155,10 +154,9 @@ class GitHubPoller:
     ) -> Iterable[SourceEvent]:
         for item in items:
             body = item.get("body")
-            actionable = (
-                contains_agent_mention(body)
-                if stream == "issues"
-                else starts_with_agent_invocation(body)
+            actionable = is_actionable_source_event(
+                SourceKind.ISSUE if stream == "issues" else SourceKind.ISSUE_COMMENT,
+                body,
             )
             if not actionable:
                 continue

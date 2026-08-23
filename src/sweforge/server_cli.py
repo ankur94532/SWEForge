@@ -40,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-model")
     parser.add_argument("--memory-model")
     parser.add_argument("--resolution-model")
+    parser.add_argument("--clarification-model")
     parser.add_argument("--capabilities-config", type=Path)
     parser.add_argument("--sandbox-provider")
     parser.add_argument("--unsafe-local-shell", action="store_true")
@@ -101,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
             review_model=args.review_model,
             memory_model=args.memory_model,
             resolution_model=args.resolution_model,
+            clarification_model=args.clarification_model,
             capabilities_config=args.capabilities_config,
             sandbox_provider=args.sandbox_provider,
             unsafe_local_shell=args.unsafe_local_shell,

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import fcntl
 import os
+import re
 import threading
+import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -12,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .capabilities import load_capability_registry
+from .clarification import build_clarification_classifier
 from .execution import SQLiteCheckpointer
 from .execution_security import resolve_sandbox_provider
 from .github_auth import (
@@ -42,6 +45,7 @@ class ServerConfig:
     review_model: str | None = None
     memory_model: str | None = None
     resolution_model: str | None = None
+    clarification_model: str | None = None
     capabilities_config: Path | None = None
     sandbox_provider: str | None = None
     unsafe_local_shell: bool = False
@@ -72,6 +76,10 @@ class ServerConfig:
     @property
     def resolution(self) -> str:
         return self.resolution_model or self.memory
+
+    @property
+    def clarification(self) -> str:
+        return self.clarification_model or self.execution
 
 
 class ServerInstanceLock:
@@ -145,6 +153,28 @@ def _credentials(config: ServerConfig):
     )
 
 
+def _safe_dispatch_error(exc: BaseException) -> str:
+    """Persist only a bounded, redacted diagnostic string."""
+    message = f"{type(exc).__name__}: {exc}"
+    for name in (
+        "SWEFORGE_GITHUB_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+    ):
+        value = os.getenv(name)
+        if value:
+            message = message.replace(value, "[REDACTED]")
+    message = re.sub(
+        r"-----BEGIN [A-Z ]+ PRIVATE KEY-----.*?-----END [A-Z ]+ PRIVATE KEY-----",
+        "[REDACTED_PRIVATE_KEY]",
+        message,
+        flags=re.DOTALL,
+    )
+    message = re.sub(r"(https?://)([^/\s:@]+):([^@\s]+)@", r"\1[REDACTED]@", message)
+    return message[:1000]
+
+
 class SWEForgeServer:
     """Poll, fairly dispatch, and drain durable workflows in one process."""
 
@@ -155,6 +185,7 @@ class SWEForgeServer:
         client_factory: Callable[[ServerConfig], tuple[GitHubClient, object]]
         | None = None,
         poller_factory: Callable[..., GitHubPoller] | None = None,
+        worker_runner: Callable[[str], None] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         if config.workers < 1 or config.max_ticks < 1 or config.poll_interval < 0:
@@ -167,6 +198,7 @@ class SWEForgeServer:
         self.config = config
         self.client_factory = client_factory or _credentials
         self.poller_factory = poller_factory or GitHubPoller
+        self.worker_runner = worker_runner
         self.now = now or (lambda: datetime.now(UTC))
         self.stop_event = threading.Event()
         self._futures: dict[Future, str] = {}
@@ -209,10 +241,19 @@ class SWEForgeServer:
         store = SQLiteGitHubStore(self.config.db)
         client = authenticator = checkpoints = memory = None
         try:
+            if self.worker_runner is not None:
+                self.worker_runner(thread_id)
+                return
             client, authenticator = self.client_factory(self.config)
             checkpoints = SQLiteCheckpointer(self.config.checkpoints)
             memory = SQLiteMemoryStore(self.config.memory_db)
-            engine = WorkflowEngine(store=store, client=client)
+            engine = WorkflowEngine(
+                store=store,
+                client=client,
+                clarification_classifier=build_clarification_classifier(
+                    self.config.clarification
+                ),
+            )
             capability_registry = (
                 load_capability_registry(self.config.capabilities_config)
                 if self.config.capabilities_config
@@ -248,6 +289,12 @@ class SWEForgeServer:
                     publication_id = store.eligible_publication_id(thread_id)
                     if not publication_id:
                         break
+                    publication_record = store.publication_for_id(publication_id)
+                    if (
+                        publication_record is not None
+                        and publication_record.status.value == "FAILED"
+                    ):
+                        break
                     publication = GitHubPublisher(
                         store=store,
                         client=client,
@@ -256,20 +303,19 @@ class SWEForgeServer:
                         api_url=self.config.api_url,
                     ).publish_one(publication_id)
                     if publication.status not in {"COMPLETED", "NO_CHANGES"}:
-                        raise RuntimeError(
-                            f"publication {publication.status.lower()}"
-                        )
-                elif result.phase in {
-                    WorkflowPhase.IDLE,
-                    WorkflowPhase.WAITING_FOR_INPUT,
-                    WorkflowPhase.WAITING_FOR_PLAN_APPROVAL,
-                    WorkflowPhase.REVIEW_BLOCKED,
-                }:
+                        raise RuntimeError(f"publication {publication.status.lower()}")
+                if result.message == "busy":
                     break
+                if result.phase != WorkflowPhase.AWAITING_PUBLICATION:
+                    now = self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
+                    if not store.is_thread_runnable(thread_id, now=now):
+                        break
             store.clear_dispatcher_failure(thread_id)
         except Exception as exc:
             now = self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
-            store.record_dispatcher_failure(thread_id, now=now, error=str(exc))
+            store.record_dispatcher_failure(
+                thread_id, now=now, error=_safe_dispatch_error(exc)
+            )
             raise
         finally:
             for resource in (memory, checkpoints, store, client, authenticator):
@@ -289,23 +335,33 @@ class SWEForgeServer:
             try:
                 self._poll(poll_client, poll_store)
             except Exception:
+                if self.config.once:
+                    raise
                 # A transient GitHub outage must not terminate the dispatcher.
                 pass
             self._submit(executor, poll_store)
             if self.config.once:
                 while True:
                     self._reap()
+                    self._submit(executor, poll_store)
                     with self._futures_lock:
-                        if not self._futures:
-                            break
+                        active = bool(self._futures)
+                    now = self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
+                    if not active and not poll_store.runnable_thread_ids(now=now):
+                        break
                     self.stop_event.wait(0.05)
                 return
-            while not self.stop_event.wait(self.config.poll_interval):
+            last_poll = time.monotonic()
+            while not self.stop_event.wait(
+                min(0.25, max(self.config.poll_interval, 0.25))
+            ):
                 self._reap()
-                try:
-                    self._poll(poll_client, poll_store)
-                except Exception:
-                    pass
+                if time.monotonic() - last_poll >= self.config.poll_interval:
+                    try:
+                        self._poll(poll_client, poll_store)
+                    except Exception:
+                        pass
+                    last_poll = time.monotonic()
                 self._submit(executor, poll_store)
         finally:
             self.stop_event.set()

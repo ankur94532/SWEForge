@@ -17,6 +17,7 @@ from pathlib import Path
 from .github_models import (
     SourceEvent,
     SubjectKind,
+    is_actionable_source_event,
     is_exact_agent_approval,
     starts_with_agent_invocation,
 )
@@ -5677,8 +5678,8 @@ class SQLiteGitHubStore:
             count = int(row[0]) + 1 if row else 1
             delay = min(3600, base_seconds * (2 ** min(count - 1, 10)))
             current = datetime.fromisoformat(now.replace("Z", "+00:00"))
-            eligible = (current + timedelta(seconds=delay)).isoformat().replace(
-                "+00:00", "Z"
+            eligible = (
+                (current + timedelta(seconds=delay)).isoformat().replace("+00:00", "Z")
             )
             db.execute(
                 "INSERT INTO dispatcher_failures "
@@ -5692,7 +5693,9 @@ class SQLiteGitHubStore:
 
     def clear_dispatcher_failure(self, thread_id: str) -> None:
         with self.transaction(immediate=True) as db:
-            db.execute("DELETE FROM dispatcher_failures WHERE thread_id = ?", (thread_id,))
+            db.execute(
+                "DELETE FROM dispatcher_failures WHERE thread_id = ?", (thread_id,)
+            )
 
     def runnable_thread_ids(self, *, now: str, limit: int | None = None) -> list[str]:
         """Return durable work candidates in stable update-time order.
@@ -5712,39 +5715,63 @@ class SQLiteGitHubStore:
             (now,),
         ).fetchall()
         selected: list[str] = []
-        active = {
-            WorkflowPhase.PLANNING.value,
-            WorkflowPhase.EXECUTION_READY.value,
-            WorkflowPhase.EXECUTING.value,
-            WorkflowPhase.AWAITING_PUBLICATION.value,
-            WorkflowPhase.REVIEW_EXECUTION.value,
-            WorkflowPhase.REPAIR_READY.value,
-        }
         for row in rows:
-            phase = row["phase"]
-            pending = self.unconsumed_inputs(row["thread_id"])
-            actionable = any(
-                starts_with_agent_invocation(item["body"]) for item in pending
-            )
-            if phase in active or (
-                phase in {
-                    None,
-                    WorkflowPhase.IDLE.value,
-                    WorkflowPhase.WAITING_FOR_PLAN_APPROVAL.value,
-                    WorkflowPhase.WAITING_FOR_INPUT.value,
-                }
-                and (
-                    actionable
-                    or (
-                        phase == WorkflowPhase.IDLE.value
-                        and (
-                            self.pending_memory_learning(row["thread_id"]) is not None
-                            or self.pending_issue_resolution(row["thread_id"]) is not None
-                        )
-                    )
-                )
-            ):
+            if self.is_thread_runnable(row["thread_id"], now=now):
                 selected.append(row["thread_id"])
                 if limit is not None and len(selected) >= limit:
                     break
         return selected
+
+    def is_thread_runnable(self, thread_id: str, *, now: str) -> bool:
+        """Authoritative durable predicate used by selection and draining."""
+        failure = self.dispatcher_failure(thread_id)
+        if failure is not None and failure["next_eligible_at"] > now:
+            return False
+        thread = self.issue_thread(thread_id)
+        if thread is None:
+            return False
+        state = self.workflow_state(thread_id)
+        pending = self.unconsumed_inputs(thread_id)
+        actionable = any(
+            is_actionable_source_event(item["source_kind"], item["body"])
+            for item in pending
+        )
+        if state is None:
+            return actionable
+        phase = state.phase
+        if phase in {
+            WorkflowPhase.PLANNING,
+            WorkflowPhase.EXECUTION_READY,
+            WorkflowPhase.EXECUTING,
+            WorkflowPhase.REVIEW_EXECUTION,
+            WorkflowPhase.REPAIR_READY,
+        }:
+            return True
+        if phase == WorkflowPhase.IDLE:
+            return bool(
+                actionable
+                or self.deferred_followups(thread_id)
+                or self.pending_memory_learning(thread_id)
+                or self.pending_issue_resolution(thread_id)
+            )
+        if phase == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL:
+            if state.mode == WorkflowMode.AUTO:
+                return True
+            return any(
+                is_exact_agent_approval(item["body"])
+                or is_actionable_source_event(item["source_kind"], item["body"])
+                for item in pending
+            )
+        if phase == WorkflowPhase.WAITING_FOR_INPUT:
+            return actionable
+        if phase == WorkflowPhase.AWAITING_PUBLICATION:
+            publication = self.publication_for_cycle(
+                thread_id=thread_id,
+                cycle_id=state.cycle_id,
+                root_event_key=state.root_event_key,
+                root_input_id=state.root_input_id,
+            )
+            if publication is None:
+                return self.publication_target(thread_id) is not None
+            return publication.status in RESUMABLE_PUBLICATION_STATUSES
+        return False
