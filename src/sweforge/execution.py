@@ -54,6 +54,7 @@ class TaskRunner(Protocol):
         secure_execution: bool = True,
         unsafe_local_shell: bool = False,
         clarification_request_sink: Callable[[dict], None] | None = None,
+        resume_value: object | None = None,
     ) -> str: ...
 
 
@@ -174,6 +175,7 @@ class ClarificationRequestProposal:
     reason: str
     answer_type: str = "TEXT"
     choices: tuple[str, ...] = ()
+    occurrence_key: str = ""
 
 
 def recover_stale(
@@ -223,6 +225,8 @@ def execute_one(
     secure_execution: bool = True,
     unsafe_local_shell: bool = False,
     clarification_request_sink: Callable[[dict], None] | None = None,
+    resume_value: object | None = None,
+    clarification_enabled: bool = True,
 ) -> ExecutionResult:
     clock = now or (lambda: datetime.now(UTC))
     event = store.claim_next_event(now=utc_timestamp(clock()))
@@ -250,6 +254,8 @@ def execute_one(
                 secure_execution=secure_execution,
                 unsafe_local_shell=unsafe_local_shell,
                 clarification_request_sink=clarification_request_sink,
+                resume_value=resume_value,
+                clarification_enabled=clarification_enabled,
                 now=clock,
             )
     except ThreadLockUnavailable:
@@ -293,11 +299,16 @@ def _execute_claim(
     secure_execution: bool = True,
     unsafe_local_shell: bool = False,
     clarification_request_sink: Callable[[dict], None] | None = None,
+    resume_value: object | None = None,
+    clarification_enabled: bool = True,
 ) -> ExecutionResult:
     workspace: ThreadWorkspace | None = None
     try:
+        deferred_text = store.deferred_text_for_event(event.event_key)
         task = (
-            prepared_task if prepared_task is not None else normalize_task(event.body)
+            prepared_task
+            if prepared_task is not None
+            else deferred_text or normalize_task(event.body)
         )
         repository_path = repo_paths.get(event.repo_full_name)
         if repository_path is None:
@@ -386,7 +397,12 @@ def _execute_claim(
             "secure_execution": secure_execution,
             "unsafe_local_shell": unsafe_local_shell,
             "clarification_request_sink": capture_clarification,
+            "resume_value": resume_value,
         }
+        if not clarification_enabled:
+            runner_kwargs.pop("clarification_request_sink", None)
+        if resume_value is None:
+            runner_kwargs.pop("resume_value", None)
         if live_input_provider is not None:
             runner_kwargs["live_input_provider"] = live_input_provider
         if live_delivered_event_keys is not None:
@@ -410,6 +426,7 @@ def _execute_claim(
                     reason=proposal["reason"],
                     answer_type=proposal["answer_type"],
                     choices=tuple(proposal["choices"]),
+                    occurrence_key=proposal.get("occurrence_key", ""),
                 ),
                 workspace_created=workspace.created,
             )

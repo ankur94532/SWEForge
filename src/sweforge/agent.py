@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import os
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Annotated, Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import (
@@ -17,8 +17,9 @@ from deepagents.backends.protocol import SandboxBackendProtocol
 from deepagents.middleware.permissions import FilesystemPermission
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import HumanMessage
-from langchain_core.tools import tool
+from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.store.base import BaseStore
+from langgraph.types import Command, interrupt
 
 from .capabilities import RepoCapabilityRegistry, load_repo_mcp_tools
 from .context import RepoAgentContext
@@ -172,6 +173,7 @@ def run_task(
     live_input_provider: Callable[[], list[tuple[str, str]]] | None = None,
     live_delivered_event_keys: set[str] | None = None,
     clarification_request_sink: Callable[[dict[str, Any]], None] | None = None,
+    resume_value: Any | None = None,
 ) -> str:
     """Run one task using Deep Agents' native harness and return its final text."""
     if checkpointer is not None and not thread_id:
@@ -231,6 +233,7 @@ def run_task(
             reason: str,
             answer_type: str = "TEXT",
             choices: list[str] | None = None,
+            tool_call_id: Annotated[str, InjectedToolCallId] = "",
         ) -> str:
             """Request specific missing information before safely continuing."""
             normalized_type = answer_type.upper()
@@ -245,9 +248,18 @@ def run_task(
                     "reason": reason[:2_000],
                     "answer_type": normalized_type,
                     "choices": normalized_choices,
+                    "occurrence_key": tool_call_id or message_id or "clarification",
                 }
             )
-            return "Clarification request recorded. Stop and wait for the answer."
+            answer = interrupt(
+                {
+                    "question": question[:2_000],
+                    "reason": reason[:2_000],
+                    "answer_type": normalized_type,
+                    "choices": normalized_choices,
+                }
+            )
+            return f"Clarification answer received: {answer}"
 
         clarification_tools.append(request_clarification)
     if capability_registry is not None:
@@ -284,6 +296,16 @@ def run_task(
     }
     if thread_id:
         config = {"configurable": {"thread_id": thread_id}}
+        if resume_value is not None:
+            result: dict[str, Any] = _invoke_agent(
+                agent,
+                Command(resume=resume_value),
+                config=config,
+                durability="sync",
+                context=repo_context,
+            )
+            messages = result.get("messages", [])
+            return _normalize_response_text(messages[-1]) if messages else ""
         if message_id:
             snapshot = agent.get_state(config)
             has_message = any(

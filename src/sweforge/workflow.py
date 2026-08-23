@@ -663,11 +663,38 @@ class WorkflowEngine:
                     authorization_id=permit.permit_id,
                     created_at=utc_timestamp(clock()),
                 )
+                answered = self.store.clarification_for_thread(
+                    permit.thread_id, status=ClarificationStatus.ANSWERED.value
+                )
+                resume_value = None
+                if answered and answered.cycle_id == permit.cycle_id:
+                    answer_payload = json.loads(answered.answer_json or "{}")
+                    resume_value = answer_payload.get("answer")
+
+                def persist_request(payload: dict) -> None:
+                    current_state = self.store.workflow_state(permit.thread_id)
+                    if current_state is None:
+                        raise ValueError(
+                            "workflow state disappeared during clarification"
+                        )
+                    self._persist_clarification(
+                        state=current_state,
+                        proposal=ClarificationRequestProposal(
+                            question=payload["question"],
+                            reason=payload["reason"],
+                            answer_type=payload["answer_type"],
+                            choices=tuple(payload["choices"]),
+                            occurrence_key=payload.get("occurrence_key", ""),
+                        ),
+                    )
+
                 result = _execute_claim(
                     store=self.store,
                     event=event,
                     live_input_provider=None,
                     live_delivered_event_keys=delivered,
+                    clarification_request_sink=persist_request,
+                    resume_value=resume_value,
                     approved_plan_text=plan.plan_text,
                     approved_plan_id=plan.plan_id,
                     approved_plan_version=plan.version,
@@ -750,13 +777,16 @@ class WorkflowEngine:
         self, *, state: WorkflowStateRecord, proposal: ClarificationRequestProposal
     ) -> ClarificationRequestRecord:
         clarification_id = "clarification-" + _stable_id(
-            state.thread_id, state.cycle_id, proposal.question
+            state.thread_id,
+            state.cycle_id,
+            proposal.occurrence_key or proposal.question,
         )
         record = ClarificationRequestRecord(
             clarification_id=clarification_id,
             thread_id=state.thread_id,
             cycle_id=state.cycle_id,
             root_event_key=state.root_event_key,
+            occurrence_key=proposal.occurrence_key,
             requested_from_phase=WorkflowPhase.EXECUTING.value,
             question=proposal.question,
             reason=proposal.reason,
@@ -902,6 +932,7 @@ class WorkflowEngine:
                     memory_store=memory_store,
                     live_input_provider=None,
                     live_delivered_event_keys=delivered,
+                    clarification_enabled=False,
                     approved_plan_text=None,
                     approved_plan_id=None,
                     approved_plan_version=None,
@@ -951,6 +982,10 @@ class WorkflowEngine:
         cycle_id: int,
         purpose: InputPurpose = InputPurpose.DEFERRED_FOLLOWUP,
     ) -> None:
+        if purpose == InputPurpose.PLANNING_INPUT:
+            self.store.consume_deferred_followup(
+                event_key, cycle_id=cycle_id, consumed_at=self.clock()
+            )
         self.store.consume_input(
             event_key,
             thread_id=thread_id,
@@ -1023,15 +1058,25 @@ class WorkflowEngine:
 
     @staticmethod
     def _clarification_target_matches(row, clarification) -> bool:
+        same_surface = row["origin_surface"] == clarification.origin_surface
+        same_subject = row["subject_number"] == clarification.response_subject_number
+        if clarification.origin_surface == "PR_INLINE_REVIEW":
+            same_target = (
+                row["review_thread_root_id"] == clarification.review_thread_root_id
+            )
+        else:
+            same_target = same_surface and same_subject
+        if not same_target:
+            return False
         if clarification.clarification_id in row["body"]:
             return True
-        if row["in_reply_to_id"] and clarification.response_comment_id:
-            return row["in_reply_to_id"] == clarification.response_comment_id
-        if clarification.origin_surface == "PR_INLINE_REVIEW":
-            return row["review_thread_root_id"] == clarification.review_thread_root_id
         return (
-            row["origin_surface"] == clarification.origin_surface
-            and row["subject_number"] == clarification.response_subject_number
+            bool(
+                row["in_reply_to_id"]
+                and clarification.response_comment_id
+                and row["in_reply_to_id"] == clarification.response_comment_id
+            )
+            or same_target
         )
 
     def _deterministic_clarification_answer(
@@ -1050,8 +1095,8 @@ class WorkflowEngine:
                 choice for choice in choices if choice.casefold() in text.casefold()
             ]
             return matches[0] if len(matches) == 1 else None
-        if answer_type in {"TEXT", "VALUE"} and text.strip():
-            return text.strip()
+        if answer_type in {"TEXT", "VALUE"}:
+            return None
         return None
 
     def _resolve_open_clarification(self, state: WorkflowStateRecord) -> None:
@@ -1080,13 +1125,6 @@ class WorkflowEngine:
                     clarification=clarification, event=dict(row)
                 )
                 if classification.get("relationship") == "CHANGES_SCOPE":
-                    self.store.consume_input(
-                        row["event_key"],
-                        thread_id=state.thread_id,
-                        cycle_id=state.cycle_id,
-                        purpose=InputPurpose.PLANNING_INPUT,
-                        claimed_at=self.clock(),
-                    )
                     self.store.cancel_clarification_for_replan(
                         clarification.clarification_id,
                         event_key=row["event_key"],
@@ -1118,24 +1156,12 @@ class WorkflowEngine:
                 else:
                     residual = None
             if residual:
-                self.store.defer_followup(
-                    source_event_key=row["event_key"],
-                    thread_id=state.thread_id,
-                    originating_cycle_id=state.cycle_id,
-                    queued_at=self.clock(),
-                    residual_text=residual,
-                )
-            self.store.consume_input(
-                row["event_key"],
-                thread_id=state.thread_id,
-                cycle_id=state.cycle_id,
-                purpose=InputPurpose.CLARIFICATION_RESPONSE,
-                claimed_at=self.clock(),
-            )
-            self.store.resume_clarification(
+                residual = residual[:MAX_COMMENT_CHARS]
+            self.store.resolve_clarification_answer(
                 clarification.clarification_id,
                 answer_event_key=row["event_key"],
                 answer_json=json.dumps({"answer": answer, "residual": residual}),
+                residual_text=residual,
                 now=self.clock(),
             )
             return
@@ -1716,6 +1742,20 @@ class WorkflowEngine:
                     message="orphaned repair recovered",
                 )
             state = self.store.workflow_state(thread_id)
+            open_clarification = self.store.clarification_for_thread(thread_id)
+            if (
+                state
+                and state.phase == WorkflowPhase.EXECUTING
+                and open_clarification is not None
+            ):
+                permit = self.store.permit_for_plan(state.current_plan_id or "")
+                if permit is not None:
+                    self.store.interrupt_execution_for_clarification(
+                        permit_id=permit.permit_id,
+                        event_key=permit.root_event_key,
+                        now=self.clock(),
+                    )
+                    state = self.store.workflow_state(thread_id)
             if state and state.phase == WorkflowPhase.WAITING_FOR_INPUT:
                 pending_clarification = self.store.clarification_for_thread(thread_id)
                 if (

@@ -282,8 +282,13 @@ next-cycle follow-up once execution, review, repair, or publication is active.
 It is never injected into execution or `REVIEW_EXECUTION`.
 
 An execution agent may instead use the application-owned clarification tool when
-specific missing information prevents safe continuation. SWEForge persists the
-request, enters `WAITING_FOR_INPUT`, routes the question back to its issue,
-PR conversation, or inline review thread, and resumes the same cycle only after
-an unambiguous, provenance-matched answer. Mixed answers retain residual
-follow-up text for the next planning cycle.
+specific missing information prevents safe continuation. The tool performs a
+native LangGraph checkpoint interrupt; no later tool/action in that run proceeds
+before the answer. SWEForge persists the request, enters `WAITING_FOR_INPUT`,
+and routes the question back to its issue, PR conversation, or inline review
+thread. A restart reconciles an open request with the interrupted execution and
+retries clarification posting idempotently. An unambiguous, provenance-matched
+answer resumes the same checkpoint and cycle. A scope-changing or ambiguous
+answer does not reuse the old authorization. Mixed answers retain a distinct,
+durable residual follow-up identity for the next planning cycle. Repair runs do
+not expose the clarification tool; review findings remain internal repair input.

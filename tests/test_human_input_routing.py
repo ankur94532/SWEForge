@@ -1,10 +1,17 @@
 import json
 from dataclasses import replace
+from typing import TypedDict
 
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+
+from sweforge.execution import ClarificationRequestProposal
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import (
     ClarificationRequestRecord,
     ClarificationStatus,
+    InputPurpose,
     SQLiteGitHubStore,
     WorkflowPhase,
 )
@@ -66,6 +73,15 @@ def test_active_followup_is_durable_and_not_an_unconsumed_active_input(tmp_path)
     )
     queued = store.deferred_followups(thread_id)
     assert [row["event_key"] for row in queued] == [events[1].event_key]
+    assert len(engine.pending_planning_inputs(thread_id)) == 1
+    engine._acknowledge_delivered(
+        events[1].event_key,
+        thread_id=thread_id,
+        cycle_id=1,
+        purpose=InputPurpose.PLANNING_INPUT,
+    )
+    assert engine.pending_planning_inputs(thread_id) == []
+    assert engine.pending_planning_inputs(thread_id) == []
     store.close()
 
 
@@ -77,6 +93,7 @@ def test_clarification_answer_and_replay_state_are_durable(tmp_path):
         thread_id=thread_id,
         cycle_id=1,
         root_event_key=events[0].event_key,
+        occurrence_key="tool-call-1",
         requested_from_phase=WorkflowPhase.EXECUTING.value,
         question="Which region?",
         reason="Two valid regions were found.",
@@ -95,13 +112,73 @@ def test_clarification_answer_and_replay_state_are_durable(tmp_path):
     )
     store.save_clarification(record)
     assert store.clarification_for_thread(thread_id).question == "Which region?"
-    store.resume_clarification(
+    store.resolve_clarification_answer(
         "clarification-1",
         answer_event_key=events[1].event_key,
-        answer_json=json.dumps({"answer": "us-east-1"}),
+        answer_json=json.dumps(
+            {"answer": "us-east-1", "residual": "update the README"}
+        ),
+        residual_text="update the README",
         now="later",
     )
     answered = store.clarification("clarification-1")
     assert answered.status == ClarificationStatus.ANSWERED.value
     assert answered.answer_event_key == events[1].event_key
+    deferred = store.deferred_followup(events[1].event_key)
+    assert deferred is not None
+    assert deferred.deferred_id != events[1].event_key
+    assert store.deferred_text_for_event(events[1].event_key) == "update the README"
     store.close()
+
+
+def test_same_question_has_distinct_occurrence_ids(tmp_path):
+    store, _repo, events = _store_with_cycle(tmp_path)
+    thread_id = store.source_event(events[0].event_key)["thread_id"]
+    state = store.workflow_state(thread_id)
+    assert state is not None
+    engine = WorkflowEngine(store=store)
+    first = engine._persist_clarification(
+        state=state,
+        proposal=ClarificationRequestProposal(
+            question="Which region?",
+            reason="Need one region.",
+            occurrence_key="tool-call-1",
+        ),
+    )
+    second = engine._persist_clarification(
+        state=state,
+        proposal=ClarificationRequestProposal(
+            question="Which region?",
+            reason="Need one region.",
+            occurrence_key="tool-call-2",
+        ),
+    )
+    assert first.clarification_id != second.clarification_id
+    store.close()
+
+
+def test_native_interrupt_prevents_post_request_action_until_resume():
+    class State(TypedDict):
+        actions: list[str]
+
+    def node(state: State):
+        actions = [*state["actions"], "before"]
+        answer = interrupt({"question": "continue?"})
+        actions.append(f"after:{answer}")
+        return {"actions": actions}
+
+    graph = StateGraph(State)
+    graph.add_node("clarifying", node)
+    graph.add_edge(START, "clarifying")
+    graph.add_edge("clarifying", END)
+    checkpointer = MemorySaver()
+    compiled = graph.compile(checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": "native-clarification"}}
+
+    paused = compiled.invoke({"actions": []}, config=config)
+    assert "after:yes" not in paused["actions"]
+    assert paused["__interrupt__"][0].value["question"] == "continue?"
+    assert compiled.get_state(config).tasks[0].interrupts
+
+    resumed = compiled.invoke(Command(resume="yes"), config=config)
+    assert resumed["actions"] == ["before", "after:yes"]
