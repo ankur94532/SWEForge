@@ -52,6 +52,7 @@ from sweforge.reviewer import (
     _authority_facts,
     _build_challenger,
     _candidate_requirement_associations,
+    _canonical_inspection_provenance,
     _challenger_prompt,
     _clusters_for_stage,
     _complete_challenge_report,
@@ -61,6 +62,7 @@ from sweforge.reviewer import (
     _guard_accept_coverage,
     _guard_repairability,
     _inspection_artifact_problems,
+    _inspection_failure_diagnostic,
     _invoke_specialist,
     _lexical_tokens,
     _resolve_reviewer_file,
@@ -1469,6 +1471,215 @@ def test_read_ledger_records_only_successful_bounded_reads(tmp_path):
     assert ledger[0]["normalized_path"] == "src/main.py"
     assert ledger[0]["returned_lines"] == [2, 2]
     assert ledger[0]["excerpt"] == "two\n"
+
+
+def _semantic_inspection(requirement_id="REQ-B", *, path="src/main.py", start=2, end=3):
+    return InspectionReport(
+        inspections=[
+            RequirementInspection(
+                requirement_id=requirement_id,
+                status=InspectionStatus.VERIFIED,
+                evidence_refs=[
+                    EvidenceRef(
+                        ref_id="model-ref",
+                        requirement_id=requirement_id,
+                        kind=EvidenceKind.INSPECTED_FILE,
+                        source_id="read:fake-model-id",
+                        path=path,
+                    )
+                ],
+            )
+        ],
+        observations=[
+            InspectionObservation(
+                observation_id="obs-1",
+                requirement_id=requirement_id,
+                kind="CODE",
+                path=path,
+                start_line=start,
+                end_line=end,
+                fact="the implementation preserves the threshold behavior",
+            )
+        ],
+    )
+
+
+def test_provenance_binding_owns_read_id_and_replaces_fake_model_id():
+    report = _semantic_inspection()
+    bound = _canonical_inspection_provenance(
+        report,
+        evidence={"changed_files": []},
+        ledger=[
+            {
+                "read_id": "read:actual",
+                "normalized_path": "src/main.py",
+                "offset": 0,
+                "returned_lines": [1, 10],
+                "excerpt": "source",
+            }
+        ],
+    )
+
+    ref = bound.inspections[0].evidence_refs[0]
+    assert ref.kind is EvidenceKind.INSPECTED_FILE
+    assert ref.source_id == "read:actual"
+    assert ref.source_id != "read:fake-model-id"
+    assert ref.start_line == 2 and ref.end_line == 3
+
+
+def test_unchanged_code_requires_matching_read_range():
+    report = _semantic_inspection(start=15, end=20)
+    bound = _canonical_inspection_provenance(
+        report,
+        evidence={"changed_files": []},
+        ledger=[
+            {
+                "read_id": "read:narrow",
+                "normalized_path": "src/main.py",
+                "returned_lines": [10, 20],
+            }
+        ],
+    )
+    problems = _inspection_artifact_problems(
+        [{"requirement_id": "REQ-B", "classification": "BEHAVIORAL"}],
+        bound,
+        ledger=[
+            {
+                "read_id": "read:narrow",
+                "normalized_path": "src/main.py",
+                "returned_lines": [10, 20],
+            }
+        ],
+        evidence={"changed_files": []},
+    )
+    assert problems == []
+
+    outside = _canonical_inspection_provenance(
+        _semantic_inspection(start=30, end=40),
+        evidence={"changed_files": []},
+        ledger=[
+            {
+                "read_id": "read:narrow",
+                "normalized_path": "src/main.py",
+                "returned_lines": [10, 20],
+            }
+        ],
+    )
+    assert "ungrounded code observation for REQ-B" in _inspection_artifact_problems(
+        [{"requirement_id": "REQ-B", "classification": "BEHAVIORAL"}],
+        outside,
+        ledger=[
+            {
+                "read_id": "read:narrow",
+                "normalized_path": "src/main.py",
+                "returned_lines": [10, 20],
+            }
+        ],
+        evidence={"changed_files": []},
+    )
+
+
+def test_provenance_binding_rejects_missing_and_wrong_path_reads():
+    missing = _canonical_inspection_provenance(
+        _semantic_inspection(), evidence={"changed_files": []}, ledger=[]
+    )
+    problems = _inspection_artifact_problems(
+        [{"requirement_id": "REQ-B", "classification": "BEHAVIORAL"}],
+        missing,
+        ledger=[],
+        evidence={"changed_files": []},
+    )
+    assert "ungrounded code observation for REQ-B" in problems
+
+    wrong_path = _canonical_inspection_provenance(
+        _semantic_inspection(),
+        evidence={"changed_files": []},
+        ledger=[
+            {
+                "read_id": "read:other",
+                "normalized_path": "src/other.py",
+                "returned_lines": [1, 20],
+            }
+        ],
+    )
+    assert "ungrounded code observation for REQ-B" in _inspection_artifact_problems(
+        [{"requirement_id": "REQ-B", "classification": "BEHAVIORAL"}],
+        wrong_path,
+        ledger=[
+            {
+                "read_id": "read:other",
+                "normalized_path": "src/other.py",
+                "returned_lines": [1, 20],
+            }
+        ],
+        evidence={"changed_files": []},
+    )
+
+
+def test_provenance_binding_selects_narrowest_read_then_stable_order():
+    report = _semantic_inspection(start=15, end=16)
+    ledger = [
+        {
+            "read_id": "read:wide",
+            "normalized_path": "src/main.py",
+            "returned_lines": [1, 100],
+        },
+        {
+            "read_id": "read:narrow",
+            "normalized_path": "src/main.py",
+            "returned_lines": [10, 20],
+        },
+    ]
+    bound = _canonical_inspection_provenance(
+        report, evidence={"changed_files": []}, ledger=ledger
+    )
+    assert bound.inspections[0].evidence_refs[0].source_id == "read:narrow"
+
+
+def test_changed_file_binding_generates_trusted_diff_without_model_ref():
+    report = _semantic_inspection(path="src/changed_test.py")
+    bound = _canonical_inspection_provenance(
+        report,
+        evidence={"changed_files": ["src/changed_test.py"]},
+        ledger=[],
+    )
+    ref = bound.inspections[0].evidence_refs[0]
+    assert ref.kind is EvidenceKind.TRUSTED_DIFF
+    assert ref.path == "src/changed_test.py"
+    assert ref.source_id.startswith("diff:")
+
+
+def test_rendered_evidence_exposes_exact_execution_ids_to_inspector():
+    rendered = render_review_evidence(
+        {
+            "execution": [{"evidence_id": "exec-focused", "exit_code": 0}],
+            "execution_observations": [
+                {"evidence_id": "exec-focused", "command": "mvn focused"}
+            ],
+        }
+    )
+    assert "exec-focused" in rendered
+
+
+def test_inspector_failure_diagnostic_is_bounded_and_excludes_contents():
+    diagnostic = _inspection_failure_diagnostic(
+        attempt=2,
+        problems=["ungrounded code observation for REQ-B"],
+        ledger=[
+            {
+                "normalized_path": "src/main.py",
+                "offset": 10,
+                "returned_lines": [11, 20],
+                "excerpt": "SECRET_CONTENT_SHOULD_NOT_APPEAR",
+            }
+        ],
+    )
+    encoded = json.dumps(diagnostic)
+    assert diagnostic["attempt"] == 2
+    assert "SECRET_CONTENT_SHOULD_NOT_APPEAR" not in encoded
+    assert len(encoded) < 1_000
+    error = ReviewFinalizationError("inspector failed", diagnostic=diagnostic)
+    assert "artifact_problems" in str(error)
 
 
 def test_accept_guard_rejects_unread_and_wrong_requirement_evidence():

@@ -393,6 +393,13 @@ class EvidencePackingError(ValueError):
 class ReviewFinalizationError(RuntimeError):
     """A review could not produce a structured semantic verdict."""
 
+    def __init__(self, message: str, *, diagnostic: dict | None = None):
+        self.diagnostic = diagnostic or {}
+        if self.diagnostic:
+            bounded = json.dumps(self.diagnostic, sort_keys=True, separators=(",", ":"))
+            message = f"{message}; diagnostic={bounded[:700]}"
+        super().__init__(message)
+
 
 REVIEW_INSPECTION_MODEL_CALL_LIMIT = 8
 REVIEW_INSPECTION_TOOL_CALL_LIMIT = 24
@@ -705,7 +712,9 @@ INSPECTOR_SYSTEM_PROMPT = (
     "not prove a behavioral requirement; inspect the assertion and observable "
     "evidence. Classification is supplied by the deterministic contract; do not "
     "reproduce or alter it. "
-    "Return narrow code facts, not broad semantic conclusions. For every VERIFIED "
+    "Return narrow code facts, not broad semantic conclusions. State what you observed "
+    "using semantic paths and line ranges; never invent or transcribe opaque read IDs. "
+    "For every VERIFIED "
     "STRUCTURAL requirement, cite appropriate trusted diff or inspected-file "
     "authority. For every VERIFIED BEHAVIORAL requirement, emit a CODE observation "
     "for that exact requirement with a concrete relevant path; if the path is "
@@ -2477,7 +2486,7 @@ def _inspection_authority_problems(
     classification = requirement["classification"]
     for observation in requirement_observations:
         if observation.kind in {"CODE", "TEST"}:
-            grounded = observation.path in changed_files or any(
+            grounded = observation.path.lstrip("/") in changed_files or any(
                 ref.kind is EvidenceKind.INSPECTED_FILE
                 and ref.source_id in ledger_by_id
                 and ref.path == observation.path
@@ -2503,6 +2512,214 @@ def _inspection_authority_problems(
     return problems
 
 
+def _canonical_ref_id(
+    requirement_id: str,
+    kind: EvidenceKind,
+    source_id: str,
+    path: str,
+    start_line: int | None,
+    end_line: int | None,
+) -> str:
+    material = "\0".join(
+        str(item)
+        for item in (
+            requirement_id,
+            kind.value,
+            source_id,
+            path,
+            start_line or "",
+            end_line or "",
+        )
+    )
+    return "bind:" + hashlib.sha256(material.encode()).hexdigest()[:24]
+
+
+def _observation_range(observation: InspectionObservation) -> tuple[int, int] | None:
+    if observation.start_line is None or observation.end_line is None:
+        return None
+    if observation.end_line < observation.start_line:
+        return None
+    return observation.start_line, observation.end_line
+
+
+def _canonical_inspection_provenance(
+    report: InspectionReport, *, evidence: dict, ledger: list[dict]
+) -> InspectionReport:
+    """Bind semantic inspector observations to application-owned authority."""
+    changed_files = {
+        str(path).lstrip("/") for path in evidence.get("changed_files", [])
+    }
+    bounded = report.model_copy(deep=True)
+    observations = {}
+    for observation in bounded.observations:
+        observations.setdefault(observation.requirement_id, []).append(observation)
+    ledger_index = list(enumerate(ledger))
+    for inspection in bounded.inspections:
+        generated: list[EvidenceRef] = []
+        generated_keys: set[tuple[EvidenceKind, str, str, int | None, int | None]] = (
+            set()
+        )
+
+        def add_generated(ref: EvidenceRef) -> None:
+            key = (ref.kind, ref.source_id, ref.path, ref.start_line, ref.end_line)
+            if key not in generated_keys:
+                generated_keys.add(key)
+                generated.append(ref)
+
+        for observation in observations.get(inspection.requirement_id, []):
+            if observation.kind not in {"CODE", "TEST"}:
+                continue
+            path = observation.path.lstrip("/")
+            line_range = _observation_range(observation)
+            if path in changed_files:
+                source_id = "diff:" + hashlib.sha256(path.encode()).hexdigest()[:24]
+                add_generated(
+                    EvidenceRef(
+                        ref_id=_canonical_ref_id(
+                            inspection.requirement_id,
+                            EvidenceKind.TRUSTED_DIFF,
+                            source_id,
+                            path,
+                            *(line_range or (None, None)),
+                        ),
+                        requirement_id=inspection.requirement_id,
+                        kind=EvidenceKind.TRUSTED_DIFF,
+                        source_id=source_id,
+                        path=path,
+                        start_line=(line_range or (None, None))[0],
+                        end_line=(line_range or (None, None))[1],
+                    )
+                )
+                continue
+            if line_range is None:
+                continue
+            start_line, end_line = line_range
+            candidates = [
+                (end - start, index, entry)
+                for index, entry in ledger_index
+                if entry.get("normalized_path") == path
+                and (start := int(entry.get("returned_lines", [0, 0])[0])) <= start_line
+                and (end := int(entry.get("returned_lines", [0, 0])[1])) >= end_line
+            ]
+            if not candidates:
+                continue
+            _span, _index, selected = min(candidates, key=lambda item: item[:2])
+            source_id = str(selected["read_id"])
+            add_generated(
+                EvidenceRef(
+                    ref_id=_canonical_ref_id(
+                        inspection.requirement_id,
+                        EvidenceKind.INSPECTED_FILE,
+                        source_id,
+                        path,
+                        start_line,
+                        end_line,
+                    ),
+                    requirement_id=inspection.requirement_id,
+                    kind=EvidenceKind.INSPECTED_FILE,
+                    source_id=source_id,
+                    path=path,
+                    start_line=start_line,
+                    end_line=end_line,
+                )
+            )
+        for ref in inspection.evidence_refs:
+            path = ref.path.lstrip("/")
+            if ref.kind is EvidenceKind.TRUSTED_DIFF and (
+                not path or path in changed_files
+            ):
+                source_id = (
+                    "diff:"
+                    + hashlib.sha256((path or "whole").encode()).hexdigest()[:24]
+                )
+                add_generated(
+                    EvidenceRef(
+                        ref_id=_canonical_ref_id(
+                            inspection.requirement_id,
+                            EvidenceKind.TRUSTED_DIFF,
+                            source_id,
+                            path,
+                            ref.start_line,
+                            ref.end_line,
+                        ),
+                        requirement_id=inspection.requirement_id,
+                        kind=EvidenceKind.TRUSTED_DIFF,
+                        source_id=source_id,
+                        path=path,
+                        start_line=ref.start_line,
+                        end_line=ref.end_line,
+                    )
+                )
+            elif ref.kind is EvidenceKind.INSPECTED_FILE:
+                line_range = _observation_range(
+                    InspectionObservation(
+                        observation_id="ref-range",
+                        requirement_id=inspection.requirement_id,
+                        kind="CODE",
+                        path=path,
+                        start_line=ref.start_line,
+                        end_line=ref.end_line,
+                    )
+                )
+                if line_range is None:
+                    continue
+                start_line, end_line = line_range
+                candidates = [
+                    (end - start, index, entry)
+                    for index, entry in ledger_index
+                    if entry.get("normalized_path") == path
+                    and (start := int(entry.get("returned_lines", [0, 0])[0]))
+                    <= start_line
+                    and (end := int(entry.get("returned_lines", [0, 0])[1])) >= end_line
+                ]
+                if candidates:
+                    _span, _index, selected = min(candidates, key=lambda item: item[:2])
+                    source_id = str(selected["read_id"])
+                    add_generated(
+                        EvidenceRef(
+                            ref_id=_canonical_ref_id(
+                                inspection.requirement_id,
+                                EvidenceKind.INSPECTED_FILE,
+                                source_id,
+                                path,
+                                start_line,
+                                end_line,
+                            ),
+                            requirement_id=inspection.requirement_id,
+                            kind=EvidenceKind.INSPECTED_FILE,
+                            source_id=source_id,
+                            path=path,
+                            start_line=start_line,
+                            end_line=end_line,
+                        )
+                    )
+        preserved = [
+            ref
+            for ref in inspection.evidence_refs
+            if ref.kind not in {EvidenceKind.INSPECTED_FILE, EvidenceKind.TRUSTED_DIFF}
+        ]
+        inspection.evidence_refs = preserved + generated
+    return bounded
+
+
+def _inspection_failure_diagnostic(
+    *, attempt: int, problems: list[str], ledger: list[dict]
+) -> dict:
+    return {
+        "stage": "inspector",
+        "attempt": attempt,
+        "artifact_problems": problems[:12],
+        "reads": [
+            {
+                "path": item.get("normalized_path", ""),
+                "offset": item.get("offset", 0),
+                "returned_lines": item.get("returned_lines", []),
+            }
+            for item in ledger[:12]
+        ],
+    }
+
+
 def _inspection_artifact_problems(
     contract: list[dict[str, str]],
     inspection: InspectionReport,
@@ -2514,7 +2731,9 @@ def _inspection_artifact_problems(
     expected = {item["requirement_id"]: item for item in contract}
     observations = {item.observation_id: item for item in inspection.observations}
     ledger_by_id = {item["read_id"]: item for item in ledger if item.get("read_id")}
-    changed_files = set(evidence.get("changed_files", []))
+    changed_files = {
+        str(path).lstrip("/") for path in evidence.get("changed_files", [])
+    }
     execution_ids = {
         str(item.get("evidence_id"))
         for item in evidence.get("execution_observations", [])
@@ -2715,7 +2934,10 @@ def _inspection_correction_prompt(evidence: dict, problems: list[str]) -> str:
                     "VERIFIED unless its classification-specific proof obligations "
                     "are satisfied. For behavioral requirements, read unchanged "
                     "files with read_repo_file before emitting grounded CODE facts; "
-                    "for validation requirements cite authoritative EXECUTION refs."
+                    "emit the semantic path and complete line range, but never "
+                    "invent or copy an opaque read ID. The application binds reads "
+                    "deterministically. For validation requirements cite an exact "
+                    "authoritative EXECUTION evidence_id shown in the evidence."
                 ),
             },
             sort_keys=True,
@@ -3043,6 +3265,9 @@ def review_execution(
         except (ModelCallLimitExceededError, ToolCallLimitExceededError):
             inspection_truncated = True
             break
+        inspection_report = _canonical_inspection_provenance(
+            inspection_report, evidence=evidence, ledger=ledger
+        )
         resolved = _resolved_evidence(evidence, inspection_report, ledger)
         inspection_report = _fail_closed_unavailable_inspections(
             inspection_report, set(resolved.unavailable_requirement_ids)
@@ -3054,7 +3279,12 @@ def review_execution(
             break
         if inspection_attempt == 1:
             raise ReviewFinalizationError(
-                "inspector returned an invalid inspection artifact after correction"
+                "inspector returned an invalid inspection artifact after correction",
+                diagnostic=_inspection_failure_diagnostic(
+                    attempt=inspection_attempt + 1,
+                    problems=artifact_problems,
+                    ledger=ledger,
+                ),
             )
         inspection_prompt = _inspection_correction_prompt(evidence, artifact_problems)
     else:
