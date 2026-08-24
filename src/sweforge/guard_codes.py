@@ -52,7 +52,7 @@ class GuardCode(StrEnum):
     FA_CHALLENGE_NOT_SUPPORTED = "FA-CHALLENGE-NOT-SUPPORTED"
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True)
 class GuardProblem:
     """A stable guard identifier plus the unchanged, variable diagnostic text."""
 
@@ -61,13 +61,3 @@ class GuardProblem:
 
     def __str__(self) -> str:
         return self.detail
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, GuardProblem):
-            return self.code is other.code and self.detail == other.detail
-        if isinstance(other, str):
-            return self.detail == other
-        return NotImplemented
-
-    def __hash__(self) -> int:
-        return hash((self.code, self.detail))

@@ -9,6 +9,7 @@ from langchain.agents.structured_output import ToolStrategy
 from sweforge.execution import recover_stale
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import SQLiteGitHubStore, WorkflowPhase
+from sweforge.guard_codes import GuardCode, GuardProblem
 from sweforge.reviewer import (
     REVIEW_INSPECTION_MODEL_CALL_LIMIT,
     REVIEW_INSPECTION_TOOL_CALL_LIMIT,
@@ -1565,17 +1566,20 @@ def test_unchanged_code_requires_matching_read_range():
             }
         ],
     )
-    assert "ungrounded code observation for REQ-B" in _inspection_artifact_problems(
-        [{"requirement_id": "REQ-B", "classification": "BEHAVIORAL"}],
-        outside,
-        ledger=[
-            {
-                "read_id": "read:narrow",
-                "normalized_path": "src/main.py",
-                "returned_lines": [10, 20],
-            }
-        ],
-        evidence={"changed_files": []},
+    assert any(
+        problem.detail == "ungrounded code observation for REQ-B"
+        for problem in _inspection_artifact_problems(
+            [{"requirement_id": "REQ-B", "classification": "BEHAVIORAL"}],
+            outside,
+            ledger=[
+                {
+                    "read_id": "read:narrow",
+                    "normalized_path": "src/main.py",
+                    "returned_lines": [10, 20],
+                }
+            ],
+            evidence={"changed_files": []},
+        )
     )
 
 
@@ -1589,7 +1593,10 @@ def test_provenance_binding_rejects_missing_and_wrong_path_reads():
         ledger=[],
         evidence={"changed_files": []},
     )
-    assert "ungrounded code observation for REQ-B" in problems
+    assert any(
+        problem.detail == "ungrounded code observation for REQ-B"
+        for problem in problems
+    )
 
     wrong_path = _canonical_inspection_provenance(
         _semantic_inspection(),
@@ -1602,17 +1609,20 @@ def test_provenance_binding_rejects_missing_and_wrong_path_reads():
             }
         ],
     )
-    assert "ungrounded code observation for REQ-B" in _inspection_artifact_problems(
-        [{"requirement_id": "REQ-B", "classification": "BEHAVIORAL"}],
-        wrong_path,
-        ledger=[
-            {
-                "read_id": "read:other",
-                "normalized_path": "src/other.py",
-                "returned_lines": [1, 20],
-            }
-        ],
-        evidence={"changed_files": []},
+    assert any(
+        problem.detail == "ungrounded code observation for REQ-B"
+        for problem in _inspection_artifact_problems(
+            [{"requirement_id": "REQ-B", "classification": "BEHAVIORAL"}],
+            wrong_path,
+            ledger=[
+                {
+                    "read_id": "read:other",
+                    "normalized_path": "src/other.py",
+                    "returned_lines": [1, 20],
+                }
+            ],
+            evidence={"changed_files": []},
+        )
     )
 
 
@@ -1664,7 +1674,12 @@ def test_rendered_evidence_exposes_exact_execution_ids_to_inspector():
 def test_inspector_failure_diagnostic_is_bounded_and_excludes_contents():
     diagnostic = _inspection_failure_diagnostic(
         attempt=2,
-        problems=["ungrounded code observation for REQ-B"],
+        problems=[
+            GuardProblem(
+                GuardCode.IA_UNGROUNDED_OBSERVATION,
+                "ungrounded code observation for REQ-B",
+            )
+        ],
         ledger=[
             {
                 "normalized_path": "src/main.py",
@@ -3026,7 +3041,10 @@ def test_inspection_artifact_rejects_ungrounded_unchanged_code():
         ledger=[],
         evidence={"changed_files": []},
     )
-    assert "ungrounded code observation for plan:step:1" in problems
+    assert any(
+        problem.detail == "ungrounded code observation for plan:step:1"
+        for problem in problems
+    )
 
 
 def test_inspection_artifact_requires_execution_for_validation():
@@ -3050,8 +3068,11 @@ def test_inspection_artifact_requires_execution_for_validation():
         == []
     )
     invalid = _inspection_report(requirement_id)
-    assert "missing direct execution evidence for plan:validation:1" in (
-        _inspection_artifact_problems(contract, invalid, ledger=[], evidence={})
+    assert any(
+        problem.detail == "missing direct execution evidence for plan:validation:1"
+        for problem in _inspection_artifact_problems(
+            contract, invalid, ledger=[], evidence={}
+        )
     )
 
 
@@ -3106,9 +3127,9 @@ def test_inspection_artifact_rejects_test_without_assertion_signal():
             ),
         ],
     )
-    assert (
-        "missing assertion or signal for plan:step:1"
-        in _inspection_artifact_problems(
+    assert any(
+        problem.detail == "missing assertion or signal for plan:step:1"
+        for problem in _inspection_artifact_problems(
             _inspection_contract(ReviewRequirementClassification.BEHAVIORAL.value),
             report,
             ledger=[],

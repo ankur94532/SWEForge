@@ -35,10 +35,6 @@ def _guard_problem(code: GuardCode, detail: str) -> GuardProblem:
     return GuardProblem(code=code, detail=detail)
 
 
-def _problem_text(problem: GuardProblem | str) -> str:
-    return problem.detail if isinstance(problem, GuardProblem) else problem
-
-
 class ExecutionReviewVerdict(StrEnum):
     ACCEPT = "ACCEPT"
     NEEDS_FIXES = "NEEDS_FIXES"
@@ -2839,15 +2835,13 @@ def _canonical_inspection_provenance(
 
 
 def _inspection_failure_diagnostic(
-    *, attempt: int, problems: list[GuardProblem | str], ledger: list[dict]
+    *, attempt: int, problems: list[GuardProblem], ledger: list[dict]
 ) -> dict:
     return {
         "stage": "inspector",
         "attempt": attempt,
-        "artifact_problems": [_problem_text(item) for item in problems[:12]],
-        "guard_codes": [
-            item.code.value for item in problems[:12] if isinstance(item, GuardProblem)
-        ],
+        "artifact_problems": [item.detail for item in problems[:12]],
+        "guard_codes": [item.code.value for item in problems[:12]],
         "reads": [
             {
                 "path": item.get("normalized_path", ""),
