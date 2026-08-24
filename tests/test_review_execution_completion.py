@@ -2785,14 +2785,22 @@ def test_reviewer_prompts_require_full_contract_semantics():
     assert "read_repo_file" in INSPECTOR_SYSTEM_PROMPT
     assert "assertion_or_signal" in INSPECTOR_SYSTEM_PROMPT
     assert "never replaces CODE grounding" in INSPECTOR_SYSTEM_PROMPT
+    assert "never substitute" in INSPECTOR_SYSTEM_PROMPT
+    assert "both a CODE" in INSPECTOR_SYSTEM_PROMPT
     assert "Never mark VERIFIED" in INSPECTOR_SYSTEM_PROMPT
     assert "copied verbatim" in INSPECTOR_SYSTEM_PROMPT
     assert "Never put command text" in INSPECTOR_SYSTEM_PROMPT
     assert "never a directory path" in INSPECTOR_SYSTEM_PROMPT
+    assert "exact non-empty source_id" in FINALIZER_SYSTEM_PROMPT
 
 
 def test_inspector_schema_describes_exact_execution_and_file_authority():
-    from sweforge.reviewer import EvidenceRef, InspectionObservation
+    from sweforge.reviewer import (
+        EvidenceRef,
+        InspectionObservation,
+        InspectionReport,
+        ReviewRequirementCheck,
+    )
 
     ref_description = EvidenceRef.model_json_schema()["properties"]["source_id"][
         "description"
@@ -2800,9 +2808,22 @@ def test_inspector_schema_describes_exact_execution_and_file_authority():
     observation_description = InspectionObservation.model_json_schema()["properties"][
         "path"
     ]["description"]
+    kind_description = InspectionObservation.model_json_schema()["properties"]["kind"][
+        "description"
+    ]
+    observations_description = InspectionReport.model_json_schema()["properties"][
+        "observations"
+    ]["description"]
+    final_refs_description = ReviewRequirementCheck.model_json_schema()["properties"][
+        "evidence_refs"
+    ]["description"]
     assert "exact evidence_id" in ref_description
     assert "Never use command text" in ref_description
+    assert "exact non-empty source_id" in ref_description
     assert "never use a directory" in observation_description
+    assert "never replace" in kind_description
+    assert "at least one CODE" in observations_description
+    assert "exact non-empty source_id" in final_refs_description
 
 
 def test_finalizer_prompt_declares_uncommitted_worktree_authority():

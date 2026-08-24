@@ -93,7 +93,10 @@ class EvidenceRef(BaseModel):
         description=(
             "For EXECUTION evidence, copy the exact evidence_id supplied in the "
             "authoritative execution observations. Never use command text, a "
-            "sequence label, prose, or a reconstructed identifier."
+            "sequence label, prose, or a reconstructed identifier. For "
+            "INSPECTED_FILE evidence in a final requirement check, copy the exact "
+            "non-empty source_id supplied in the evidence catalog; never omit, "
+            "invent, or reconstruct a repository read ID."
         ),
     )
     path: str = Field(default="", max_length=500)
@@ -104,7 +107,13 @@ class EvidenceRef(BaseModel):
 class InspectionObservation(BaseModel):
     observation_id: str = Field(min_length=1, max_length=120)
     requirement_id: str = Field(min_length=1, max_length=120)
-    kind: Literal["CODE", "TEST", "EXECUTION"]
+    kind: Literal["CODE", "TEST", "EXECUTION"] = Field(
+        description=(
+            "Every VERIFIED BEHAVIORAL requirement must have a CODE observation. "
+            "TEST and EXECUTION observations are supplemental and never replace "
+            "that mandatory CODE observation."
+        )
+    )
     path: str = Field(
         default="",
         max_length=500,
@@ -131,7 +140,13 @@ class InspectionReport(BaseModel):
         default_factory=list, max_length=80
     )
     observations: list[InspectionObservation] = Field(
-        default_factory=list, max_length=160
+        default_factory=list,
+        max_length=160,
+        description=(
+            "For each VERIFIED BEHAVIORAL requirement include at least one CODE "
+            "observation. If test semantics or execution evidence matter, add "
+            "separate TEST or EXECUTION observations for the same requirement."
+        ),
     )
 
 
@@ -371,7 +386,15 @@ class ReviewRequirementCheck(BaseModel):
     requirement_id: str = Field(min_length=1, max_length=120)
     status: ReviewRequirementStatus
     evidence: str = Field(max_length=2_000)
-    evidence_refs: list[EvidenceRef] = Field(default_factory=list, max_length=20)
+    evidence_refs: list[EvidenceRef] = Field(
+        default_factory=list,
+        max_length=20,
+        description=(
+            "Copy evidence authority exactly from the supplied catalog. Every "
+            "INSPECTED_FILE reference must preserve its exact non-empty source_id, "
+            "path, and line range."
+        ),
+    )
     repairability: ReviewRepairability = ReviewRepairability.NOT_APPLICABLE
 
 
@@ -802,9 +825,13 @@ INSPECTOR_SYSTEM_PROMPT = (
     "authority. For every VERIFIED BEHAVIORAL requirement, emit a CODE observation "
     "for that exact requirement with a concrete relevant path; if the path is "
     "unchanged, use read_repo_file first and cite the matching inspected-file/read "
-    "ledger authority. When test semantics matter, emit a TEST observation with "
-    "the actual assertion_or_signal. Execution success may supplement behavioral "
-    "proof but never replaces CODE grounding. For every VERIFIED VALIDATION "
+    "ledger authority. TEST and EXECUTION observations never substitute for this "
+    "mandatory CODE observation. When test semantics matter, emit both a CODE "
+    "observation and a separate TEST observation for that exact requirement, with "
+    "the actual assertion_or_signal on TEST. Execution success may supplement "
+    "behavioral proof but never replaces CODE grounding. This rule also applies "
+    "when a behavioral requirement is phrased as a test or validation step. For "
+    "every VERIFIED VALIDATION "
     "requirement, cite the exact authoritative EXECUTION evidence; its source_id "
     "must be copied verbatim from that observation's evidence_id. Never put command "
     "text, sequence labels, prose, or reconstructed identifiers in EXECUTION "
@@ -875,7 +902,10 @@ FINALIZER_SYSTEM_PROMPT = (
     "instructions for IN_SCOPE_REPAIR. ACCEPT requires all requirements to be "
     "SATISFIED. Passing "
     "tests alone does not prove an unasserted behavioral guarantee; executor claims "
-    "are untrusted, and test names are not evidence by themselves."
+    "are untrusted, and test names are not evidence by themselves. Copy evidence "
+    "authority from the supplied evidence catalog exactly. Every INSPECTED_FILE "
+    "reference must preserve the catalog's exact non-empty source_id, path, and "
+    "line range; never omit, invent, or reconstruct a repository read ID."
 )
 
 
@@ -3265,7 +3295,10 @@ def _finalizer_prompt(
         "EXTERNAL_BLOCKER or NOT_APPLICABLE for repairability, or when authority "
         "is materially inconsistent. ACCEPT is legal only when every requirement "
         "is SATISFIED. "
-        "If any check is UNSATISFIED or UNVERIFIED, ACCEPT is forbidden.\n\n"
+        "If any check is UNSATISFIED or UNVERIFIED, ACCEPT is forbidden. For each "
+        "evidence reference, copy its authority fields from the supplied catalog "
+        "exactly. An INSPECTED_FILE evidence reference with an empty source_id is "
+        "invalid.\n\n"
         "[Current review contract]\n" + contract + "\n\n"
         "[Trusted execution evidence]\n"
         + render_review_evidence(evidence)
