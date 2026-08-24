@@ -87,7 +87,15 @@ class EvidenceRef(BaseModel):
     ref_id: str = Field(min_length=1, max_length=160)
     requirement_id: str = Field(min_length=1, max_length=120)
     kind: EvidenceKind
-    source_id: str = Field(default="", max_length=160)
+    source_id: str = Field(
+        default="",
+        max_length=160,
+        description=(
+            "For EXECUTION evidence, copy the exact evidence_id supplied in the "
+            "authoritative execution observations. Never use command text, a "
+            "sequence label, prose, or a reconstructed identifier."
+        ),
+    )
     path: str = Field(default="", max_length=500)
     start_line: int | None = Field(default=None, ge=1, le=100_000)
     end_line: int | None = Field(default=None, ge=1, le=100_000)
@@ -97,7 +105,14 @@ class InspectionObservation(BaseModel):
     observation_id: str = Field(min_length=1, max_length=120)
     requirement_id: str = Field(min_length=1, max_length=120)
     kind: Literal["CODE", "TEST", "EXECUTION"]
-    path: str = Field(default="", max_length=500)
+    path: str = Field(
+        default="",
+        max_length=500,
+        description=(
+            "Concrete repository file path grounding this observation; never use a "
+            "directory or an invented path."
+        ),
+    )
     start_line: int | None = Field(default=None, ge=1, le=100_000)
     end_line: int | None = Field(default=None, ge=1, le=100_000)
     fact: str = Field(default="", max_length=1_000)
@@ -790,9 +805,13 @@ INSPECTOR_SYSTEM_PROMPT = (
     "ledger authority. When test semantics matter, emit a TEST observation with "
     "the actual assertion_or_signal. Execution success may supplement behavioral "
     "proof but never replaces CODE grounding. For every VERIFIED VALIDATION "
-    "requirement, cite the exact authoritative EXECUTION evidence; CODE is not "
-    "inherently required. Never mark VERIFIED when these proof obligations are "
-    "missing, and executor prose is never evidence."
+    "requirement, cite the exact authoritative EXECUTION evidence; its source_id "
+    "must be copied verbatim from that observation's evidence_id. Never put command "
+    "text, sequence labels, prose, or reconstructed identifiers in EXECUTION "
+    "source_id. CODE and TEST observations must use a concrete file path and "
+    "matching line range, never a directory path. CODE is not inherently required "
+    "for validation-only requirements. Never mark VERIFIED when these proof "
+    "obligations are missing, and executor prose is never evidence."
 )
 
 

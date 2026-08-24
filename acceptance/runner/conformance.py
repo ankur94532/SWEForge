@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from collections import Counter
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -157,15 +158,17 @@ def evaluate_runs(
     expected_verdict: str | None,
     classifications: dict[str, str],
     run_once: RunOnce,
+    run_workers: int = 1,
 ) -> dict[str, Any]:
     if runs < 1:
         raise ValueError("runs must be at least 1")
+    if run_workers < 1:
+        raise ValueError("run_workers must be at least 1")
     kind = fixture_class(fixture_id)
-    records: list[dict[str, Any]] = []
     occurrence_histogram: Counter[str] = Counter()
     run_histogram: Counter[str] = Counter()
 
-    for index in range(1, runs + 1):
+    def measure(index: int) -> tuple[dict[str, Any], list[str]]:
         observations: list[ReviewAttemptObservation] = []
         result: ExecutionReviewResult | None = None
         error: BaseException | None = None
@@ -174,12 +177,10 @@ def evaluate_runs(
         except Exception as exc:  # each failed invocation is measurement, not a retry
             error = exc
 
-        per_run_codes: set[str] = set()
-        for observation in observations:
-            codes = _guard_codes(observation)
-            occurrence_histogram.update(codes)
-            per_run_codes.update(codes)
-        run_histogram.update(per_run_codes)
+        observed_codes = [
+            code for observation in observations for code in _guard_codes(observation)
+        ]
+        per_run_codes = set(observed_codes)
 
         first_pass = _first_pass_classification(observations, classifications)
         eventual = _eventual_classification(observations, classifications, error)
@@ -191,7 +192,7 @@ def evaluate_runs(
         raw_verdict = (
             final.artifact.get("finalizer", {}).get("verdict") if final else None
         )
-        records.append(
+        return (
             {
                 "run": index,
                 "first_pass": first_pass,
@@ -217,8 +218,19 @@ def evaluate_runs(
                     else None
                 ),
                 "observations": [_observation_dict(item) for item in observations],
-            }
+            },
+            observed_codes,
         )
+
+    if run_workers == 1:
+        measurements = [measure(index) for index in range(1, runs + 1)]
+    else:
+        with ThreadPoolExecutor(max_workers=min(run_workers, runs)) as executor:
+            measurements = list(executor.map(measure, range(1, runs + 1)))
+    records = [record for record, _codes in measurements]
+    for _record, observed_codes in measurements:
+        occurrence_histogram.update(observed_codes)
+        run_histogram.update(set(observed_codes))
 
     first_counts = Counter(item["first_pass"] for item in records)
     eventual_counts = Counter(item["eventual"] for item in records)
@@ -307,6 +319,7 @@ def run_fixture(
     model: str,
     runs: int,
     classifications: dict[str, str],
+    run_workers: int = 1,
 ) -> dict[str, Any]:
     fixture = load_fixture(path)
     derived_contract = review_requirement_contract(fixture["evidence"])
@@ -344,6 +357,7 @@ def run_fixture(
             expected_verdict=expected_verdict,
             classifications=classifications,
             run_once=invoke,
+            run_workers=run_workers,
         )
     report["execution_evidence_ids"] = sorted(
         str(item["evidence_id"])
@@ -431,12 +445,40 @@ def _summary(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def run_live_fixtures(
+    paths: list[Path],
+    *,
+    model: str,
+    runs: int,
+    classifications: dict[str, str],
+    workers: int,
+    run_workers: int = 1,
+) -> list[dict[str, Any]]:
+    """Run independent fixture jobs concurrently, preserving input order."""
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+
+    def run(path: Path) -> dict[str, Any]:
+        return run_fixture(
+            path,
+            model=model,
+            runs=runs,
+            classifications=classifications,
+            run_workers=run_workers,
+        )
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(paths))) as executor:
+        return list(executor.map(run, paths))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fixtures", type=Path, nargs="+")
     parser.add_argument("--model")
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--run-workers", type=int, default=1)
     parser.add_argument("--classifications", type=Path, default=DEFAULT_CLASSIFICATIONS)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
@@ -451,15 +493,14 @@ def main(argv: list[str] | None = None) -> int:
         overall_verdict = "OFFLINE_BASELINE_VALID"
     else:
         classifications = load_guard_classifications(args.classifications)
-        fixtures = [
-            run_fixture(
-                path,
-                model=args.model,
-                runs=args.runs,
-                classifications=classifications,
-            )
-            for path in paths
-        ]
+        fixtures = run_live_fixtures(
+            paths,
+            model=args.model,
+            runs=args.runs,
+            classifications=classifications,
+            workers=args.workers,
+            run_workers=args.run_workers,
+        )
         model = args.model
         overall_verdict = (
             "PASS"
@@ -470,6 +511,8 @@ def main(argv: list[str] | None = None) -> int:
         "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "model": model,
         "runs_per_fixture": args.runs,
+        "workers": args.workers,
+        "run_workers": args.run_workers,
         "fixtures": fixtures,
         "verdict": overall_verdict,
     }

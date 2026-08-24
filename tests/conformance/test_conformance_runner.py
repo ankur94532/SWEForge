@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -7,6 +9,7 @@ from acceptance.runner.conformance import (
     evaluate_runs,
     fixture_class,
     main,
+    run_live_fixtures,
 )
 from sweforge.guard_codes import GuardCode, GuardProblem
 from sweforge.reviewer import (
@@ -247,3 +250,52 @@ def test_offline_cli_validates_all_eight_stored_baselines(tmp_path, capsys):
         "STABLE",
         "CONTESTED",
     }
+
+
+def test_live_fixture_jobs_run_concurrently_and_preserve_order(monkeypatch):
+    barrier = threading.Barrier(2)
+
+    def fake_run_fixture(path, **_kwargs):
+        barrier.wait(timeout=1)
+        time.sleep(0.01)
+        return {"fixture": path.name}
+
+    monkeypatch.setattr(
+        "acceptance.runner.conformance.run_fixture", fake_run_fixture
+    )
+    paths = [Path("second"), Path("first")]
+    assert run_live_fixtures(
+        paths,
+        model="scripted",
+        runs=1,
+        classifications={},
+        workers=2,
+    ) == [{"fixture": "second"}, {"fixture": "first"}]
+
+
+def test_runs_can_execute_concurrently_and_preserve_sample_order():
+    barrier = threading.Barrier(2)
+    call_lock = threading.Lock()
+    next_call = 0
+
+    def run_once(observer):
+        nonlocal next_call
+        with call_lock:
+            next_call += 1
+            call = next_call
+        barrier.wait(timeout=1)
+        observer(_observation("INSPECTION"))
+        observer(_observation("FINALIZATION", raw_verdict="BLOCKED"))
+        return ExecutionReviewResult(verdict="BLOCKED", summary=f"call {call}")
+
+    report = evaluate_runs(
+        fixture_id="RF-016-inspector-authority",
+        model="scripted",
+        runs=2,
+        expected_verdict=None,
+        classifications=CLASSIFICATIONS,
+        run_once=run_once,
+        run_workers=2,
+    )
+    assert [record["run"] for record in report["results"]] == [1, 2]
+    assert report["eventual"]["rate"] == 1.0
