@@ -50,6 +50,14 @@ class ReviewRequirementStatus(StrEnum):
     UNVERIFIED = "UNVERIFIED"
 
 
+class ReviewRepairability(StrEnum):
+    """Application-visible classification for a non-satisfied requirement."""
+
+    IN_SCOPE_REPAIR = "IN_SCOPE_REPAIR"
+    EXTERNAL_BLOCKER = "EXTERNAL_BLOCKER"
+    NOT_APPLICABLE = "NOT_APPLICABLE"
+
+
 class InspectionStatus(StrEnum):
     VERIFIED = "VERIFIED"
     CONTRADICTED = "CONTRADICTED"
@@ -342,6 +350,7 @@ class ReviewRequirementCheck(BaseModel):
     status: ReviewRequirementStatus
     evidence: str = Field(max_length=2_000)
     evidence_refs: list[EvidenceRef] = Field(default_factory=list, max_length=20)
+    repairability: ReviewRepairability = ReviewRepairability.NOT_APPLICABLE
 
 
 class ExecutionReviewResult(BaseModel):
@@ -679,6 +688,36 @@ INSPECTOR_SYSTEM_PROMPT = (
     "Return narrow code facts, not broad semantic conclusions."
 )
 
+
+def _guard_repairability(result: ExecutionReviewResult) -> ExecutionReviewResult:
+    """Route explicitly repairable review gaps into the repair lifecycle."""
+    if result.verdict != "BLOCKED":
+        return result
+    checks = [
+        check
+        for check in result.requirement_checks
+        if check.status is not ReviewRequirementStatus.SATISFIED
+    ]
+    if (
+        not checks
+        or not result.repair_instructions
+        or any(
+            check.repairability is not ReviewRepairability.IN_SCOPE_REPAIR
+            for check in checks
+        )
+    ):
+        return result
+    return result.model_copy(
+        update={
+            "verdict": "NEEDS_FIXES",
+            "summary": (
+                result.summary[:1_700]
+                + " Repairable in-scope deficiencies are routed to REVIEW_REPAIR."
+            ),
+        }
+    )
+
+
 FINALIZER_SYSTEM_PROMPT = (
     "You are the bounded structured execution-review finalizer. The approved plan "
     "and trusted execution evidence are authoritative. Every iteration independently "
@@ -688,10 +727,15 @@ FINALIZER_SYSTEM_PROMPT = (
     "application-generated inspection and specialist authority facts are constraints. "
     "ACCEPT only "
     "when the exact approved plan is materially satisfied by observable evidence. "
-    "Use NEEDS_FIXES only for deficiencies repairable within that exact approved plan. "
-    "Use BLOCKED when scope expansion is required or evidence is materially "
-    "insufficient or inconsistent. If inspection was truncated and unresolved material "
-    "evidence is needed, return BLOCKED. Do not edit, execute, publish, write memory, "
+    "Use NEEDS_FIXES when a non-satisfied requirement is explicitly classified "
+    "IN_SCOPE_REPAIR and the repair instructions can correct or validate it within "
+    "the exact approved plan. Missing validation because an in-scope action was "
+    "omitted is NEEDS_FIXES, not BLOCKED; a repair may generate new authoritative "
+    "execution evidence. Use BLOCKED only when a non-satisfied requirement is "
+    "EXTERNAL_BLOCKER or the authority problem is not classified as an in-scope "
+    "repair. If inspection was truncated and unresolved material evidence is needed, "
+    "classify whether an authorized repair can obtain it before choosing a verdict. "
+    "Do not edit, execute, publish, write memory, "
     "or include chain-of-thought; return only the bounded structured verdict. "
     "Execution review occurs before publication, so the task workspace may be dirty "
     "and uncommitted during execution, review, and repair. Absence of a commit, push, "
@@ -700,7 +744,10 @@ FINALIZER_SYSTEM_PROMPT = (
     "repository evidence. Return one requirement check per expected ID. Mark a "
     "requirement SATISFIED only when concrete observable evidence supports it, "
     "UNSATISFIED when current evidence contradicts it, and UNVERIFIED when evidence "
-    "is insufficient. ACCEPT requires all requirements to be SATISFIED. Passing "
+    "is insufficient. For every non-SATISFIED check, return repairability as "
+    "IN_SCOPE_REPAIR, EXTERNAL_BLOCKER, or NOT_APPLICABLE and provide repair "
+    "instructions for IN_SCOPE_REPAIR. ACCEPT requires all requirements to be "
+    "SATISFIED. Passing "
     "tests alone does not prove an unasserted behavioral guarantee; executor claims "
     "are untrusted, and test names are not evidence by themselves."
 )
@@ -2584,9 +2631,12 @@ def _finalizer_prompt(
         "facts are constraints, not suggestions. "
         + semantic_instructions
         + " An inspector CONTRADICTED or UNVERIFIED requirement cannot be SATISFIED. "
-        "Use BLOCKED when "
-        "evidence is insufficient or inconsistent and no concrete repairable defect "
-        "is established. ACCEPT is legal only when every requirement is SATISFIED. "
+        "Use NEEDS_FIXES when a non-satisfied requirement is classified "
+        "IN_SCOPE_REPAIR and actionable repair instructions are possible within "
+        "the approved plan. Use BLOCKED when a non-satisfied requirement is "
+        "EXTERNAL_BLOCKER or NOT_APPLICABLE for repairability, or when authority "
+        "is materially inconsistent. ACCEPT is legal only when every requirement "
+        "is SATISFIED. "
         "If any check is UNSATISFIED or UNVERIFIED, ACCEPT is forbidden.\n\n"
         "[Current review contract]\n" + contract + "\n\n"
         "[Trusted execution evidence]\n"
@@ -2897,6 +2947,7 @@ def review_execution(
         raise ReviewFinalizationError(
             "execution review returned an invalid structured verdict"
         ) from exc
+    parsed = _guard_repairability(parsed)
     guarded = _guard_accept_coverage(
         parsed,
         contract,

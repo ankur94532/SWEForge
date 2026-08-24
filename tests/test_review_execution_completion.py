@@ -37,6 +37,7 @@ from sweforge.reviewer import (
     ReviewerReadError,
     ReviewFinalizationError,
     ReviewFinding,
+    ReviewRepairability,
     ReviewRequirementCheck,
     ReviewRequirementClassification,
     ReviewRequirementStatus,
@@ -57,6 +58,7 @@ from sweforge.reviewer import (
     _fail_closed_unavailable_inspections,
     _finalizer_prompt,
     _guard_accept_coverage,
+    _guard_repairability,
     _invoke_specialist,
     _lexical_tokens,
     _resolve_reviewer_file,
@@ -2084,6 +2086,73 @@ def _complete_review_checks(evidence):
         )
         for item in review_requirement_contract(evidence)
     ]
+
+
+@pytest.mark.parametrize(
+    "label, response_text, command_exit, expected",
+    [
+        ("omitted validation", "Tests were not run", None, "NEEDS_FIXES"),
+        ("executor prose", "mvn test passed", None, "NEEDS_FIXES"),
+        ("failed validation", "Maven failed", 1, "NEEDS_FIXES"),
+    ],
+)
+def test_repairable_validation_gaps_route_to_needs_fixes(
+    label, response_text, command_exit, expected
+):
+    del label, response_text, command_exit
+    result = ExecutionReviewResult(
+        verdict="BLOCKED",
+        summary="validation evidence is missing or failed",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id="plan:validation:1",
+                status=ReviewRequirementStatus.UNVERIFIED,
+                evidence="no authoritative observation",
+                repairability=ReviewRepairability.IN_SCOPE_REPAIR,
+            )
+        ],
+        repair_instructions=["run the approved validation and preserve its evidence"],
+    )
+    guarded = _guard_repairability(result)
+    assert guarded.verdict == expected
+    assert guarded.repair_instructions
+
+
+def test_unclassified_or_external_blockers_remain_blocked():
+    for repairability in (
+        ReviewRepairability.NOT_APPLICABLE,
+        ReviewRepairability.EXTERNAL_BLOCKER,
+    ):
+        result = ExecutionReviewResult(
+            verdict="BLOCKED",
+            summary="authority blocker",
+            requirement_checks=[
+                ReviewRequirementCheck(
+                    requirement_id="plan:validation:1",
+                    status=ReviewRequirementStatus.UNVERIFIED,
+                    evidence="cannot establish authority",
+                    repairability=repairability,
+                )
+            ],
+            repair_instructions=["investigate"],
+        )
+        assert _guard_repairability(result).verdict == "BLOCKED"
+
+
+def test_repairability_guard_does_not_accept_missing_evidence():
+    result = ExecutionReviewResult(
+        verdict="ACCEPT",
+        summary="claimed passed",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id="plan:validation:1",
+                status=ReviewRequirementStatus.UNVERIFIED,
+                evidence="prose only",
+                repairability=ReviewRepairability.IN_SCOPE_REPAIR,
+            )
+        ],
+    )
+    assert _guard_repairability(result).verdict == "ACCEPT"
 
 
 def test_review_execution_uses_split_semantic_artifact_not_broad_challenger(
