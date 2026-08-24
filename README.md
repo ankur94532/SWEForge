@@ -13,7 +13,7 @@ export ANTHROPIC_API_KEY=...
 ```
 
 Other provider model strings supported by LangChain can be used, for example
-`openai:gpt-5.5` or `google_genai:gemini-3.6-flash`, with the corresponding
+`openai:gpt-5.5` or `google_genai:gemini-3.6-flash` or `anthropic:claude-sonnet-5`, with the corresponding
 provider package and credentials installed.
 
 ## Run
