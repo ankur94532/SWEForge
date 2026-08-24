@@ -27,6 +27,7 @@ from sweforge.reviewer import (
     FindingCandidateAssociation,
     InspectionObservation,
     InspectionReport,
+    InspectionStatus,
     LocalEvidenceSlice,
     RequirementChallenge,
     RequirementChallengeVerdict,
@@ -1161,6 +1162,300 @@ def test_requirement_classification_is_conservative_and_deterministic():
         behavioral[0]["classification"]
         == ReviewRequirementClassification.BEHAVIORAL.value
     )
+    validation = build_review_requirement_contract(
+        "", "Validation:\n- run the focused checker\n- verify the full suite"
+    )
+    assert [item["classification"] for item in validation] == [
+        ReviewRequirementClassification.VALIDATION.value,
+        ReviewRequirementClassification.VALIDATION.value,
+    ]
+
+
+def _coverage_guard_fixture(
+    requirement_id, classification, refs, *, execution=True, changed_files=None
+):
+    inspection = InspectionReport(
+        inspections=[
+            RequirementInspection(
+                requirement_id=requirement_id,
+                status=InspectionStatus.VERIFIED,
+                evidence_refs=refs,
+            )
+        ]
+    )
+    result = ExecutionReviewResult(
+        verdict="ACCEPT",
+        summary="accepted",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id=requirement_id,
+                status=ReviewRequirementStatus.SATISFIED,
+                evidence="trusted",
+                evidence_refs=refs,
+            )
+        ],
+    )
+    semantic = _guard_semantic()
+    contract = [
+        {
+            "requirement_id": requirement_id,
+            "text": "requirement",
+            "classification": classification,
+        }
+    ]
+    evidence = {"changed_files": changed_files or []}
+    if execution:
+        evidence["execution"] = [{"evidence_id": "exec-1"}]
+        evidence["execution_observations"] = [
+            {"evidence_id": "exec-1", "command": "test", "exit_code": 0}
+        ]
+    return _guard_accept_coverage(
+        result,
+        contract,
+        inspection=inspection,
+        semantic_review=semantic,
+        ledger=[],
+        evidence=evidence,
+    )
+
+
+def test_accept_guard_allows_validation_with_authoritative_execution_only():
+    ref = EvidenceRef(
+        ref_id="exec-ref",
+        requirement_id="plan:validation:1",
+        kind=EvidenceKind.EXECUTION,
+        source_id="exec-1",
+    )
+    assert (
+        _coverage_guard_fixture(
+            "plan:validation:1",
+            ReviewRequirementClassification.VALIDATION.value,
+            [ref],
+        ).verdict
+        == "ACCEPT"
+    )
+
+
+def test_accept_guard_rejects_validation_without_execution():
+    ref = EvidenceRef(
+        ref_id="diff-ref",
+        requirement_id="plan:validation:1",
+        kind=EvidenceKind.TRUSTED_DIFF,
+        path="src/test.py",
+    )
+    guarded = _coverage_guard_fixture(
+        "plan:validation:1",
+        ReviewRequirementClassification.VALIDATION.value,
+        [ref],
+        execution=False,
+    )
+    assert guarded.verdict == "BLOCKED"
+    assert "missing direct execution evidence" in guarded.findings[0].evidence
+
+
+def test_accept_guard_keeps_behavioral_implementation_code_grounding():
+    ref = EvidenceRef(
+        ref_id="exec-ref",
+        requirement_id="plan:step:1",
+        kind=EvidenceKind.EXECUTION,
+        source_id="exec-1",
+    )
+    guarded = _coverage_guard_fixture(
+        "plan:step:1",
+        ReviewRequirementClassification.BEHAVIORAL.value,
+        [ref],
+    )
+    assert guarded.verdict == "BLOCKED"
+    assert "missing direct code observation" in guarded.findings[0].evidence
+
+
+def test_accept_guard_requires_test_assertion_signal_for_behavioral_claims():
+    requirement_id = "plan:validation:1"
+    diff_ref = EvidenceRef(
+        ref_id="diff-ref",
+        requirement_id=requirement_id,
+        kind=EvidenceKind.TRUSTED_DIFF,
+        path="src/test.py",
+    )
+    inspection = InspectionReport(
+        inspections=[
+            RequirementInspection(
+                requirement_id=requirement_id,
+                status=InspectionStatus.VERIFIED,
+                evidence_refs=[diff_ref],
+            )
+        ],
+        observations=[
+            InspectionObservation(
+                observation_id="code-1",
+                requirement_id=requirement_id,
+                kind="CODE",
+                path="src/test.py",
+                fact="threshold assertion is present",
+            ),
+            InspectionObservation(
+                observation_id="test-1",
+                requirement_id=requirement_id,
+                kind="TEST",
+                path="src/test.py",
+                fact="test covers the threshold",
+            ),
+        ],
+    )
+    result = ExecutionReviewResult(
+        verdict="ACCEPT",
+        summary="accepted",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id=requirement_id,
+                status=ReviewRequirementStatus.SATISFIED,
+                evidence="trusted diff",
+                evidence_refs=[diff_ref],
+            )
+        ],
+    )
+    guarded = _guard_accept_coverage(
+        result,
+        [
+            {
+                "requirement_id": requirement_id,
+                "text": "the threshold behavior is asserted",
+                "classification": ReviewRequirementClassification.BEHAVIORAL.value,
+            }
+        ],
+        inspection=inspection,
+        semantic_review=_guard_semantic(),
+        ledger=[],
+        evidence={"changed_files": ["src/test.py"]},
+    )
+    assert guarded.verdict == "BLOCKED"
+    assert "missing assertion or signal" in guarded.findings[0].evidence
+
+
+def test_accept_guard_keeps_structural_diff_authority():
+    requirement_id = "plan:step:4"
+    diff_ref = EvidenceRef(
+        ref_id="diff-ref",
+        requirement_id=requirement_id,
+        kind=EvidenceKind.TRUSTED_DIFF,
+        path="src/test.py",
+    )
+    guarded = _coverage_guard_fixture(
+        requirement_id,
+        ReviewRequirementClassification.STRUCTURAL.value,
+        [diff_ref],
+        changed_files=["src/test.py"],
+    )
+    assert guarded.verdict == "ACCEPT"
+
+
+def test_accept_guard_passes_exact_issue13_requirement_modes():
+    source = "@agent Add focused threshold regression tests."
+    plan = (
+        "Implementation steps:\n"
+        "1. Confirm threshold behavior.\n"
+        "2. Add the three tests.\n"
+        "3. Name the test methods.\n"
+        "4. Do not modify /src/main/java.\n"
+        "5. Run the focused test class.\n"
+        "6. Run the full test suite.\n\n"
+        "Validation:\n"
+        "- New tests assert 9,999, 10,000, and 10,001 behavior.\n"
+        "- `mvn -Dtest=PricingCalculatorTest test` passes.\n"
+        "- `mvn test` passes.\n"
+        "- No changes under /src/main/java."
+    )
+    contract = build_review_requirement_contract(source, plan)
+    changed_path = "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java"
+    execution_refs = {
+        "plan:step:5": "exec-focused",
+        "plan:step:6": "exec-full",
+        "plan:validation:2": "exec-focused",
+        "plan:validation:3": "exec-full",
+    }
+    inspections = []
+    observations = []
+    checks = []
+    for item in contract:
+        requirement_id = item["requirement_id"]
+        refs = []
+        if requirement_id in execution_refs:
+            refs.append(
+                EvidenceRef(
+                    ref_id=f"ref-{requirement_id}",
+                    requirement_id=requirement_id,
+                    kind=EvidenceKind.EXECUTION,
+                    source_id=execution_refs[requirement_id],
+                )
+            )
+        else:
+            refs.append(
+                EvidenceRef(
+                    ref_id=f"ref-{requirement_id}",
+                    requirement_id=requirement_id,
+                    kind=EvidenceKind.TRUSTED_DIFF,
+                    path=changed_path,
+                )
+            )
+        if item["classification"] == ReviewRequirementClassification.BEHAVIORAL.value:
+            observations.append(
+                InspectionObservation(
+                    observation_id=f"code-{requirement_id}",
+                    requirement_id=requirement_id,
+                    kind="CODE",
+                    path=changed_path,
+                    fact="direct threshold implementation/test grounding",
+                )
+            )
+            if requirement_id == "plan:validation:1":
+                observations.append(
+                    InspectionObservation(
+                        observation_id="test-plan-validation-1",
+                        requirement_id=requirement_id,
+                        kind="TEST",
+                        path=changed_path,
+                        fact="assertions cover all three boundary values",
+                        assertion_or_signal="9,999, 10,000, and 10,001 assertions",
+                    )
+                )
+        inspections.append(
+            RequirementInspection(
+                requirement_id=requirement_id,
+                status=InspectionStatus.VERIFIED,
+                evidence_refs=refs,
+            )
+        )
+        checks.append(
+            ReviewRequirementCheck(
+                requirement_id=requirement_id,
+                status=ReviewRequirementStatus.SATISFIED,
+                evidence="trusted evidence",
+                evidence_refs=refs,
+            )
+        )
+    result = ExecutionReviewResult(
+        verdict="ACCEPT", summary="exact fixture accepted", requirement_checks=checks
+    )
+    guarded = _guard_accept_coverage(
+        result,
+        contract,
+        inspection=InspectionReport(inspections=inspections, observations=observations),
+        semantic_review=_guard_semantic(),
+        ledger=[],
+        evidence={
+            "changed_files": [changed_path],
+            "execution": [{"evidence_id": "exec-focused"}],
+            "execution_observations": [
+                {
+                    "evidence_id": "exec-focused",
+                    "command": "mvn focused",
+                    "exit_code": 0,
+                },
+                {"evidence_id": "exec-full", "command": "mvn test", "exit_code": 0},
+            ],
+        },
+    )
+    assert guarded.verdict == "ACCEPT"
 
 
 def test_read_ledger_records_only_successful_bounded_reads(tmp_path):

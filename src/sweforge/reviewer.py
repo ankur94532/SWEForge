@@ -67,6 +67,7 @@ class InspectionStatus(StrEnum):
 class ReviewRequirementClassification(StrEnum):
     STRUCTURAL = "STRUCTURAL"
     BEHAVIORAL = "BEHAVIORAL"
+    VALIDATION = "VALIDATION"
 
 
 class EvidenceKind(StrEnum):
@@ -436,15 +437,32 @@ _STRUCTURAL_REQUIREMENT_RE = re.compile(
     r"(?:^|\b)(?:add|create|rename|remove|delete|introduce)\s+"
     r"(?:the\s+)?(?:enum|field|file|method|class|constant|literal|config)\b"
     r"|(?:^|\b)(?:file|method|field|enum value|class)\s+[^\n]{1,100}\s+exists"
-    r"|(?:^|\b)do not modify\s+[^\n]{1,120}$",
+    r"|(?:^|\b)do not modify\s+[^\n]{1,120}"
+    r"|(?:^|\b)no (?:changes?|modifications?)\s+[^\n]{1,120}"
+    r"|(?:^|\b)keep\s+[^\n]{1,120}\s+unchanged",
+    re.IGNORECASE,
+)
+
+_EXECUTION_REQUIREMENT_RE = re.compile(
+    r"(?:^|\b)(?:run|execute|invoke|build|validate)\b"
+    r"|`[^`\n]+`(?:\s+\([^\n)]{1,100}\))?\s+"
+    r"(?:passes|succeeds|completed|is successful)\b",
     re.IGNORECASE,
 )
 
 
-def _requirement_classification(text: str) -> ReviewRequirementClassification:
-    """Classify only confidently structural text; conservatively default behavioral."""
-    if _STRUCTURAL_REQUIREMENT_RE.search(" ".join(text.split())):
+def _requirement_classification(
+    text: str, *, prefix: str | None = None
+) -> ReviewRequirementClassification:
+    """Classify proof mode from stable contract structure and generic semantics."""
+    normalized = " ".join(text.split())
+    if _STRUCTURAL_REQUIREMENT_RE.search(normalized):
         return ReviewRequirementClassification.STRUCTURAL
+    if _EXECUTION_REQUIREMENT_RE.search(normalized) or (
+        prefix == "plan:validation"
+        and re.match(r"^verify\b", normalized, re.IGNORECASE)
+    ):
+        return ReviewRequirementClassification.VALIDATION
     return ReviewRequirementClassification.BEHAVIORAL
 
 
@@ -535,7 +553,9 @@ def build_review_requirement_contract(
             {
                 "requirement_id": f"{prefix}:{counters[prefix]}",
                 "text": text,
-                "classification": _requirement_classification(text).value,
+                "classification": _requirement_classification(
+                    text, prefix=prefix
+                ).value,
             }
         )
         if len(result) >= MAX_REVIEW_REQUIREMENTS:
@@ -2378,6 +2398,7 @@ def _reference_problems(
     ledger_by_id: dict[str, dict],
     changed_files: set[str],
     has_execution: bool,
+    execution_ids: set[str] | None = None,
 ) -> list[str]:
     problems: list[str] = []
     for ref in refs:
@@ -2391,6 +2412,13 @@ def _reference_problems(
                 problems.append(f"untrusted diff path for {requirement_id}")
         if ref.kind is EvidenceKind.EXECUTION and not has_execution:
             problems.append(f"missing execution source for {requirement_id}")
+        elif (
+            ref.kind is EvidenceKind.EXECUTION
+            and execution_ids is not None
+            and ref.source_id
+            and ref.source_id not in execution_ids
+        ):
+            problems.append(f"unknown execution source for {requirement_id}")
         if ref.kind is EvidenceKind.INSPECTOR_OBSERVATION:
             observation = observations.get(ref.source_id)
             if observation is None:
@@ -2433,6 +2461,13 @@ def _artifact_problems(
     }
     ledger_by_id = {item["read_id"]: item for item in ledger if item.get("read_id")}
     changed_files = set((evidence or {}).get("changed_files", []))
+    execution_ids = {
+        str(item.get("evidence_id"))
+        for item in (evidence or {}).get("execution_observations", [])
+        if item.get("evidence_id")
+    }
+    if not execution_ids:
+        execution_ids = None
     problems: list[str] = []
     inspection_ids = [item.requirement_id for item in inspection.inspections]
     observation_ids = [item.observation_id for item in inspection.observations]
@@ -2490,6 +2525,7 @@ def _artifact_problems(
                 ledger_by_id=ledger_by_id,
                 changed_files=changed_files,
                 has_execution=bool((evidence or {}).get("execution")),
+                execution_ids=execution_ids,
             )
         )
         if not current.evidence_refs and not check.evidence_refs:
@@ -2544,8 +2580,17 @@ def _artifact_problems(
                             ledger_by_id=ledger_by_id,
                             changed_files=changed_files,
                             has_execution=bool((evidence or {}).get("execution")),
+                            execution_ids=execution_ids,
                         )
                     )
+        elif requirement[
+            "classification"
+        ] == ReviewRequirementClassification.VALIDATION.value and not any(
+            ref.kind is EvidenceKind.EXECUTION for ref in refs
+        ):
+            problems.append(
+                f"missing direct execution evidence for {check.requirement_id}"
+            )
     problems.extend(semantic_problems)
     return problems
 
