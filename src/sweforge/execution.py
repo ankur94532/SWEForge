@@ -380,7 +380,7 @@ def _execute_claim(
         if approved_plan_text is not None:
             task += (
                 f"\n\n[Approved SWEForge Plan v{approved_plan_version} "
-                f"{approved_plan_id}]\n{approved_plan_text[:12_000]}\n"
+                f"{approved_plan_id}]\n{approved_plan_text}\n"
                 "SWEForge application code authorized this exact plan. Execute it; "
                 "do not decide whether approval is valid."
             )

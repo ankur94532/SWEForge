@@ -74,7 +74,7 @@ from .memory_learning import (
     candidate_from_proposal,
     curate_repository_memory,
 )
-from .planner import PlannerContext, generate_plan
+from .planner import PlannerContext, generate_plan, validate_canonical_plan_text
 from .reviewer import ExecutionReviewResult, ReviewerContext, review_execution
 from .workspace import ThreadWorkspace, Workspace, WorkspaceError
 
@@ -304,7 +304,7 @@ class WorkflowEngine:
             cycle_id=cycle_id,
             version=version,
             root_event_key=event_key,
-            plan_text=plan_text[:MAX_COMMENT_CHARS],
+            plan_text=validate_canonical_plan_text(plan_text),
             status=PlanStatus.POSTED if posted_comment_id else PlanStatus.DRAFT,
             created_at=timestamp,
             posted_at=timestamp if posted_comment_id else None,
@@ -494,7 +494,7 @@ class WorkflowEngine:
             )
             body = f"{marker}\n### SWEForge Plan — v{plan.version}"
             body += " · AUTO" if mode == WorkflowMode.AUTO else ""
-            body += f"\n\n{plan.plan_text[:MAX_COMMENT_CHARS]}{suffix}"
+            body += f"\n\n{validate_canonical_plan_text(plan.plan_text)}{suffix}"
             if inline:
                 reply_to = state.review_thread_root_id or state.response_comment_id
                 if not reply_to:
@@ -618,7 +618,7 @@ class WorkflowEngine:
             cycle_id=state.cycle_id,
             version=version,
             root_event_key=state.root_event_key,
-            plan_text=plan_text[:MAX_COMMENT_CHARS],
+            plan_text=validate_canonical_plan_text(plan_text),
             status=PlanStatus.DRAFT,
             created_at=timestamp,
             posted_at=None,
@@ -2880,7 +2880,7 @@ class WorkflowEngine:
                 state.thread_id, state.cycle_id, current.version + 1, plan_text
             ),
             version=current.version + 1,
-            plan_text=plan_text[:MAX_COMMENT_CHARS],
+            plan_text=validate_canonical_plan_text(plan_text),
             status=PlanStatus.DRAFT,
             created_at=timestamp,
             posted_at=None,

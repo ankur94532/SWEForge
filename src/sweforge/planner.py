@@ -1,7 +1,7 @@
 """Read-only planning harness for the durable workflow."""
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import (
@@ -13,7 +13,7 @@ from deepagents.backends import (
 from deepagents.backends.protocol import DeleteResult, EditResult, WriteResult
 from deepagents.middleware.permissions import FilesystemPermission
 from langgraph.store.base import BaseStore
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .agent import LiveInputMiddleware
 from .context import RepoAgentContext
@@ -32,8 +32,24 @@ class PlanResult(BaseModel):
     """Bounded, user-facing planner output; it is not execution authority."""
 
     summary: str = Field(min_length=1, max_length=1_000)
-    steps: list[str] = Field(min_length=1, max_length=20)
-    validation: list[str] = Field(default_factory=list, max_length=10)
+    steps: list[Annotated[str, Field(min_length=1, max_length=MAX_STEP_CHARS)]] = Field(
+        min_length=1, max_length=20
+    )
+    validation: list[Annotated[str, Field(min_length=1, max_length=MAX_STEP_CHARS)]] = (
+        Field(default_factory=list, max_length=10)
+    )
+
+    @model_validator(mode="after")
+    def validate_complete_items(self) -> "PlanResult":
+        if not self.summary.strip():
+            raise ValueError("planner summary must not be blank")
+        if not any(step.strip() for step in self.steps):
+            raise ValueError("planner returned no implementation steps")
+        if any(len(item.strip()) > MAX_STEP_CHARS for item in self.steps):
+            raise ValueError("implementation step exceeds the item character limit")
+        if any(len(item.strip()) > MAX_STEP_CHARS for item in self.validation):
+            raise ValueError("validation item exceeds the item character limit")
+        return self
 
 
 class ReadOnlyFilesystemBackend(FilesystemBackend):
@@ -134,22 +150,30 @@ def build_planner(context: PlannerContext, *, model: str):
 
 
 def render_plan(result: PlanResult) -> str:
-    """Render and bound the canonical plan stored and shown to users."""
-    steps = [step.strip()[:MAX_STEP_CHARS] for step in result.steps if step.strip()]
+    """Render a complete, bounded canonical plan stored and shown to users."""
+    result = PlanResult.model_validate(result)
+    steps = [step.strip() for step in result.steps if step.strip()]
     if not steps:
         raise ValueError("planner returned no implementation steps")
-    lines = [result.summary.strip()[:1_000], "", "Implementation steps:"]
+    lines = [result.summary.strip(), "", "Implementation steps:"]
     lines.extend(f"{index}. {step}" for index, step in enumerate(steps, 1))
-    validation = [
-        item.strip()[:MAX_STEP_CHARS] for item in result.validation if item.strip()
-    ]
+    validation = [item.strip() for item in result.validation if item.strip()]
     if validation:
         lines.extend(["", "Validation:"])
         lines.extend(f"- {item}" for item in validation)
     text = "\n".join(lines).strip()
     if len(text) > MAX_PLAN_CHARS:
-        text = text[:MAX_PLAN_CHARS].rstrip()
+        raise ValueError(f"canonical plan exceeds the {MAX_PLAN_CHARS}-character limit")
     return text
+
+
+def validate_canonical_plan_text(plan_text: str) -> str:
+    """Reject, rather than shorten, text used as approval-bearing plan authority."""
+    if not isinstance(plan_text, str) or not plan_text.strip():
+        raise ValueError("canonical plan must not be blank")
+    if len(plan_text) > MAX_PLAN_CHARS:
+        raise ValueError(f"canonical plan exceeds the {MAX_PLAN_CHARS}-character limit")
+    return plan_text
 
 
 def generate_plan(
