@@ -28,6 +28,15 @@ from .agent import LiveInputMiddleware
 from .context import RepoAgentContext
 from .execution import normalize_task
 from .github_models import format_source_context
+from .guard_codes import GuardCode, GuardProblem
+
+
+def _guard_problem(code: GuardCode, detail: str) -> GuardProblem:
+    return GuardProblem(code=code, detail=detail)
+
+
+def _problem_text(problem: GuardProblem | str) -> str:
+    return problem.detail if isinstance(problem, GuardProblem) else problem
 
 
 class ExecutionReviewVerdict(StrEnum):
@@ -394,7 +403,8 @@ class ReviewFinalizationError(RuntimeError):
     """A review could not produce a structured semantic verdict."""
 
     def __init__(self, message: str, *, diagnostic: dict | None = None):
-        self.diagnostic = diagnostic or {}
+        self.diagnostic = dict(diagnostic or {})
+        self.diagnostic.setdefault("guard_codes", [])
         if self.diagnostic:
             bounded = json.dumps(self.diagnostic, sort_keys=True, separators=(",", ":"))
             message = f"{message}; diagnostic={bounded[:700]}"
@@ -634,17 +644,30 @@ def _guard_accept_coverage(
     expected = [item["requirement_id"] for item in contract]
     actual = [item.requirement_id for item in result.requirement_checks]
     counts = Counter(actual)
-    problems: list[str] = []
+    problems: list[GuardProblem] = []
     if set(actual) != set(expected):
         problems.append(
-            "requirement coverage does not exactly match the current contract"
+            _guard_problem(
+                GuardCode.RC_REQUIREMENT_COVERAGE,
+                "requirement coverage does not exactly match the current contract",
+            )
         )
     duplicates = sorted(item for item, count in counts.items() if count > 1)
     if duplicates:
-        problems.append("duplicate requirement IDs: " + ", ".join(duplicates))
+        problems.append(
+            _guard_problem(
+                GuardCode.RC_DUPLICATE_REQUIREMENT,
+                "duplicate requirement IDs: " + ", ".join(duplicates),
+            )
+        )
     unknown = sorted(set(actual) - set(expected))
     if unknown:
-        problems.append("unexpected requirement IDs: " + ", ".join(unknown))
+        problems.append(
+            _guard_problem(
+                GuardCode.RC_UNEXPECTED_REQUIREMENT,
+                "unexpected requirement IDs: " + ", ".join(unknown),
+            )
+        )
     unsatisfied = [
         item.requirement_id
         for item in result.requirement_checks
@@ -652,7 +675,10 @@ def _guard_accept_coverage(
     ]
     if unsatisfied:
         problems.append(
-            "non-satisfied requirement IDs: " + ", ".join(sorted(set(unsatisfied)))
+            _guard_problem(
+                GuardCode.RC_UNSATISFIED_REQUIREMENT,
+                "non-satisfied requirement IDs: " + ", ".join(sorted(set(unsatisfied))),
+            )
         )
     problems.extend(
         _artifact_problems(
@@ -681,7 +707,7 @@ def _guard_accept_coverage(
                     "Structured ACCEPT did not provide complete satisfied coverage "
                     "of the current review contract."
                 ),
-                evidence="; ".join(problems)[:2_000],
+                evidence="; ".join(map(str, problems))[:2_000],
             )
         ],
         repair_instructions=[],
@@ -2305,18 +2331,28 @@ def _semantic_authority_facts(
     return facts
 
 
-def _semantic_artifact_problems(semantic: SemanticReviewArtifact) -> list[str]:
-    problems: list[str] = []
+def _semantic_artifact_problems(semantic: SemanticReviewArtifact) -> list[GuardProblem]:
+    problems: list[GuardProblem] = []
     cluster_ids = [item.cluster_id for item in semantic.clusters]
     if len(cluster_ids) != len(set(cluster_ids)):
-        problems.append("duplicate evidence cluster IDs")
+        problems.append(
+            _guard_problem(
+                GuardCode.SP_DUPLICATE_EVIDENCE_CLUSTER,
+                "duplicate evidence cluster IDs",
+            )
+        )
     for cluster in semantic.clusters:
         if (
             cluster.complete
             and cluster.content_hash
             != hashlib.sha256(cluster.bounded_raw_excerpt.encode()).hexdigest()
         ):
-            problems.append(f"cluster content hash mismatch: {cluster.cluster_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.SP_CLUSTER_HASH_MISMATCH,
+                    f"cluster content hash mismatch: {cluster.cluster_id}",
+                )
+            )
     expected_applicability = {
         SpecialistStage.IMPLEMENTATION: bool(
             _clusters_for_stage(semantic.clusters, SpecialistStage.IMPLEMENTATION)
@@ -2343,28 +2379,52 @@ def _semantic_artifact_problems(semantic: SemanticReviewArtifact) -> list[str]:
         applicable = expected_applicability[report.stage]
         if applicable and report.status is not SpecialistStageStatus.COMPLETED:
             problems.append(
-                f"required {report.stage.value} specialist is not completed"
+                _guard_problem(
+                    GuardCode.SP_REQUIRED_STAGE_INCOMPLETE,
+                    f"required {report.stage.value} specialist is not completed",
+                )
             )
         if not applicable and report.status is not SpecialistStageStatus.SKIPPED:
             problems.append(
-                f"inapplicable {report.stage.value} specialist was not skipped"
+                _guard_problem(
+                    GuardCode.SP_INAPPLICABLE_STAGE_NOT_SKIPPED,
+                    f"inapplicable {report.stage.value} specialist was not skipped",
+                )
             )
         if report.applicable != applicable:
-            problems.append(f"incorrect {report.stage.value} applicability")
+            problems.append(
+                _guard_problem(
+                    GuardCode.SP_STAGE_APPLICABILITY_MISMATCH,
+                    f"incorrect {report.stage.value} applicability",
+                )
+            )
         stage_scope = scopes[report.stage]
         for finding in report.findings:
             finding_ids.append(finding.finding_id)
             if _finding_provenance_errors(finding, stage_scope):
-                problems.append(f"invalid finding provenance: {finding.finding_id}")
+                problems.append(
+                    _guard_problem(
+                        GuardCode.SP_INVALID_FINDING_PROVENANCE,
+                        f"invalid finding provenance: {finding.finding_id}",
+                    )
+                )
             if finding.severity is EvidenceFindingSeverity.BLOCKING:
                 problems.append(
-                    f"current blocking specialist finding: {finding.finding_id}"
+                    _guard_problem(
+                        GuardCode.SP_CURRENT_BLOCKING_FINDING,
+                        f"current blocking specialist finding: {finding.finding_id}",
+                    )
                 )
     duplicates = sorted(
         item for item, count in Counter(finding_ids).items() if count > 1
     )
     if duplicates:
-        problems.append("duplicate specialist finding IDs: " + ", ".join(duplicates))
+        problems.append(
+            _guard_problem(
+                GuardCode.SP_DUPLICATE_FINDING,
+                "duplicate specialist finding IDs: " + ", ".join(duplicates),
+            )
+        )
     unknown_associations = sorted(
         item.finding_id
         for item in semantic.candidate_associations
@@ -2372,8 +2432,11 @@ def _semantic_artifact_problems(semantic: SemanticReviewArtifact) -> list[str]:
     )
     if unknown_associations:
         problems.append(
-            "candidate associations reference unknown findings: "
-            + ", ".join(unknown_associations)
+            _guard_problem(
+                GuardCode.SP_UNKNOWN_ASSOCIATED_FINDING,
+                "candidate associations reference unknown findings: "
+                + ", ".join(unknown_associations),
+            )
         )
     association_ids = [item.finding_id for item in semantic.candidate_associations]
     duplicate_associations = sorted(
@@ -2381,12 +2444,19 @@ def _semantic_artifact_problems(semantic: SemanticReviewArtifact) -> list[str]:
     )
     if duplicate_associations:
         problems.append(
-            "duplicate candidate associations: " + ", ".join(duplicate_associations)
+            _guard_problem(
+                GuardCode.SP_DUPLICATE_ASSOCIATION,
+                "duplicate candidate associations: "
+                + ", ".join(duplicate_associations),
+            )
         )
     missing_associations = sorted(set(finding_ids) - set(association_ids))
     if missing_associations:
         problems.append(
-            "missing candidate associations: " + ", ".join(missing_associations)
+            _guard_problem(
+                GuardCode.SP_MISSING_ASSOCIATION,
+                "missing candidate associations: " + ", ".join(missing_associations),
+            )
         )
     return problems
 
@@ -2418,38 +2488,81 @@ def _reference_problems(
     changed_files: set[str],
     has_execution: bool,
     execution_ids: set[str] | None = None,
-) -> list[str]:
-    problems: list[str] = []
+) -> list[GuardProblem]:
+    problems: list[GuardProblem] = []
     for ref in refs:
         if ref.requirement_id != requirement_id:
-            problems.append(f"wrong-requirement evidence for {requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.IA_WRONG_REQUIREMENT_REFERENCE,
+                    f"wrong-requirement evidence for {requirement_id}",
+                )
+            )
         read_problem = _read_ref_problem(ref, ledger_by_id)
         if read_problem:
-            problems.append(f"{read_problem} for {requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.IA_INVALID_READ_REFERENCE,
+                    f"{read_problem} for {requirement_id}",
+                )
+            )
         if ref.kind is EvidenceKind.TRUSTED_DIFF and ref.path:
             if ref.path not in changed_files:
-                problems.append(f"untrusted diff path for {requirement_id}")
+                problems.append(
+                    _guard_problem(
+                        GuardCode.IA_UNTRUSTED_DIFF_PATH,
+                        f"untrusted diff path for {requirement_id}",
+                    )
+                )
         if ref.kind is EvidenceKind.EXECUTION and not has_execution:
-            problems.append(f"missing execution source for {requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.IA_MISSING_EXECUTION_SOURCE,
+                    f"missing execution source for {requirement_id}",
+                )
+            )
         elif (
             ref.kind is EvidenceKind.EXECUTION
             and execution_ids is not None
             and ref.source_id
             and ref.source_id not in execution_ids
         ):
-            problems.append(f"unknown execution source for {requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.IA_UNKNOWN_EXECUTION_SOURCE,
+                    f"unknown execution source for {requirement_id}",
+                )
+            )
         if ref.kind is EvidenceKind.INSPECTOR_OBSERVATION:
             observation = observations.get(ref.source_id)
             if observation is None:
-                problems.append(f"invalid observation reference for {requirement_id}")
+                problems.append(
+                    _guard_problem(
+                        GuardCode.IA_INVALID_OBSERVATION_REFERENCE,
+                        f"invalid observation reference for {requirement_id}",
+                    )
+                )
             elif observation.requirement_id != requirement_id:
                 problems.append(
-                    f"observation has wrong requirement for {requirement_id}"
+                    _guard_problem(
+                        GuardCode.IA_WRONG_OBSERVATION_REQUIREMENT,
+                        f"observation has wrong requirement for {requirement_id}",
+                    )
                 )
             elif ref.path and ref.path != observation.path:
-                problems.append(f"observation path mismatch for {requirement_id}")
+                problems.append(
+                    _guard_problem(
+                        GuardCode.IA_OBSERVATION_PATH_MISMATCH,
+                        f"observation path mismatch for {requirement_id}",
+                    )
+                )
         if ref.start_line and ref.end_line and ref.end_line < ref.start_line:
-            problems.append(f"invalid evidence range for {requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.IA_INVALID_EVIDENCE_RANGE,
+                    f"invalid evidence range for {requirement_id}",
+                )
+            )
     return problems
 
 
@@ -2463,7 +2576,7 @@ def _inspection_authority_problems(
     has_execution: bool,
     execution_ids: set[str] | None = None,
     refs: list[EvidenceRef] | None = None,
-) -> list[str]:
+) -> list[GuardProblem]:
     """Validate the proof shape required before finalization can use VERIFIED."""
     if inspection.status is not InspectionStatus.VERIFIED:
         return []
@@ -2494,21 +2607,44 @@ def _inspection_authority_problems(
             )
             if not grounded:
                 problems.append(
-                    f"ungrounded {observation.kind.lower()} observation "
-                    f"for {requirement_id}"
+                    _guard_problem(
+                        GuardCode.IA_UNGROUNDED_OBSERVATION,
+                        f"ungrounded {observation.kind.lower()} observation "
+                        f"for {requirement_id}",
+                    )
                 )
     if classification == ReviewRequirementClassification.BEHAVIORAL.value:
         if not any(item.kind == "CODE" for item in requirement_observations):
-            problems.append(f"missing direct code observation for {requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.IA_MISSING_DIRECT_CODE_OBSERVATION,
+                    f"missing direct code observation for {requirement_id}",
+                )
+            )
         for observation in requirement_observations:
             if observation.kind == "TEST" and not observation.assertion_or_signal:
-                problems.append(f"missing assertion or signal for {requirement_id}")
+                problems.append(
+                    _guard_problem(
+                        GuardCode.IA_MISSING_ASSERTION_OR_SIGNAL,
+                        f"missing assertion or signal for {requirement_id}",
+                    )
+                )
     elif classification == ReviewRequirementClassification.VALIDATION.value:
         if not any(ref.kind is EvidenceKind.EXECUTION for ref in refs):
-            problems.append(f"missing direct execution evidence for {requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.IA_MISSING_DIRECT_EXECUTION_EVIDENCE,
+                    f"missing direct execution evidence for {requirement_id}",
+                )
+            )
     elif classification == ReviewRequirementClassification.STRUCTURAL.value:
         if not refs:
-            problems.append(f"missing structural evidence for {requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.IA_MISSING_STRUCTURAL_EVIDENCE,
+                    f"missing structural evidence for {requirement_id}",
+                )
+            )
     return problems
 
 
@@ -2703,12 +2839,15 @@ def _canonical_inspection_provenance(
 
 
 def _inspection_failure_diagnostic(
-    *, attempt: int, problems: list[str], ledger: list[dict]
+    *, attempt: int, problems: list[GuardProblem | str], ledger: list[dict]
 ) -> dict:
     return {
         "stage": "inspector",
         "attempt": attempt,
-        "artifact_problems": problems[:12],
+        "artifact_problems": [_problem_text(item) for item in problems[:12]],
+        "guard_codes": [
+            item.code.value for item in problems[:12] if isinstance(item, GuardProblem)
+        ],
         "reads": [
             {
                 "path": item.get("normalized_path", ""),
@@ -2726,7 +2865,7 @@ def _inspection_artifact_problems(
     *,
     ledger: list[dict],
     evidence: dict,
-) -> list[str]:
+) -> list[GuardProblem]:
     """Reject VERIFIED inspection output that cannot satisfy the authority guard."""
     expected = {item["requirement_id"]: item for item in contract}
     observations = {item.observation_id: item for item in inspection.observations}
@@ -2741,16 +2880,24 @@ def _inspection_artifact_problems(
     }
     if not execution_ids:
         execution_ids = None
-    problems: list[str] = []
+    problems: list[GuardProblem] = []
     for observation in inspection.observations:
         if observation.requirement_id not in expected:
             problems.append(
-                f"unknown observation requirement: {observation.requirement_id}"
+                _guard_problem(
+                    GuardCode.II_UNKNOWN_OBSERVATION_REQUIREMENT,
+                    f"unknown observation requirement: {observation.requirement_id}",
+                )
             )
     for current in inspection.inspections:
         requirement = expected.get(current.requirement_id)
         if requirement is None:
-            problems.append(f"unknown inspection requirement: {current.requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.II_UNKNOWN_INSPECTION_REQUIREMENT,
+                    f"unknown inspection requirement: {current.requirement_id}",
+                )
+            )
             continue
         problems.extend(
             _inspection_authority_problems(
@@ -2774,7 +2921,7 @@ def _artifact_problems(
     ledger: list[dict] | None,
     evidence: dict | None = None,
     semantic_review: SemanticReviewArtifact | None = None,
-) -> list[str]:
+) -> list[GuardProblem]:
     semantic_problems = (
         _semantic_artifact_problems(semantic_review)
         if semantic_review is not None
@@ -2800,7 +2947,7 @@ def _artifact_problems(
     }
     if not execution_ids:
         execution_ids = None
-    problems: list[str] = []
+    problems: list[GuardProblem] = []
     inspection_ids = [item.requirement_id for item in inspection.inspections]
     observation_ids = [item.observation_id for item in inspection.observations]
     challenge_ids = [
@@ -2817,10 +2964,20 @@ def _artifact_problems(
             item for item, count in Counter(values).items() if count > 1
         )
         if duplicates:
-            problems.append(f"duplicate {label}: {', '.join(duplicates)}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.FA_DUPLICATE_IDENTITY,
+                    f"duplicate {label}: {', '.join(duplicates)}",
+                )
+            )
     expected_ids = set(expected)
     if set(inspection_ids) != expected_ids:
-        problems.append("inspection coverage does not exactly match the contract")
+        problems.append(
+            _guard_problem(
+                GuardCode.FA_INSPECTION_COVERAGE,
+                "inspection coverage does not exactly match the contract",
+            )
+        )
     behavioral_ids = {
         item["requirement_id"]
         for item in contract
@@ -2828,26 +2985,47 @@ def _artifact_problems(
     }
     if semantic_review is None and set(challenge_ids) != behavioral_ids:
         problems.append(
-            "challenge coverage does not exactly match behavioral requirements"
+            _guard_problem(
+                GuardCode.FA_CHALLENGE_COVERAGE,
+                "challenge coverage does not exactly match behavioral requirements",
+            )
         )
     for observation in inspection.observations:
         if observation.requirement_id not in expected_ids:
             problems.append(
-                f"unknown observation requirement: {observation.requirement_id}"
+                _guard_problem(
+                    GuardCode.FA_UNKNOWN_OBSERVATION_REQUIREMENT,
+                    f"unknown observation requirement: {observation.requirement_id}",
+                )
             )
     for current in inspection.inspections:
         if current.requirement_id not in expected:
-            problems.append(f"unknown inspection requirement: {current.requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.FA_UNKNOWN_INSPECTION_REQUIREMENT,
+                    f"unknown inspection requirement: {current.requirement_id}",
+                )
+            )
     for check in result.requirement_checks:
         if check.status is not ReviewRequirementStatus.SATISFIED:
             continue
         requirement = expected.get(check.requirement_id)
         current = inspections.get(check.requirement_id)
         if requirement is None or current is None:
-            problems.append(f"missing inspection for {check.requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.FA_MISSING_INSPECTION,
+                    f"missing inspection for {check.requirement_id}",
+                )
+            )
             continue
         if current.status is not InspectionStatus.VERIFIED:
-            problems.append(f"inspection is not VERIFIED for {check.requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.FA_INSPECTION_NOT_VERIFIED,
+                    f"inspection is not VERIFIED for {check.requirement_id}",
+                )
+            )
         refs = [*current.evidence_refs, *check.evidence_refs]
         problems.extend(
             _reference_problems(
@@ -2861,7 +3039,12 @@ def _artifact_problems(
             )
         )
         if not current.evidence_refs and not check.evidence_refs:
-            problems.append(f"missing evidence for {check.requirement_id}")
+            problems.append(
+                _guard_problem(
+                    GuardCode.FA_MISSING_EVIDENCE,
+                    f"missing evidence for {check.requirement_id}",
+                )
+            )
         refs = [*current.evidence_refs, *check.evidence_refs]
         authority_problems = _inspection_authority_problems(
             current,
@@ -2881,10 +3064,18 @@ def _artifact_problems(
             if semantic_review is None:
                 challenger = challenges.get(check.requirement_id)
                 if challenger is None:
-                    problems.append(f"missing challenge for {check.requirement_id}")
+                    problems.append(
+                        _guard_problem(
+                            GuardCode.FA_MISSING_CHALLENGE,
+                            f"missing challenge for {check.requirement_id}",
+                        )
+                    )
                 elif challenger.verdict is not RequirementChallengeVerdict.SUPPORTED:
                     problems.append(
-                        f"challenge is not SUPPORTED for {check.requirement_id}"
+                        _guard_problem(
+                            GuardCode.FA_CHALLENGE_NOT_SUPPORTED,
+                            f"challenge is not SUPPORTED for {check.requirement_id}",
+                        )
                     )
                 else:
                     problems.extend(
@@ -2922,13 +3113,16 @@ def _bounded_inspection_prompt(evidence: dict) -> str:
     )
 
 
-def _inspection_correction_prompt(evidence: dict, problems: list[str]) -> str:
+def _inspection_correction_prompt(evidence: dict, problems: list[GuardProblem]) -> str:
     return (
         _bounded_inspection_prompt(evidence)
         + "\n\n[Deterministic inspection-artifact correction]\n"
         + json.dumps(
             {
-                "problems": problems,
+                "problems": [
+                    {"code": item.code.value, "detail": item.detail}
+                    for item in problems
+                ],
                 "instruction": (
                     "Correct only the inspection artifact. Do not mark a requirement "
                     "VERIFIED unless its classification-specific proof obligations "
