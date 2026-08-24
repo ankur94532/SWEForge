@@ -1,1 +1,32 @@
-[]
+[
+  {
+    "content_hash": "8d9cf62f3ebd3d2e31abfee736ddd499c50a73ec79633c2d015be11778b0e55d",
+    "normalized_path": "src/main/java/com/sweforge/pricing/PricingCalculator.java",
+    "offset": 0,
+    "read_id": "read:47090b199940a0e685c5bead",
+    "returned_lines": [
+      1,
+      10
+    ]
+  },
+  {
+    "content_hash": "c44a23936ba05291e2358e1deeb048efac8962c35a6ffde5a3806b93e98b4e32",
+    "normalized_path": "src/main/java/com/sweforge/pricing/DiscountPolicy.java",
+    "offset": 0,
+    "read_id": "read:2d4fbdc8f06ae92f9db4e7a9",
+    "returned_lines": [
+      1,
+      11
+    ]
+  },
+  {
+    "content_hash": "c1ce75f6651ddf6c9fb7c6c815fba1088c6993a1dde2d8d2841904347e867a19",
+    "normalized_path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+    "offset": 0,
+    "read_id": "read:c2258df2bc1b3ec9d2f40028",
+    "returned_lines": [
+      1,
+      33
+    ]
+  }
+]

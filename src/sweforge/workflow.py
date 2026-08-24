@@ -78,7 +78,11 @@ from .memory_learning import (
     curate_repository_memory,
 )
 from .planner import PlannerContext, generate_plan, validate_canonical_plan_text
-from .review_fixture import build_review_evidence, write_fixture
+from .review_fixture import (
+    build_review_evidence,
+    record_capture_failure,
+    write_fixture,
+)
 from .reviewer import ExecutionReviewResult, review_execution
 from .workspace import ThreadWorkspace, Workspace, WorkspaceError
 
@@ -2248,8 +2252,10 @@ class WorkflowEngine:
                     )[2],
                     outcome=result,
                     error=review_error,
+                    review_model=model,
                 )
             except Exception as capture_error:  # capture must never affect review
+                record_capture_failure()
                 _LOGGER.warning("review fixture capture failed: %s", capture_error)
         if review_error is not None:
             raise review_error

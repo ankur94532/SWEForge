@@ -1,8 +1,8 @@
 {
-  "capture_reason": "review",
-  "captured_at": "2026-08-24T15:14:38.697893Z",
+  "capture_reason": "backfill",
+  "captured_at": "2026-08-24T15:25:40.175088Z",
   "fixture_id": "RF-14-41504759",
   "review_model": null,
   "schema_version": 1,
-  "sweforge_git_sha": "unknown"
+  "sweforge_git_sha": "575d4a8ba3cafcc20cd371a94d0cadfc3507c5fc"
 }

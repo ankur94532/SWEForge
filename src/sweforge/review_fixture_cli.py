@@ -11,7 +11,13 @@ from pathlib import Path
 
 from .context import RepoAgentContext
 from .github_store import SQLiteGitHubStore
-from .review_fixture import build_review_evidence, load_fixture, write_fixture
+from .review_fixture import (
+    build_review_evidence,
+    ledger_from_sources,
+    load_fixture,
+    parse_dispatcher_failure,
+    write_fixture,
+)
 from .reviewer import ReviewerContext, review_execution, review_requirement_contract
 
 
@@ -40,14 +46,11 @@ def freeze_main(argv: list[str] | None = None) -> int:
             "WHERE thread_id = ?",
             (args.thread_id,),
         ).fetchone()
-        diagnostics = {}
+        diagnostics = parse_dispatcher_failure(
+            failure["last_error"] if failure else None
+        )
         if failure:
-            diagnostics = {
-                "exception_type": "ReviewFinalizationError",
-                "message": failure["last_error"],
-                "guard_codes": ["IA-MISSING-DIRECT-CODE-OBSERVATION"],
-                "failure_count": failure["failure_count"],
-            }
+            diagnostics["failure_count"] = failure["failure_count"]
     write_fixture(
         args.output,
         fixture_id=args.fixture_id,
@@ -55,6 +58,12 @@ def freeze_main(argv: list[str] | None = None) -> int:
         context=context,
         provenance=provenance,
         diagnostics=diagnostics,
+        ledger=ledger_from_sources(diagnostics=diagnostics),
+        capture_reason="backfill",
+        source={
+            "source_archive": str(args.state_db.parent),
+            "source_database": str(args.state_db),
+        },
         expected={},
     )
     return 0
@@ -63,10 +72,17 @@ def freeze_main(argv: list[str] | None = None) -> int:
 def replay_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Replay a review fixture offline")
     parser.add_argument("fixture", type=Path)
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--model")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="replay the stored outcome without loading a model provider",
+    )
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
+    if not args.offline and not args.model:
+        parser.error("--model is required unless --offline is selected")
     fixture = load_fixture(args.fixture)
     evidence = fixture["evidence"]
     contract = review_requirement_contract(evidence)
@@ -74,6 +90,34 @@ def replay_main(argv: list[str] | None = None) -> int:
     if contract != stored_contract:
         raise SystemExit("fixture contract no longer matches current derivation")
     results = []
+    if args.offline:
+        outcome = fixture["outcome"]
+        diagnostics = fixture["diagnostics"]
+        for _ in range(args.runs):
+            if outcome:
+                results.append({"ok": True, "verdict": outcome["verdict"]})
+            else:
+                results.append(
+                    {
+                        "ok": False,
+                        "exception": diagnostics.get(
+                            "exception_type", "ReviewFinalizationError"
+                        ),
+                        "message": diagnostics.get("message", "stored failure"),
+                    }
+                )
+        report = {
+            "fixture": fixture["fixture"]["fixture_id"],
+            "runs": args.runs,
+            "offline": True,
+            "results": results,
+        }
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+        else:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if all(item["ok"] for item in results) else 1
     for _ in range(args.runs):
         with tempfile.TemporaryDirectory(prefix="sweforge-review-replay-") as temp:
             archive = Path(temp) / "worktree.tar"

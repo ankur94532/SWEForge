@@ -21,6 +21,7 @@ from typing import Any
 from .context import RepoAgentContext
 from .execution_evidence import sanitize
 from .github_store import SQLiteGitHubStore
+from .guard_codes import GuardCode
 from .reviewer import (
     ReviewerContext,
     ReviewFinalizationError,
@@ -54,6 +55,170 @@ class FixtureError(ValueError):
 
 class FixtureQuarantined(FixtureError):
     """A post-write secret scan found content that must not be published."""
+
+
+# These phrases are the detail strings emitted at the corresponding guard sites
+# in reviewer.py.  Matching the site text keeps diagnostics evidence-based and
+# makes an unrecognised new guard visible instead of silently classifying it.
+_GUARD_DETAIL_PREFIXES: tuple[tuple[str, GuardCode], ...] = (
+    ("requirement coverage does not exactly match", GuardCode.RC_REQUIREMENT_COVERAGE),
+    ("duplicate requirement IDs:", GuardCode.RC_DUPLICATE_REQUIREMENT),
+    ("unexpected requirement IDs:", GuardCode.RC_UNEXPECTED_REQUIREMENT),
+    ("non-satisfied requirement IDs:", GuardCode.RC_UNSATISFIED_REQUIREMENT),
+    ("duplicate evidence cluster IDs:", GuardCode.SP_DUPLICATE_EVIDENCE_CLUSTER),
+    ("evidence cluster hash mismatch:", GuardCode.SP_CLUSTER_HASH_MISMATCH),
+    (
+        "required specialist stage is incomplete:",
+        GuardCode.SP_REQUIRED_STAGE_INCOMPLETE,
+    ),
+    (
+        "inapplicable specialist stage was not skipped:",
+        GuardCode.SP_INAPPLICABLE_STAGE_NOT_SKIPPED,
+    ),
+    (
+        "specialist stage applicability mismatch:",
+        GuardCode.SP_STAGE_APPLICABILITY_MISMATCH,
+    ),
+    ("invalid finding provenance:", GuardCode.SP_INVALID_FINDING_PROVENANCE),
+    ("current blocking finding:", GuardCode.SP_CURRENT_BLOCKING_FINDING),
+    ("duplicate finding IDs:", GuardCode.SP_DUPLICATE_FINDING),
+    ("unknown associated finding IDs:", GuardCode.SP_UNKNOWN_ASSOCIATED_FINDING),
+    ("duplicate finding association:", GuardCode.SP_DUPLICATE_ASSOCIATION),
+    ("missing finding association:", GuardCode.SP_MISSING_ASSOCIATION),
+    ("wrong-requirement evidence for", GuardCode.IA_WRONG_REQUIREMENT_REFERENCE),
+    ("invalid read reference", GuardCode.IA_INVALID_READ_REFERENCE),
+    ("untrusted diff path for", GuardCode.IA_UNTRUSTED_DIFF_PATH),
+    ("missing execution source for", GuardCode.IA_MISSING_EXECUTION_SOURCE),
+    ("unknown execution source for", GuardCode.IA_UNKNOWN_EXECUTION_SOURCE),
+    ("invalid observation reference for", GuardCode.IA_INVALID_OBSERVATION_REFERENCE),
+    (
+        "observation has wrong requirement for",
+        GuardCode.IA_WRONG_OBSERVATION_REQUIREMENT,
+    ),
+    ("observation path mismatch for", GuardCode.IA_OBSERVATION_PATH_MISMATCH),
+    ("invalid evidence range for", GuardCode.IA_INVALID_EVIDENCE_RANGE),
+    ("ungrounded ", GuardCode.IA_UNGROUNDED_OBSERVATION),
+    (
+        "missing direct code observation for",
+        GuardCode.IA_MISSING_DIRECT_CODE_OBSERVATION,
+    ),
+    ("missing assertion or signal for", GuardCode.IA_MISSING_ASSERTION_OR_SIGNAL),
+    (
+        "missing direct execution evidence for",
+        GuardCode.IA_MISSING_DIRECT_EXECUTION_EVIDENCE,
+    ),
+    ("missing structural evidence for", GuardCode.IA_MISSING_STRUCTURAL_EVIDENCE),
+    ("unknown observation requirement:", GuardCode.II_UNKNOWN_OBSERVATION_REQUIREMENT),
+    ("unknown inspection requirement:", GuardCode.II_UNKNOWN_INSPECTION_REQUIREMENT),
+    ("duplicate ", GuardCode.FA_DUPLICATE_IDENTITY),
+    ("inspection coverage does not exactly match", GuardCode.FA_INSPECTION_COVERAGE),
+    ("challenge coverage does not exactly match", GuardCode.FA_CHALLENGE_COVERAGE),
+    ("missing inspection for", GuardCode.FA_MISSING_INSPECTION),
+    ("inspection is not VERIFIED for", GuardCode.FA_INSPECTION_NOT_VERIFIED),
+    ("missing evidence for", GuardCode.FA_MISSING_EVIDENCE),
+    ("missing challenge for", GuardCode.FA_MISSING_CHALLENGE),
+    ("challenge is not SUPPORTED for", GuardCode.FA_CHALLENGE_NOT_SUPPORTED),
+)
+
+
+def _guard_code_for_problem(problem: str) -> GuardCode | None:
+    for prefix, code in _GUARD_DETAIL_PREFIXES:
+        if problem.startswith(prefix):
+            return code
+    return None
+
+
+def parse_dispatcher_failure(last_error: str | None) -> dict:
+    """Parse one durable dispatcher diagnostic without inventing evidence."""
+    if not last_error:
+        return {}
+    prefix, separator, payload = last_error.partition("; diagnostic=")
+    if not separator:
+        return {"reason": "missing ; diagnostic= delimiter"}
+    exception_type, separator, message = prefix.partition(": ")
+    if not separator:
+        return {"reason": "missing exception prefix delimiter"}
+    try:
+        diagnostic = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        return {"reason": f"unparseable diagnostic JSON: {exc.msg}"}
+    if not isinstance(diagnostic, dict):
+        return {"reason": "diagnostic payload is not an object"}
+    problems = diagnostic.get("artifact_problems", [])
+    if not isinstance(problems, list):
+        return {"reason": "artifact_problems is not a list"}
+    guard_codes = []
+    for problem in problems:
+        text = str(problem)
+        code = _guard_code_for_problem(text)
+        guard_codes.append(code.value if code else f"UNMAPPED:{text}")
+    result = {
+        "exception_type": exception_type,
+        "message": message,
+        "artifact_problems": problems,
+        "attempt": diagnostic.get("attempt"),
+        "reads": diagnostic.get("reads", []),
+        "guard_codes": guard_codes,
+    }
+    return result
+
+
+def structured_outcome(row: Any) -> dict | None:
+    """Convert an execution_reviews row into ROADMAP §E.2's result shape."""
+    if row is None:
+        return None
+
+    def parse_field(name: str, default: Any) -> Any:
+        value = getattr(row, name, default)
+        if not value:
+            return default
+        try:
+            return json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return default
+
+    return {
+        "verdict": row.verdict,
+        "summary": row.summary,
+        "requirement_checks": parse_field("requirement_checks_json", []),
+        "findings": parse_field("findings_json", []),
+        "repair_instructions": parse_field("repair_instructions_json", []),
+        "inspection_report": parse_field("inspection_json", {}),
+        "challenge": parse_field("challenge_json", {}),
+        "semantic_artifact": parse_field("challenge_json", {}),
+    }
+
+
+def ledger_from_sources(
+    *, outcome: Any = None, diagnostics: dict | None = None
+) -> list[dict]:
+    if outcome is not None:
+        raw = getattr(outcome, "read_ledger_json", "[]")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except json.JSONDecodeError:
+            parsed = []
+        if isinstance(parsed, list) and parsed:
+            return parsed
+    reads = (diagnostics or {}).get("reads", [])
+    return reads if isinstance(reads, list) else []
+
+
+def record_capture_failure() -> None:
+    global _CAPTURE_FAILURES
+    _CAPTURE_FAILURES += 1
+
+
+_CAPTURE_FAILURES = 0
+
+
+def capture_failure_count() -> int:
+    return _CAPTURE_FAILURES
+
+
+def reset_capture_failure_count() -> None:
+    global _CAPTURE_FAILURES
+    _CAPTURE_FAILURES = 0
 
 
 def _jsonable(value: Any) -> Any:
@@ -220,6 +385,11 @@ def write_fixture(
     diagnostics: dict | None = None,
     expected: dict | None = None,
     captured_at: str | None = None,
+    sweforge_git_sha: str | None = None,
+    review_model: str | None = None,
+    capture_reason: str = "review",
+    source: dict | None = None,
+    ledger: list[dict] | None = None,
 ) -> Path:
     """Write all ten schema files atomically; raise on unsafe content."""
     root = Path(destination) / fixture_id
@@ -233,9 +403,9 @@ def write_fixture(
             "schema_version": SCHEMA_VERSION,
             "fixture_id": fixture_id,
             "captured_at": now,
-            "sweforge_git_sha": "unknown",
-            "review_model": None,
-            "capture_reason": "review",
+            "sweforge_git_sha": sweforge_git_sha or _git_sha(Path(context.worktree)),
+            "review_model": review_model,
+            "capture_reason": capture_reason,
         }
         files: dict[str, Any] = {
             "fixture.json": envelope,
@@ -248,9 +418,13 @@ def write_fixture(
                 "memory_namespace": context.memory_namespace,
                 "memory_snapshot": None,
             },
-            "outcome.json": _jsonable(outcome) if outcome is not None else None,
+            "outcome.json": structured_outcome(outcome)
+            if outcome is not None
+            else None,
             "ledger.json": _jsonable(
-                getattr(outcome, "read_ledger", []) if outcome is not None else []
+                ledger_from_sources(outcome=outcome, diagnostics=diagnostics)
+                if ledger is None
+                else ledger
             ),
             "diagnostics.json": diagnostics
             if diagnostics is not None
@@ -266,6 +440,8 @@ def write_fixture(
             ),
             "expected.json": expected or {},
         }
+        if source:
+            files["provenance.json"] = {**provenance, **source}
         for name, value in files.items():
             (temporary / name).write_text(
                 json.dumps(value, indent=2, sort_keys=True, default=str) + "\n"
@@ -274,6 +450,12 @@ def write_fixture(
         _scan(temporary)
         temporary.rename(root)
         return root
+    except FixtureQuarantined:
+        quarantine = root.with_name(root.name + ".quarantine")
+        if quarantine.exists():
+            shutil.rmtree(quarantine, ignore_errors=True)
+        temporary.rename(quarantine)
+        raise
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
         raise
@@ -294,3 +476,17 @@ def load_fixture(path: str | Path) -> dict[str, Any]:
         for name in FIXTURE_FILES
         if name.endswith(".json")
     } | {"path": root, "worktree_archive": root / "worktree.tar.zst"}
+
+
+def _git_sha(path: Path) -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=path,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return result.stdout.strip() or "unknown"

@@ -1,20 +1,735 @@
 {
-  "attempt_id": "attempt-permit-56cf57786be8bc97759155294667131aae5de89e38199e45fa682ea4781ac45f",
-  "challenge_json": "{\"artifact_kind\":\"SPLIT_EVIDENCE_REVIEW\",\"artifact_version\":1,\"clusters\":[{\"cluster_id\":\"cluster:f8bb3f7bace69bba995e6489\",\"role\":\"TEST_VALIDATION\",\"ranges\":[{\"evidence_id\":\"diff:f343ecb7f4e6c9ce1ce085f1\",\"path\":\"src/test/java/com/sweforge/pricing/PricingCalculatorTest.java\",\"start_line\":5,\"end_line\":33,\"hunk_identity\":\"@@ -5,17 +5,29 @@ import java.util.List;\"}],\"evidence_ids\":[\"diff:f343ecb7f4e6c9ce1ce085f1\"],\"bounded_raw_excerpt\":\"@@ -5,17 +5,29 @@ import java.util.List;\\n import static org.junit.jupiter.api.Assertions.assertEquals;\\n \\n class PricingCalculatorTest {\\n-    private final PricingCalculator calculator = new PricingCalculator();\\n+      private final PricingCalculator calculator = new PricingCalculator();\\n \\n-    @Test void smallRegularOrderHasNoDiscount() {\\n-        assertEquals(5_500, calculator.calculateTotalCents(new Order(List.of(new Item(2_500), new Item(3_000)))));\\n-    }\\n+      @Test void smallRegularOrderHasNoDiscount() {\\n+          assertEquals(5_500, calculator.calculateTotalCents(new Order(List.of(new Item(2_500), new Item(3_000)))));\\n+      }\\n \\n-    @Test void largeRegularOrderGetsBulkDiscount() {\\n-        assertEquals(9_900, calculator.calculateTotalCents(new Order(List.of(new Item(6_000), new Item(5_000)))));\\n-    }\\n+      @Test void largeRegularOrderGetsBulkDiscount() {\\n+          assertEquals(9_900, calculator.calculateTotalCents(new Order(List.of(new Item(6_000), new Item(5_000)))));\\n+      }\\n \\n-    @Test void vipOrderGetsVipDiscount() {\\n-        assertEquals(4_800, calculator.calculateTotalCents(new Order(List.of(new Item(4_000), new Item(2_000)), CustomerTier.VIP)));\\n-    }\\n+      @Test void vipOrderGetsVipDiscount() {\\n+          assertEquals(4_800, calculator.calculateTotalCents(new Order(List.of(new Item(4_000), new Item(2_000)), CustomerTier.VIP)));\\n+      }\\n+\\n+      @Test void justBelowThresholdHasNoDiscount() {\\n+          assertEquals(9_999, calculator.calculateTotalCents(new Order(List.of(new Item(9_999)))));\\n+      }\\n+\\n+      @Test void atThresholdGetsBulkDiscount() {\\n+          assertEquals(9_000, calculator.calculateTotalCents(new Order(List.of(new Item(10_000)))));\\n+      }\\n+\\n+      @Test void justAboveThresholdGetsBulkDiscount() {\\n+          assertEquals(9_001, calculator.calculateTotalCents(new Order(List.of(new Item(10_001)))));\\n+      }\\n }\\n\",\"content_hash\":\"20d7e0472b73b8cc5428a9bd83000f371d9e1a66b5d2d4a94d53cb2875b4f498\",\"complete\":true,\"score\":41,\"routing_signals\":[\"test-like path\",\"test/assert vocabulary\"]}],\"implementation\":{\"stage\":\"IMPLEMENTATION\",\"status\":\"SKIPPED\",\"applicable\":false,\"findings\":[],\"failure_reason\":\"\",\"failure_stage\":\"NONE\",\"rejected_findings\":[],\"prompt_chars\":0,\"provider_requests\":0},\"test_validation\":{\"stage\":\"TEST_VALIDATION\",\"status\":\"COMPLETED\",\"applicable\":true,\"findings\":[{\"finding_id\":\"boundary-tests-cover-single-item-orders-only\",\"severity\":\"WARNING\",\"cluster_ids\":[\"cluster:f8bb3f7bace69bba995e6489\"],\"provenance\":[{\"cluster_id\":\"cluster:f8bb3f7bace69bba995e6489\",\"evidence_id\":\"diff:f343ecb7f4e6c9ce1ce085f1\",\"path\":\"src/test/java/com/sweforge/pricing/PricingCalculatorTest.java\",\"start_line\":5,\"end_line\":33,\"hunk_identity\":\"@@ -5,17 +5,29 @@ import java.util.List;\"}],\"concise_summary\":\"The three new threshold boundary tests (justBelowThresholdHasNoDiscount, atThresholdGetsBulkDiscount, justAboveThresholdGetsBulkDiscount) each construct an Order containing a single Item, so they only prove the bulk-discount threshold comparison against one item's price, not against the summed total of a multi-item order.\",\"concrete_source_facts\":[\"justBelowThresholdHasNoDiscount builds new Order(List.of(new Item(9_999))) - one item, asserts 9_999.\",\"atThresholdGetsBulkDiscount builds new Order(List.of(new Item(10_000))) - one item, asserts 9_000.\",\"justAboveThresholdGetsBulkDiscount builds new Order(List.of(new Item(10_001))) - one item, asserts 9_001.\",\"The only pre-existing multi-item bulk-discount test, largeRegularOrderGetsBulkDiscount, uses items totaling 11_000, well clear of the 9_999/10_000/10_001 boundary and therefore does not exercise the exact crossing point for a summed multi-item total.\"],\"behavioral_consequence\":\"If the discount threshold is checked against Order.total() computed by summing item prices, a summation or off-by-one defect that only manifests when multiple items sum to a value at/near the boundary (e.g., two items summing to 10_000) would not be caught by any test in this suite, since no test sums multiple items to land exactly on or near the threshold.\"},{\"finding_id\":\"reformatting-mixed-with-functional-test-additions\",\"severity\":\"WARNING\",\"cluster_ids\":[\"cluster:f8bb3f7bace69bba995e6489\"],\"provenance\":[{\"cluster_id\":\"cluster:f8bb3f7bace69bba995e6489\",\"evidence_id\":\"diff:f343ecb7f4e6c9ce1ce085f1\",\"path\":\"src/test/java/com/sweforge/pricing/PricingCalculatorTest.java\",\"start_line\":5,\"end_line\":33,\"hunk_identity\":\"@@ -5,17 +5,29 @@ import java.util.List;\"}],\"concise_summary\":\"The same hunk that introduces three new boundary tests also reformats the indentation of all three pre-existing test methods (fields/bodies re-indented) with no logic or assertion change, mixing cosmetic whitespace edits with the functional addition in a single diff block.\",\"concrete_source_facts\":[\"The lines for the calculator field declaration and the smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, and vipOrderGetsVipDiscount methods are each removed and re-added with only indentation changed, no assertion values or expressions altered.\",\"The three genuinely new tests are appended immediately after this reformatted block inside the same hunk @@ -5,17 +5,29 @@.\"],\"behavioral_consequence\":\"Reviewers must manually distinguish pure whitespace churn from the substantive new assertions in the same hunk, increasing the chance that an incorrect expected value or subtle logic change in the new boundary tests is overlooked during review because it is visually diluted by unrelated reformatting of unchanged tests.\"}],\"failure_reason\":\"\",\"failure_stage\":\"NONE\",\"rejected_findings\":[],\"prompt_chars\":5138,\"provider_requests\":1},\"candidate_associations\":[{\"finding_id\":\"boundary-tests-cover-single-item-orders-only\",\"candidate_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"basis\":\"EXACT_RANGE\",\"exact_range_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"same_hunk_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"same_catalog_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"same_path_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"basis_scope\":\"PRIMARY\",\"primary_exact_range_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"context_exact_range_requirement_ids\":[],\"primary_same_hunk_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"context_same_hunk_requirement_ids\":[]},{\"finding_id\":\"reformatting-mixed-with-functional-test-additions\",\"candidate_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"basis\":\"EXACT_RANGE\",\"exact_range_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"same_hunk_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"same_catalog_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"same_path_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"basis_scope\":\"PRIMARY\",\"primary_exact_range_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"context_exact_range_requirement_ids\":[],\"primary_same_hunk_requirement_ids\":[\"plan:step:2\",\"plan:validation:2\"],\"context_same_hunk_requirement_ids\":[]}]}",
-  "completed_at": "2026-08-24T04:19:25.071069Z",
-  "created_at": "2026-08-24T04:19:25.071062Z",
-  "cycle_id": 1,
-  "findings_json": "[]",
-  "inspection_json": "{\"inspections\":[{\"requirement_id\":\"plan:step:1\",\"status\":\"UNVERIFIED\",\"evidence_refs\":[{\"ref_id\":\"e1\",\"requirement_id\":\"plan:step:1\",\"kind\":\"TRUSTED_DIFF\",\"source_id\":\"attempt-response\",\"path\":\"src/main/java/com/sweforge/pricing/DiscountPolicy.java\",\"start_line\":null,\"end_line\":null}],\"concise_summary\":\"Required raw evidence did not fit the deterministic evidence catalog.\"},{\"requirement_id\":\"plan:step:2\",\"status\":\"VERIFIED\",\"evidence_refs\":[{\"ref_id\":\"e2\",\"requirement_id\":\"plan:step:2\",\"kind\":\"TRUSTED_DIFF\",\"source_id\":\"\",\"path\":\"src/test/java/com/sweforge/pricing/PricingCalculatorTest.java\",\"start_line\":22,\"end_line\":34}],\"concise_summary\":\"Diff adds exactly three new @Test methods: justBelowThresholdHasNoDiscount (Item(9999)->9999), atThresholdGetsBulkDiscount (Item(10000)->9000), justAboveThresholdGetsBulkDiscount (Item(10001)->9001), matching existing single-item Order/List.of style.\"},{\"requirement_id\":\"plan:step:3\",\"status\":\"VERIFIED\",\"evidence_refs\":[{\"ref_id\":\"e3\",\"requirement_id\":\"plan:step:3\",\"kind\":\"EXECUTION\",\"source_id\":\"exec-evidence-afb6e42624e03be650b497272af29325\",\"path\":\"\",\"start_line\":null,\"end_line\":null}],\"concise_summary\":\"git diff src/main/ returned empty output, confirming no production files were modified.\"},{\"requirement_id\":\"plan:step:4\",\"status\":\"VERIFIED\",\"evidence_refs\":[{\"ref_id\":\"e4\",\"requirement_id\":\"plan:step:4\",\"kind\":\"EXECUTION\",\"source_id\":\"exec-evidence-b1a3be7a0c600cb44448aa4cde4c6c21\",\"path\":\"\",\"start_line\":null,\"end_line\":null}],\"concise_summary\":\"mvn -Dtest=PricingCalculatorTest test executed, exit code 0, Tests run: 6, Failures: 0, Errors: 0, BUILD SUCCESS.\"},{\"requirement_id\":\"plan:step:5\",\"status\":\"VERIFIED\",\"evidence_refs\":[{\"ref_id\":\"e5\",\"requirement_id\":\"plan:step:5\",\"kind\":\"EXECUTION\",\"source_id\":\"exec-evidence-bbdc85c0be35d43b4929a676b0d0beb3\",\"path\":\"\",\"start_line\":null,\"end_line\":null}],\"concise_summary\":\"Full mvn test executed, exit code 0, Tests run: 6, Failures: 0, Errors: 0, BUILD SUCCESS.\"},{\"requirement_id\":\"plan:validation:1\",\"status\":\"VERIFIED\",\"evidence_refs\":[{\"ref_id\":\"e6\",\"requirement_id\":\"plan:validation:1\",\"kind\":\"EXECUTION\",\"source_id\":\"exec-evidence-b1a3be7a0c600cb44448aa4cde4c6c21\",\"path\":\"\",\"start_line\":null,\"end_line\":null}],\"concise_summary\":\"Test run output shows Tests run: 6 (3 original + 3 new boundary tests), Failures: 0, Errors: 0, confirming compilation and passing of all three new boundary tests.\"},{\"requirement_id\":\"plan:validation:2\",\"status\":\"VERIFIED\",\"evidence_refs\":[{\"ref_id\":\"e7\",\"requirement_id\":\"plan:validation:2\",\"kind\":\"TRUSTED_DIFF\",\"source_id\":\"\",\"path\":\"src/test/java/com/sweforge/pricing/PricingCalculatorTest.java\",\"start_line\":1,\"end_line\":21},{\"ref_id\":\"e8\",\"requirement_id\":\"plan:validation:2\",\"kind\":\"EXECUTION\",\"source_id\":\"exec-evidence-bbdc85c0be35d43b4929a676b0d0beb3\",\"path\":\"\",\"start_line\":null,\"end_line\":null}],\"concise_summary\":\"Diff shows the three original tests (smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, vipOrderGetsVipDiscount) unchanged in assertion content (only whitespace/indentation changed); full suite passed 6/6, confirming they still pass.\"},{\"requirement_id\":\"plan:validation:3\",\"status\":\"VERIFIED\",\"evidence_refs\":[{\"ref_id\":\"e9\",\"requirement_id\":\"plan:validation:3\",\"kind\":\"EXECUTION\",\"source_id\":\"exec-evidence-5c505d35ca3b59c7c302129cb309db09\",\"path\":\"\",\"start_line\":null,\"end_line\":null},{\"ref_id\":\"e10\",\"requirement_id\":\"plan:validation:3\",\"kind\":\"EXECUTION\",\"source_id\":\"exec-evidence-afb6e42624e03be650b497272af29325\",\"path\":\"\",\"start_line\":null,\"end_line\":null}],\"concise_summary\":\"git diff --name-only shows only src/test/java/com/sweforge/pricing/PricingCalculatorTest.java changed; git diff src/main/ is empty.\"},{\"requirement_id\":\"plan:validation:4\",\"status\":\"VERIFIED\",\"evidence_refs\":[{\"ref_id\":\"e11\",\"requirement_id\":\"plan:validation:4\",\"kind\":\"EXECUTION\",\"source_id\":\"exec-evidence-bbdc85c0be35d43b4929a676b0d0beb3\",\"path\":\"\",\"start_line\":null,\"end_line\":null}],\"concise_summary\":\"Full mvn test run completed with BUILD SUCCESS, exit code 0, 6 tests run, 0 failures, 0 errors.\"}],\"observations\":[{\"observation_id\":\"o1\",\"requirement_id\":\"plan:step:2\",\"kind\":\"CODE\",\"path\":\"src/test/java/com/sweforge/pricing/PricingCalculatorTest.java\",\"start_line\":24,\"end_line\":30,\"fact\":\"Diff hunk shows three new @Test methods added with expected values 9_999, 9_000, and 9_001 for Item values 9_999, 10_000, and 10_001 respectively.\",\"assertion_or_signal\":\"\"},{\"observation_id\":\"o2\",\"requirement_id\":\"plan:step:3\",\"kind\":\"EXECUTION\",\"path\":\"\",\"start_line\":null,\"end_line\":null,\"fact\":\"Command 'git diff src/main/' produced empty output (output_hash matches empty tree hash e3b0c44...), confirming zero changes to production source directory.\",\"assertion_or_signal\":\"\"},{\"observation_id\":\"o3\",\"requirement_id\":\"plan:validation:3\",\"kind\":\"EXECUTION\",\"path\":\"\",\"start_line\":null,\"end_line\":null,\"fact\":\"Command 'git diff --name-only' listed exactly one file: src/test/java/com/sweforge/pricing/PricingCalculatorTest.java.\",\"assertion_or_signal\":\"\"},{\"observation_id\":\"o4\",\"requirement_id\":\"plan:step:2\",\"kind\":\"CODE\",\"path\":\"src/test/java/com/sweforge/pricing/PricingCalculatorTest.java\",\"start_line\":8,\"end_line\":21,\"fact\":\"Diff shows only whitespace/indentation reformatting (4-space to 6-space indent) applied to the existing calculator field declaration and the three pre-existing @Test methods (smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, vipOrderGetsVipDiscount); no assertion values or logic changed.\",\"assertion_or_signal\":\"\"}]}",
-  "plan_id": "plan-1c235e48afe5e0911df9fe9744d2c70c64b2c99887abcef7b9353de8c4523845",
-  "plan_version": 1,
-  "read_ledger_json": "[]",
-  "repair_instructions_json": "[\"Capture and include the actual contents (or a targeted diff/grep output) of /src/main/java/com/sweforge/pricing/DiscountPolicy.java (e.g., via `cat` or `sed -n` on the relevant lines) as trusted execution evidence to confirm the threshold logic (no discount below 10,000 cents, 10% discount at/above 10,000 cents for REGULAR tier) referenced in plan:step:1. The executor's narrative claim about line 8 is not sufficient trusted evidence on its own.\"]",
-  "requirement_checks_json": "[{\"evidence\": \"No raw evidence (file contents, cat/sed output) of DiscountPolicy.java was captured; this requirement is explicitly listed under unavailable evidence requirements. Only the executor's untrusted narrative claim references line 8 threshold logic, which is insufficient per policy that executor claims are untrusted and require independent evidence.\", \"evidence_refs\": [{\"end_line\": null, \"kind\": \"TRUSTED_DIFF\", \"path\": \"src/main/java/com/sweforge/pricing/DiscountPolicy.java\", \"ref_id\": \"e1\", \"requirement_id\": \"plan:step:1\", \"source_id\": \"\", \"start_line\": null}], \"repairability\": \"IN_SCOPE_REPAIR\", \"requirement_id\": \"plan:step:1\", \"status\": \"UNVERIFIED\"}, {\"evidence\": \"Diff (lines 22-34) confirms three new @Test methods added: justBelowThresholdHasNoDiscount (Item(9999)->9999), atThresholdGetsBulkDiscount (Item(10000)->9000), justAboveThresholdGetsBulkDiscount (Item(10001)->9001), following existing single-item Order/List.of style.\", \"evidence_refs\": [{\"end_line\": 34, \"kind\": \"TRUSTED_DIFF\", \"path\": \"src/test/java/com/sweforge/pricing/PricingCalculatorTest.java\", \"ref_id\": \"e2\", \"requirement_id\": \"plan:step:2\", \"source_id\": \"\", \"start_line\": 22}], \"repairability\": \"NOT_APPLICABLE\", \"requirement_id\": \"plan:step:2\", \"status\": \"SATISFIED\"}, {\"evidence\": \"git diff src/main/ returned empty output, confirming no production code files (DiscountPolicy.java, PricingCalculator.java, Order.java, Item.java, CustomerTier.java) were modified.\", \"evidence_refs\": [{\"end_line\": null, \"kind\": \"EXECUTION\", \"path\": \"\", \"ref_id\": \"e3\", \"requirement_id\": \"plan:step:3\", \"source_id\": \"\", \"start_line\": null}], \"repairability\": \"NOT_APPLICABLE\", \"requirement_id\": \"plan:step:3\", \"status\": \"SATISFIED\"}, {\"evidence\": \"mvn -Dtest=PricingCalculatorTest test executed with exit code 0, Tests run: 6, Failures: 0, Errors: 0, BUILD SUCCESS.\", \"evidence_refs\": [{\"end_line\": null, \"kind\": \"EXECUTION\", \"path\": \"\", \"ref_id\": \"e4\", \"requirement_id\": \"plan:step:4\", \"source_id\": \"\", \"start_line\": null}], \"repairability\": \"NOT_APPLICABLE\", \"requirement_id\": \"plan:step:4\", \"status\": \"SATISFIED\"}, {\"evidence\": \"Full mvn test executed with exit code 0, Tests run: 6, Failures: 0, Errors: 0, BUILD SUCCESS.\", \"evidence_refs\": [{\"end_line\": null, \"kind\": \"EXECUTION\", \"path\": \"\", \"ref_id\": \"e5\", \"requirement_id\": \"plan:step:5\", \"source_id\": \"\", \"start_line\": null}], \"repairability\": \"NOT_APPLICABLE\", \"requirement_id\": \"plan:step:5\", \"status\": \"SATISFIED\"}, {\"evidence\": \"Test run output shows Tests run: 6 (3 original + 3 new boundary tests), Failures: 0, Errors: 0, confirming compilation and passing of all three new boundary tests at 9,999/10,000/10,001 cents.\", \"evidence_refs\": [{\"end_line\": null, \"kind\": \"EXECUTION\", \"path\": \"\", \"ref_id\": \"e6\", \"requirement_id\": \"plan:validation:1\", \"source_id\": \"\", \"start_line\": null}], \"repairability\": \"NOT_APPLICABLE\", \"requirement_id\": \"plan:validation:1\", \"status\": \"SATISFIED\"}, {\"evidence\": \"Diff shows the three original tests (smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, vipOrderGetsVipDiscount) unchanged in assertion content (only whitespace/indentation altered); full suite passed 6/6, confirming they continue to pass.\", \"evidence_refs\": [{\"end_line\": null, \"kind\": \"TRUSTED_DIFF\", \"path\": \"\", \"ref_id\": \"e7\", \"requirement_id\": \"plan:validation:2\", \"source_id\": \"\", \"start_line\": null}, {\"end_line\": null, \"kind\": \"EXECUTION\", \"path\": \"\", \"ref_id\": \"e8\", \"requirement_id\": \"plan:validation:2\", \"source_id\": \"\", \"start_line\": null}], \"repairability\": \"NOT_APPLICABLE\", \"requirement_id\": \"plan:validation:2\", \"status\": \"SATISFIED\"}, {\"evidence\": \"git diff --name-only lists only src/test/java/com/sweforge/pricing/PricingCalculatorTest.java; git diff src/main/ is empty, confirming no production source files modified.\", \"evidence_refs\": [{\"end_line\": null, \"kind\": \"EXECUTION\", \"path\": \"\", \"ref_id\": \"e9\", \"requirement_id\": \"plan:validation:3\", \"source_id\": \"\", \"start_line\": null}, {\"end_line\": null, \"kind\": \"EXECUTION\", \"path\": \"\", \"ref_id\": \"e10\", \"requirement_id\": \"plan:validation:3\", \"source_id\": \"\", \"start_line\": null}], \"repairability\": \"NOT_APPLICABLE\", \"requirement_id\": \"plan:validation:3\", \"status\": \"SATISFIED\"}, {\"evidence\": \"Full mvn test run completed with BUILD SUCCESS, exit code 0, 6 tests run, 0 failures, 0 errors.\", \"evidence_refs\": [{\"end_line\": null, \"kind\": \"EXECUTION\", \"path\": \"\", \"ref_id\": \"e11\", \"requirement_id\": \"plan:validation:4\", \"source_id\": \"\", \"start_line\": null}], \"repairability\": \"NOT_APPLICABLE\", \"requirement_id\": \"plan:validation:4\", \"status\": \"SATISFIED\"}]",
-  "review_id": "review-c486eca99c6573bc2372f45dc1fc22dae5b13f2f6775723eab684e4a41504759",
-  "review_iteration": 1,
-  "root_event_key": "1341401850:issue:5231004416:2026-08-24T04:12:31Z",
+  "challenge": {
+    "artifact_kind": "SPLIT_EVIDENCE_REVIEW",
+    "artifact_version": 1,
+    "candidate_associations": [
+      {
+        "basis": "EXACT_RANGE",
+        "basis_scope": "PRIMARY",
+        "candidate_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "context_exact_range_requirement_ids": [],
+        "context_same_hunk_requirement_ids": [],
+        "exact_range_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "finding_id": "boundary-tests-cover-single-item-orders-only",
+        "primary_exact_range_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "primary_same_hunk_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_catalog_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_hunk_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_path_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ]
+      },
+      {
+        "basis": "EXACT_RANGE",
+        "basis_scope": "PRIMARY",
+        "candidate_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "context_exact_range_requirement_ids": [],
+        "context_same_hunk_requirement_ids": [],
+        "exact_range_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "finding_id": "reformatting-mixed-with-functional-test-additions",
+        "primary_exact_range_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "primary_same_hunk_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_catalog_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_hunk_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_path_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ]
+      }
+    ],
+    "clusters": [
+      {
+        "bounded_raw_excerpt": "@@ -5,17 +5,29 @@ import java.util.List;\n import static org.junit.jupiter.api.Assertions.assertEquals;\n \n class PricingCalculatorTest {\n-    private final PricingCalculator calculator = new PricingCalculator();\n+      private final PricingCalculator calculator = new PricingCalculator();\n \n-    @Test void smallRegularOrderHasNoDiscount() {\n-        assertEquals(5_500, calculator.calculateTotalCents(new Order(List.of(new Item(2_500), new Item(3_000)))));\n-    }\n+      @Test void smallRegularOrderHasNoDiscount() {\n+          assertEquals(5_500, calculator.calculateTotalCents(new Order(List.of(new Item(2_500), new Item(3_000)))));\n+      }\n \n-    @Test void largeRegularOrderGetsBulkDiscount() {\n-        assertEquals(9_900, calculator.calculateTotalCents(new Order(List.of(new Item(6_000), new Item(5_000)))));\n-    }\n+      @Test void largeRegularOrderGetsBulkDiscount() {\n+          assertEquals(9_900, calculator.calculateTotalCents(new Order(List.of(new Item(6_000), new Item(5_000)))));\n+      }\n \n-    @Test void vipOrderGetsVipDiscount() {\n-        assertEquals(4_800, calculator.calculateTotalCents(new Order(List.of(new Item(4_000), new Item(2_000)), CustomerTier.VIP)));\n-    }\n+      @Test void vipOrderGetsVipDiscount() {\n+          assertEquals(4_800, calculator.calculateTotalCents(new Order(List.of(new Item(4_000), new Item(2_000)), CustomerTier.VIP)));\n+      }\n+\n+      @Test void justBelowThresholdHasNoDiscount() {\n+          assertEquals(9_999, calculator.calculateTotalCents(new Order(List.of(new Item(9_999)))));\n+      }\n+\n+      @Test void atThresholdGetsBulkDiscount() {\n+          assertEquals(9_000, calculator.calculateTotalCents(new Order(List.of(new Item(10_000)))));\n+      }\n+\n+      @Test void justAboveThresholdGetsBulkDiscount() {\n+          assertEquals(9_001, calculator.calculateTotalCents(new Order(List.of(new Item(10_001)))));\n+      }\n }\n",
+        "cluster_id": "cluster:f8bb3f7bace69bba995e6489",
+        "complete": true,
+        "content_hash": "20d7e0472b73b8cc5428a9bd83000f371d9e1a66b5d2d4a94d53cb2875b4f498",
+        "evidence_ids": [
+          "diff:f343ecb7f4e6c9ce1ce085f1"
+        ],
+        "ranges": [
+          {
+            "end_line": 33,
+            "evidence_id": "diff:f343ecb7f4e6c9ce1ce085f1",
+            "hunk_identity": "@@ -5,17 +5,29 @@ import java.util.List;",
+            "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+            "start_line": 5
+          }
+        ],
+        "role": "TEST_VALIDATION",
+        "routing_signals": [
+          "test-like path",
+          "test/assert vocabulary"
+        ],
+        "score": 41
+      }
+    ],
+    "implementation": {
+      "applicable": false,
+      "failure_reason": "",
+      "failure_stage": "NONE",
+      "findings": [],
+      "prompt_chars": 0,
+      "provider_requests": 0,
+      "rejected_findings": [],
+      "stage": "IMPLEMENTATION",
+      "status": "SKIPPED"
+    },
+    "test_validation": {
+      "applicable": true,
+      "failure_reason": "",
+      "failure_stage": "NONE",
+      "findings": [
+        {
+          "behavioral_consequence": "If the discount threshold is checked against Order.total() computed by summing item prices, a summation or off-by-one defect that only manifests when multiple items sum to a value at/near the boundary (e.g., two items summing to 10_000) would not be caught by any test in this suite, since no test sums multiple items to land exactly on or near the threshold.",
+          "cluster_ids": [
+            "cluster:f8bb3f7bace69bba995e6489"
+          ],
+          "concise_summary": "The three new threshold boundary tests (justBelowThresholdHasNoDiscount, atThresholdGetsBulkDiscount, justAboveThresholdGetsBulkDiscount) each construct an Order containing a single Item, so they only prove the bulk-discount threshold comparison against one item's price, not against the summed total of a multi-item order.",
+          "concrete_source_facts": [
+            "justBelowThresholdHasNoDiscount builds new Order(List.of(new Item(9_999))) - one item, asserts 9_999.",
+            "atThresholdGetsBulkDiscount builds new Order(List.of(new Item(10_000))) - one item, asserts 9_000.",
+            "justAboveThresholdGetsBulkDiscount builds new Order(List.of(new Item(10_001))) - one item, asserts 9_001.",
+            "The only pre-existing multi-item bulk-discount test, largeRegularOrderGetsBulkDiscount, uses items totaling 11_000, well clear of the 9_999/10_000/10_001 boundary and therefore does not exercise the exact crossing point for a summed multi-item total."
+          ],
+          "finding_id": "boundary-tests-cover-single-item-orders-only",
+          "provenance": [
+            {
+              "cluster_id": "cluster:f8bb3f7bace69bba995e6489",
+              "end_line": 33,
+              "evidence_id": "diff:f343ecb7f4e6c9ce1ce085f1",
+              "hunk_identity": "@@ -5,17 +5,29 @@ import java.util.List;",
+              "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+              "start_line": 5
+            }
+          ],
+          "severity": "WARNING"
+        },
+        {
+          "behavioral_consequence": "Reviewers must manually distinguish pure whitespace churn from the substantive new assertions in the same hunk, increasing the chance that an incorrect expected value or subtle logic change in the new boundary tests is overlooked during review because it is visually diluted by unrelated reformatting of unchanged tests.",
+          "cluster_ids": [
+            "cluster:f8bb3f7bace69bba995e6489"
+          ],
+          "concise_summary": "The same hunk that introduces three new boundary tests also reformats the indentation of all three pre-existing test methods (fields/bodies re-indented) with no logic or assertion change, mixing cosmetic whitespace edits with the functional addition in a single diff block.",
+          "concrete_source_facts": [
+            "The lines for the calculator field declaration and the smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, and vipOrderGetsVipDiscount methods are each removed and re-added with only indentation changed, no assertion values or expressions altered.",
+            "The three genuinely new tests are appended immediately after this reformatted block inside the same hunk @@ -5,17 +5,29 @@."
+          ],
+          "finding_id": "reformatting-mixed-with-functional-test-additions",
+          "provenance": [
+            {
+              "cluster_id": "cluster:f8bb3f7bace69bba995e6489",
+              "end_line": 33,
+              "evidence_id": "diff:f343ecb7f4e6c9ce1ce085f1",
+              "hunk_identity": "@@ -5,17 +5,29 @@ import java.util.List;",
+              "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+              "start_line": 5
+            }
+          ],
+          "severity": "WARNING"
+        }
+      ],
+      "prompt_chars": 5138,
+      "provider_requests": 1,
+      "rejected_findings": [],
+      "stage": "TEST_VALIDATION",
+      "status": "COMPLETED"
+    }
+  },
+  "findings": [],
+  "inspection_report": {
+    "inspections": [
+      {
+        "concise_summary": "Required raw evidence did not fit the deterministic evidence catalog.",
+        "evidence_refs": [
+          {
+            "end_line": null,
+            "kind": "TRUSTED_DIFF",
+            "path": "src/main/java/com/sweforge/pricing/DiscountPolicy.java",
+            "ref_id": "e1",
+            "requirement_id": "plan:step:1",
+            "source_id": "attempt-response",
+            "start_line": null
+          }
+        ],
+        "requirement_id": "plan:step:1",
+        "status": "UNVERIFIED"
+      },
+      {
+        "concise_summary": "Diff adds exactly three new @Test methods: justBelowThresholdHasNoDiscount (Item(9999)->9999), atThresholdGetsBulkDiscount (Item(10000)->9000), justAboveThresholdGetsBulkDiscount (Item(10001)->9001), matching existing single-item Order/List.of style.",
+        "evidence_refs": [
+          {
+            "end_line": 34,
+            "kind": "TRUSTED_DIFF",
+            "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+            "ref_id": "e2",
+            "requirement_id": "plan:step:2",
+            "source_id": "",
+            "start_line": 22
+          }
+        ],
+        "requirement_id": "plan:step:2",
+        "status": "VERIFIED"
+      },
+      {
+        "concise_summary": "git diff src/main/ returned empty output, confirming no production files were modified.",
+        "evidence_refs": [
+          {
+            "end_line": null,
+            "kind": "EXECUTION",
+            "path": "",
+            "ref_id": "e3",
+            "requirement_id": "plan:step:3",
+            "source_id": "exec-evidence-afb6e42624e03be650b497272af29325",
+            "start_line": null
+          }
+        ],
+        "requirement_id": "plan:step:3",
+        "status": "VERIFIED"
+      },
+      {
+        "concise_summary": "mvn -Dtest=PricingCalculatorTest test executed, exit code 0, Tests run: 6, Failures: 0, Errors: 0, BUILD SUCCESS.",
+        "evidence_refs": [
+          {
+            "end_line": null,
+            "kind": "EXECUTION",
+            "path": "",
+            "ref_id": "e4",
+            "requirement_id": "plan:step:4",
+            "source_id": "exec-evidence-b1a3be7a0c600cb44448aa4cde4c6c21",
+            "start_line": null
+          }
+        ],
+        "requirement_id": "plan:step:4",
+        "status": "VERIFIED"
+      },
+      {
+        "concise_summary": "Full mvn test executed, exit code 0, Tests run: 6, Failures: 0, Errors: 0, BUILD SUCCESS.",
+        "evidence_refs": [
+          {
+            "end_line": null,
+            "kind": "EXECUTION",
+            "path": "",
+            "ref_id": "e5",
+            "requirement_id": "plan:step:5",
+            "source_id": "exec-evidence-bbdc85c0be35d43b4929a676b0d0beb3",
+            "start_line": null
+          }
+        ],
+        "requirement_id": "plan:step:5",
+        "status": "VERIFIED"
+      },
+      {
+        "concise_summary": "Test run output shows Tests run: 6 (3 original + 3 new boundary tests), Failures: 0, Errors: 0, confirming compilation and passing of all three new boundary tests.",
+        "evidence_refs": [
+          {
+            "end_line": null,
+            "kind": "EXECUTION",
+            "path": "",
+            "ref_id": "e6",
+            "requirement_id": "plan:validation:1",
+            "source_id": "exec-evidence-b1a3be7a0c600cb44448aa4cde4c6c21",
+            "start_line": null
+          }
+        ],
+        "requirement_id": "plan:validation:1",
+        "status": "VERIFIED"
+      },
+      {
+        "concise_summary": "Diff shows the three original tests (smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, vipOrderGetsVipDiscount) unchanged in assertion content (only whitespace/indentation changed); full suite passed 6/6, confirming they still pass.",
+        "evidence_refs": [
+          {
+            "end_line": 21,
+            "kind": "TRUSTED_DIFF",
+            "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+            "ref_id": "e7",
+            "requirement_id": "plan:validation:2",
+            "source_id": "",
+            "start_line": 1
+          },
+          {
+            "end_line": null,
+            "kind": "EXECUTION",
+            "path": "",
+            "ref_id": "e8",
+            "requirement_id": "plan:validation:2",
+            "source_id": "exec-evidence-bbdc85c0be35d43b4929a676b0d0beb3",
+            "start_line": null
+          }
+        ],
+        "requirement_id": "plan:validation:2",
+        "status": "VERIFIED"
+      },
+      {
+        "concise_summary": "git diff --name-only shows only src/test/java/com/sweforge/pricing/PricingCalculatorTest.java changed; git diff src/main/ is empty.",
+        "evidence_refs": [
+          {
+            "end_line": null,
+            "kind": "EXECUTION",
+            "path": "",
+            "ref_id": "e9",
+            "requirement_id": "plan:validation:3",
+            "source_id": "exec-evidence-5c505d35ca3b59c7c302129cb309db09",
+            "start_line": null
+          },
+          {
+            "end_line": null,
+            "kind": "EXECUTION",
+            "path": "",
+            "ref_id": "e10",
+            "requirement_id": "plan:validation:3",
+            "source_id": "exec-evidence-afb6e42624e03be650b497272af29325",
+            "start_line": null
+          }
+        ],
+        "requirement_id": "plan:validation:3",
+        "status": "VERIFIED"
+      },
+      {
+        "concise_summary": "Full mvn test run completed with BUILD SUCCESS, exit code 0, 6 tests run, 0 failures, 0 errors.",
+        "evidence_refs": [
+          {
+            "end_line": null,
+            "kind": "EXECUTION",
+            "path": "",
+            "ref_id": "e11",
+            "requirement_id": "plan:validation:4",
+            "source_id": "exec-evidence-bbdc85c0be35d43b4929a676b0d0beb3",
+            "start_line": null
+          }
+        ],
+        "requirement_id": "plan:validation:4",
+        "status": "VERIFIED"
+      }
+    ],
+    "observations": [
+      {
+        "assertion_or_signal": "",
+        "end_line": 30,
+        "fact": "Diff hunk shows three new @Test methods added with expected values 9_999, 9_000, and 9_001 for Item values 9_999, 10_000, and 10_001 respectively.",
+        "kind": "CODE",
+        "observation_id": "o1",
+        "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+        "requirement_id": "plan:step:2",
+        "start_line": 24
+      },
+      {
+        "assertion_or_signal": "",
+        "end_line": null,
+        "fact": "Command 'git diff src/main/' produced empty output (output_hash matches empty tree hash e3b0c44...), confirming zero changes to production source directory.",
+        "kind": "EXECUTION",
+        "observation_id": "o2",
+        "path": "",
+        "requirement_id": "plan:step:3",
+        "start_line": null
+      },
+      {
+        "assertion_or_signal": "",
+        "end_line": null,
+        "fact": "Command 'git diff --name-only' listed exactly one file: src/test/java/com/sweforge/pricing/PricingCalculatorTest.java.",
+        "kind": "EXECUTION",
+        "observation_id": "o3",
+        "path": "",
+        "requirement_id": "plan:validation:3",
+        "start_line": null
+      },
+      {
+        "assertion_or_signal": "",
+        "end_line": 21,
+        "fact": "Diff shows only whitespace/indentation reformatting (4-space to 6-space indent) applied to the existing calculator field declaration and the three pre-existing @Test methods (smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, vipOrderGetsVipDiscount); no assertion values or logic changed.",
+        "kind": "CODE",
+        "observation_id": "o4",
+        "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+        "requirement_id": "plan:step:2",
+        "start_line": 8
+      }
+    ]
+  },
+  "repair_instructions": [
+    "Capture and include the actual contents (or a targeted diff/grep output) of /src/main/java/com/sweforge/pricing/DiscountPolicy.java (e.g., via `cat` or `sed -n` on the relevant lines) as trusted execution evidence to confirm the threshold logic (no discount below 10,000 cents, 10% discount at/above 10,000 cents for REGULAR tier) referenced in plan:step:1. The executor's narrative claim about line 8 is not sufficient trusted evidence on its own."
+  ],
+  "requirement_checks": [
+    {
+      "evidence": "No raw evidence (file contents, cat/sed output) of DiscountPolicy.java was captured; this requirement is explicitly listed under unavailable evidence requirements. Only the executor's untrusted narrative claim references line 8 threshold logic, which is insufficient per policy that executor claims are untrusted and require independent evidence.",
+      "evidence_refs": [
+        {
+          "end_line": null,
+          "kind": "TRUSTED_DIFF",
+          "path": "src/main/java/com/sweforge/pricing/DiscountPolicy.java",
+          "ref_id": "e1",
+          "requirement_id": "plan:step:1",
+          "source_id": "",
+          "start_line": null
+        }
+      ],
+      "repairability": "IN_SCOPE_REPAIR",
+      "requirement_id": "plan:step:1",
+      "status": "UNVERIFIED"
+    },
+    {
+      "evidence": "Diff (lines 22-34) confirms three new @Test methods added: justBelowThresholdHasNoDiscount (Item(9999)->9999), atThresholdGetsBulkDiscount (Item(10000)->9000), justAboveThresholdGetsBulkDiscount (Item(10001)->9001), following existing single-item Order/List.of style.",
+      "evidence_refs": [
+        {
+          "end_line": 34,
+          "kind": "TRUSTED_DIFF",
+          "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+          "ref_id": "e2",
+          "requirement_id": "plan:step:2",
+          "source_id": "",
+          "start_line": 22
+        }
+      ],
+      "repairability": "NOT_APPLICABLE",
+      "requirement_id": "plan:step:2",
+      "status": "SATISFIED"
+    },
+    {
+      "evidence": "git diff src/main/ returned empty output, confirming no production code files (DiscountPolicy.java, PricingCalculator.java, Order.java, Item.java, CustomerTier.java) were modified.",
+      "evidence_refs": [
+        {
+          "end_line": null,
+          "kind": "EXECUTION",
+          "path": "",
+          "ref_id": "e3",
+          "requirement_id": "plan:step:3",
+          "source_id": "",
+          "start_line": null
+        }
+      ],
+      "repairability": "NOT_APPLICABLE",
+      "requirement_id": "plan:step:3",
+      "status": "SATISFIED"
+    },
+    {
+      "evidence": "mvn -Dtest=PricingCalculatorTest test executed with exit code 0, Tests run: 6, Failures: 0, Errors: 0, BUILD SUCCESS.",
+      "evidence_refs": [
+        {
+          "end_line": null,
+          "kind": "EXECUTION",
+          "path": "",
+          "ref_id": "e4",
+          "requirement_id": "plan:step:4",
+          "source_id": "",
+          "start_line": null
+        }
+      ],
+      "repairability": "NOT_APPLICABLE",
+      "requirement_id": "plan:step:4",
+      "status": "SATISFIED"
+    },
+    {
+      "evidence": "Full mvn test executed with exit code 0, Tests run: 6, Failures: 0, Errors: 0, BUILD SUCCESS.",
+      "evidence_refs": [
+        {
+          "end_line": null,
+          "kind": "EXECUTION",
+          "path": "",
+          "ref_id": "e5",
+          "requirement_id": "plan:step:5",
+          "source_id": "",
+          "start_line": null
+        }
+      ],
+      "repairability": "NOT_APPLICABLE",
+      "requirement_id": "plan:step:5",
+      "status": "SATISFIED"
+    },
+    {
+      "evidence": "Test run output shows Tests run: 6 (3 original + 3 new boundary tests), Failures: 0, Errors: 0, confirming compilation and passing of all three new boundary tests at 9,999/10,000/10,001 cents.",
+      "evidence_refs": [
+        {
+          "end_line": null,
+          "kind": "EXECUTION",
+          "path": "",
+          "ref_id": "e6",
+          "requirement_id": "plan:validation:1",
+          "source_id": "",
+          "start_line": null
+        }
+      ],
+      "repairability": "NOT_APPLICABLE",
+      "requirement_id": "plan:validation:1",
+      "status": "SATISFIED"
+    },
+    {
+      "evidence": "Diff shows the three original tests (smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, vipOrderGetsVipDiscount) unchanged in assertion content (only whitespace/indentation altered); full suite passed 6/6, confirming they continue to pass.",
+      "evidence_refs": [
+        {
+          "end_line": null,
+          "kind": "TRUSTED_DIFF",
+          "path": "",
+          "ref_id": "e7",
+          "requirement_id": "plan:validation:2",
+          "source_id": "",
+          "start_line": null
+        },
+        {
+          "end_line": null,
+          "kind": "EXECUTION",
+          "path": "",
+          "ref_id": "e8",
+          "requirement_id": "plan:validation:2",
+          "source_id": "",
+          "start_line": null
+        }
+      ],
+      "repairability": "NOT_APPLICABLE",
+      "requirement_id": "plan:validation:2",
+      "status": "SATISFIED"
+    },
+    {
+      "evidence": "git diff --name-only lists only src/test/java/com/sweforge/pricing/PricingCalculatorTest.java; git diff src/main/ is empty, confirming no production source files modified.",
+      "evidence_refs": [
+        {
+          "end_line": null,
+          "kind": "EXECUTION",
+          "path": "",
+          "ref_id": "e9",
+          "requirement_id": "plan:validation:3",
+          "source_id": "",
+          "start_line": null
+        },
+        {
+          "end_line": null,
+          "kind": "EXECUTION",
+          "path": "",
+          "ref_id": "e10",
+          "requirement_id": "plan:validation:3",
+          "source_id": "",
+          "start_line": null
+        }
+      ],
+      "repairability": "NOT_APPLICABLE",
+      "requirement_id": "plan:validation:3",
+      "status": "SATISFIED"
+    },
+    {
+      "evidence": "Full mvn test run completed with BUILD SUCCESS, exit code 0, 6 tests run, 0 failures, 0 errors.",
+      "evidence_refs": [
+        {
+          "end_line": null,
+          "kind": "EXECUTION",
+          "path": "",
+          "ref_id": "e11",
+          "requirement_id": "plan:validation:4",
+          "source_id": "",
+          "start_line": null
+        }
+      ],
+      "repairability": "NOT_APPLICABLE",
+      "requirement_id": "plan:validation:4",
+      "status": "SATISFIED"
+    }
+  ],
+  "semantic_artifact": {
+    "artifact_kind": "SPLIT_EVIDENCE_REVIEW",
+    "artifact_version": 1,
+    "candidate_associations": [
+      {
+        "basis": "EXACT_RANGE",
+        "basis_scope": "PRIMARY",
+        "candidate_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "context_exact_range_requirement_ids": [],
+        "context_same_hunk_requirement_ids": [],
+        "exact_range_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "finding_id": "boundary-tests-cover-single-item-orders-only",
+        "primary_exact_range_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "primary_same_hunk_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_catalog_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_hunk_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_path_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ]
+      },
+      {
+        "basis": "EXACT_RANGE",
+        "basis_scope": "PRIMARY",
+        "candidate_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "context_exact_range_requirement_ids": [],
+        "context_same_hunk_requirement_ids": [],
+        "exact_range_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "finding_id": "reformatting-mixed-with-functional-test-additions",
+        "primary_exact_range_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "primary_same_hunk_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_catalog_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_hunk_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ],
+        "same_path_requirement_ids": [
+          "plan:step:2",
+          "plan:validation:2"
+        ]
+      }
+    ],
+    "clusters": [
+      {
+        "bounded_raw_excerpt": "@@ -5,17 +5,29 @@ import java.util.List;\n import static org.junit.jupiter.api.Assertions.assertEquals;\n \n class PricingCalculatorTest {\n-    private final PricingCalculator calculator = new PricingCalculator();\n+      private final PricingCalculator calculator = new PricingCalculator();\n \n-    @Test void smallRegularOrderHasNoDiscount() {\n-        assertEquals(5_500, calculator.calculateTotalCents(new Order(List.of(new Item(2_500), new Item(3_000)))));\n-    }\n+      @Test void smallRegularOrderHasNoDiscount() {\n+          assertEquals(5_500, calculator.calculateTotalCents(new Order(List.of(new Item(2_500), new Item(3_000)))));\n+      }\n \n-    @Test void largeRegularOrderGetsBulkDiscount() {\n-        assertEquals(9_900, calculator.calculateTotalCents(new Order(List.of(new Item(6_000), new Item(5_000)))));\n-    }\n+      @Test void largeRegularOrderGetsBulkDiscount() {\n+          assertEquals(9_900, calculator.calculateTotalCents(new Order(List.of(new Item(6_000), new Item(5_000)))));\n+      }\n \n-    @Test void vipOrderGetsVipDiscount() {\n-        assertEquals(4_800, calculator.calculateTotalCents(new Order(List.of(new Item(4_000), new Item(2_000)), CustomerTier.VIP)));\n-    }\n+      @Test void vipOrderGetsVipDiscount() {\n+          assertEquals(4_800, calculator.calculateTotalCents(new Order(List.of(new Item(4_000), new Item(2_000)), CustomerTier.VIP)));\n+      }\n+\n+      @Test void justBelowThresholdHasNoDiscount() {\n+          assertEquals(9_999, calculator.calculateTotalCents(new Order(List.of(new Item(9_999)))));\n+      }\n+\n+      @Test void atThresholdGetsBulkDiscount() {\n+          assertEquals(9_000, calculator.calculateTotalCents(new Order(List.of(new Item(10_000)))));\n+      }\n+\n+      @Test void justAboveThresholdGetsBulkDiscount() {\n+          assertEquals(9_001, calculator.calculateTotalCents(new Order(List.of(new Item(10_001)))));\n+      }\n }\n",
+        "cluster_id": "cluster:f8bb3f7bace69bba995e6489",
+        "complete": true,
+        "content_hash": "20d7e0472b73b8cc5428a9bd83000f371d9e1a66b5d2d4a94d53cb2875b4f498",
+        "evidence_ids": [
+          "diff:f343ecb7f4e6c9ce1ce085f1"
+        ],
+        "ranges": [
+          {
+            "end_line": 33,
+            "evidence_id": "diff:f343ecb7f4e6c9ce1ce085f1",
+            "hunk_identity": "@@ -5,17 +5,29 @@ import java.util.List;",
+            "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+            "start_line": 5
+          }
+        ],
+        "role": "TEST_VALIDATION",
+        "routing_signals": [
+          "test-like path",
+          "test/assert vocabulary"
+        ],
+        "score": 41
+      }
+    ],
+    "implementation": {
+      "applicable": false,
+      "failure_reason": "",
+      "failure_stage": "NONE",
+      "findings": [],
+      "prompt_chars": 0,
+      "provider_requests": 0,
+      "rejected_findings": [],
+      "stage": "IMPLEMENTATION",
+      "status": "SKIPPED"
+    },
+    "test_validation": {
+      "applicable": true,
+      "failure_reason": "",
+      "failure_stage": "NONE",
+      "findings": [
+        {
+          "behavioral_consequence": "If the discount threshold is checked against Order.total() computed by summing item prices, a summation or off-by-one defect that only manifests when multiple items sum to a value at/near the boundary (e.g., two items summing to 10_000) would not be caught by any test in this suite, since no test sums multiple items to land exactly on or near the threshold.",
+          "cluster_ids": [
+            "cluster:f8bb3f7bace69bba995e6489"
+          ],
+          "concise_summary": "The three new threshold boundary tests (justBelowThresholdHasNoDiscount, atThresholdGetsBulkDiscount, justAboveThresholdGetsBulkDiscount) each construct an Order containing a single Item, so they only prove the bulk-discount threshold comparison against one item's price, not against the summed total of a multi-item order.",
+          "concrete_source_facts": [
+            "justBelowThresholdHasNoDiscount builds new Order(List.of(new Item(9_999))) - one item, asserts 9_999.",
+            "atThresholdGetsBulkDiscount builds new Order(List.of(new Item(10_000))) - one item, asserts 9_000.",
+            "justAboveThresholdGetsBulkDiscount builds new Order(List.of(new Item(10_001))) - one item, asserts 9_001.",
+            "The only pre-existing multi-item bulk-discount test, largeRegularOrderGetsBulkDiscount, uses items totaling 11_000, well clear of the 9_999/10_000/10_001 boundary and therefore does not exercise the exact crossing point for a summed multi-item total."
+          ],
+          "finding_id": "boundary-tests-cover-single-item-orders-only",
+          "provenance": [
+            {
+              "cluster_id": "cluster:f8bb3f7bace69bba995e6489",
+              "end_line": 33,
+              "evidence_id": "diff:f343ecb7f4e6c9ce1ce085f1",
+              "hunk_identity": "@@ -5,17 +5,29 @@ import java.util.List;",
+              "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+              "start_line": 5
+            }
+          ],
+          "severity": "WARNING"
+        },
+        {
+          "behavioral_consequence": "Reviewers must manually distinguish pure whitespace churn from the substantive new assertions in the same hunk, increasing the chance that an incorrect expected value or subtle logic change in the new boundary tests is overlooked during review because it is visually diluted by unrelated reformatting of unchanged tests.",
+          "cluster_ids": [
+            "cluster:f8bb3f7bace69bba995e6489"
+          ],
+          "concise_summary": "The same hunk that introduces three new boundary tests also reformats the indentation of all three pre-existing test methods (fields/bodies re-indented) with no logic or assertion change, mixing cosmetic whitespace edits with the functional addition in a single diff block.",
+          "concrete_source_facts": [
+            "The lines for the calculator field declaration and the smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, and vipOrderGetsVipDiscount methods are each removed and re-added with only indentation changed, no assertion values or expressions altered.",
+            "The three genuinely new tests are appended immediately after this reformatted block inside the same hunk @@ -5,17 +5,29 @@."
+          ],
+          "finding_id": "reformatting-mixed-with-functional-test-additions",
+          "provenance": [
+            {
+              "cluster_id": "cluster:f8bb3f7bace69bba995e6489",
+              "end_line": 33,
+              "evidence_id": "diff:f343ecb7f4e6c9ce1ce085f1",
+              "hunk_identity": "@@ -5,17 +5,29 @@ import java.util.List;",
+              "path": "src/test/java/com/sweforge/pricing/PricingCalculatorTest.java",
+              "start_line": 5
+            }
+          ],
+          "severity": "WARNING"
+        }
+      ],
+      "prompt_chars": 5138,
+      "provider_requests": 1,
+      "rejected_findings": [],
+      "stage": "TEST_VALIDATION",
+      "status": "COMPLETED"
+    }
+  },
   "summary": "The test file changes (three new boundary tests, no production code changes, all tests passing) are well supported by execution evidence and satisfy plan:step:2/3, plan:step:4/5, and all plan:validation:1-4 requirements. However, plan:step:1 (confirming the DiscountPolicy.java threshold logic) has no captured trusted evidence \u2014 only the executor's untrusted narrative claim, and this requirement is explicitly listed as unavailable evidence. Per policy, executor claims alone cannot satisfy a behavioral requirement. This is an in-scope repair: a follow-up cycle should capture actual DiscountPolicy.java contents (e.g., via cat/sed) as trusted execution evidence to confirm the threshold logic before the review can proceed to ACCEPT. Two WARNING-level specialist findings (single-item-only test coverage, and reformatting mixed with functional changes) are noted for awareness but are non-blocking.",
-  "thread_id": "github:1341401850:issue:14",
   "verdict": "NEEDS_FIXES"
 }

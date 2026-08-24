@@ -11,5 +11,7 @@
   "review_iteration": 1,
   "root_event_key": "1341401850:issue:5230795022:2026-08-24T03:30:27Z",
   "root_input_id": null,
+  "source_archive": "/Users/shashwattripathi/.sweforge/acceptance-archive/20260824-prefixture",
+  "source_database": "/Users/shashwattripathi/.sweforge/acceptance-archive/20260824-prefixture/stress-state.db",
   "thread_id": "github:1341401850:issue:13"
 }
