@@ -26,6 +26,7 @@ sweforge-review-replay = "sweforge.review_fixture_cli:replay_main"
 
 [dependency-groups]
 dev = [
+    "langchain-openai>=1.6.0",
     "pytest>=8.0",
     "ruff>=0.9",
 ]
