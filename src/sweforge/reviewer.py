@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -387,6 +388,23 @@ class ReviewerContext:
     read_ledger: list[dict] | None = None
 
 
+@dataclass(frozen=True)
+class ReviewAttemptObservation:
+    """One directly observed model/guard boundary during execution review."""
+
+    stage: Literal["INSPECTION", "FINALIZATION"]
+    attempt: int
+    artifact: dict
+    evaluated_artifact: dict
+    guard_problems: tuple[GuardProblem, ...] = ()
+    ledger: tuple[dict, ...] = ()
+    error_type: str | None = None
+    error_message: str | None = None
+
+
+AttemptObserver = Callable[[ReviewAttemptObservation], None]
+
+
 class ReviewerReadError(ValueError):
     """A reviewer read request was outside the safe source-review scope."""
 
@@ -625,7 +643,7 @@ def review_requirement_contract(evidence: dict) -> list[dict[str, str]]:
     return build_review_requirement_contract(source_text, plan_text)
 
 
-def _guard_accept_coverage(
+def _accept_coverage_problems(
     result: ExecutionReviewResult,
     contract: list[dict[str, str]],
     *,
@@ -634,9 +652,9 @@ def _guard_accept_coverage(
     semantic_review: SemanticReviewArtifact | None = None,
     ledger: list[dict] | None = None,
     evidence: dict | None = None,
-) -> ExecutionReviewResult:
+) -> list[GuardProblem]:
     if result.verdict != "ACCEPT":
-        return result
+        return []
     expected = [item["requirement_id"] for item in contract]
     actual = [item.requirement_id for item in result.requirement_checks]
     counts = Counter(actual)
@@ -687,6 +705,12 @@ def _guard_accept_coverage(
             semantic_review=semantic_review,
         )
     )
+    return problems
+
+
+def _apply_accept_coverage_guard(
+    result: ExecutionReviewResult, problems: list[GuardProblem]
+) -> ExecutionReviewResult:
     if not problems:
         return result
     return ExecutionReviewResult(
@@ -708,6 +732,28 @@ def _guard_accept_coverage(
         ],
         repair_instructions=[],
     )
+
+
+def _guard_accept_coverage(
+    result: ExecutionReviewResult,
+    contract: list[dict[str, str]],
+    *,
+    inspection: InspectionReport | None = None,
+    challenge: ChallengeReport | None = None,
+    semantic_review: SemanticReviewArtifact | None = None,
+    ledger: list[dict] | None = None,
+    evidence: dict | None = None,
+) -> ExecutionReviewResult:
+    problems = _accept_coverage_problems(
+        result,
+        contract,
+        inspection=inspection,
+        challenge=challenge,
+        semantic_review=semantic_review,
+        ledger=ledger,
+        evidence=evidence,
+    )
+    return _apply_accept_coverage_guard(result, problems)
 
 
 INSPECTOR_SYSTEM_PROMPT = (
@@ -3411,7 +3457,11 @@ def _fail_closed_unavailable_inspections(
 
 
 def review_execution(
-    *, context: ReviewerContext, model: str, evidence: dict
+    *,
+    context: ReviewerContext,
+    model: str,
+    evidence: dict,
+    attempt_observer: AttemptObserver | None = None,
 ) -> ExecutionReviewResult:
     contract = review_requirement_contract(evidence)
     ledger: list[dict] = []
@@ -3450,9 +3500,22 @@ def review_execution(
                     inspection_input, context=inspection_context.repo_context
                 )
             inspection_report = _structured(inspection, InspectionReport)
-        except (ModelCallLimitExceededError, ToolCallLimitExceededError):
+        except (ModelCallLimitExceededError, ToolCallLimitExceededError) as exc:
             inspection_truncated = True
+            if attempt_observer is not None:
+                attempt_observer(
+                    ReviewAttemptObservation(
+                        stage="INSPECTION",
+                        attempt=inspection_attempt + 1,
+                        artifact={},
+                        evaluated_artifact={},
+                        ledger=tuple(dict(item) for item in ledger),
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
+                )
             break
+        raw_inspection_artifact = inspection_report.model_dump(mode="json")
         inspection_report = _canonical_inspection_provenance(
             inspection_report, evidence=evidence, ledger=ledger
         )
@@ -3463,6 +3526,17 @@ def review_execution(
         artifact_problems = _inspection_artifact_problems(
             contract, inspection_report, ledger=ledger, evidence=evidence
         )
+        if attempt_observer is not None:
+            attempt_observer(
+                ReviewAttemptObservation(
+                    stage="INSPECTION",
+                    attempt=inspection_attempt + 1,
+                    artifact=raw_inspection_artifact,
+                    evaluated_artifact=inspection_report.model_dump(mode="json"),
+                    guard_problems=tuple(artifact_problems),
+                    ledger=tuple(dict(item) for item in ledger),
+                )
+            )
         if not artifact_problems:
             break
         if inspection_attempt == 1:
@@ -3535,8 +3609,9 @@ def review_execution(
         raise ReviewFinalizationError(
             "execution review returned an invalid structured verdict"
         ) from exc
+    raw_finalizer_artifact = parsed.model_dump(mode="json")
     parsed = _guard_repairability(parsed)
-    guarded = _guard_accept_coverage(
+    final_problems = _accept_coverage_problems(
         parsed,
         contract,
         inspection=inspection_report,
@@ -3544,6 +3619,22 @@ def review_execution(
         ledger=ledger,
         evidence=evidence,
     )
+    guarded = _apply_accept_coverage_guard(parsed, final_problems)
+    if attempt_observer is not None:
+        attempt_observer(
+            ReviewAttemptObservation(
+                stage="FINALIZATION",
+                attempt=1,
+                artifact={
+                    "finalizer": raw_finalizer_artifact,
+                    "inspection": inspection_report.model_dump(mode="json"),
+                    "semantic_review": semantic_review.model_dump(mode="json"),
+                },
+                evaluated_artifact=guarded.model_dump(mode="json"),
+                guard_problems=tuple(final_problems),
+                ledger=tuple(dict(item) for item in ledger),
+            )
+        )
     guarded.inspection_report = inspection_report
     guarded.semantic_review = semantic_review
     guarded.raw_verdict = parsed.verdict

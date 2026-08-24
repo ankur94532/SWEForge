@@ -1,0 +1,484 @@
+"""Frozen-fixture conformance measurement for execution review."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import tempfile
+from collections import Counter
+from collections.abc import Callable, Iterable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Literal
+
+from sweforge.context import RepoAgentContext
+from sweforge.review_fixture import FixtureError, load_fixture
+from sweforge.reviewer import (
+    ExecutionReviewResult,
+    ReviewAttemptObservation,
+    ReviewerContext,
+    ReviewFinalizationError,
+    review_execution,
+    review_requirement_contract,
+)
+
+Classification = Literal["OK", "A", "B", "UNCLASSIFIED", "ERROR"]
+FixtureClass = Literal["RF016", "STABLE", "CONTESTED"]
+
+RF016 = "RF-016-inspector-authority"
+STABLE_FIXTURES = frozenset({"RF-10-5ad6d25f", "RF-12-deb019b0", "RF-14-41504759"})
+CONTESTED_FIXTURES = frozenset(
+    {"RF-7-a34d33a8", "RF-11-8cb404e7", "RF-13-7fda18a4", "RF-14-52e49d5a"}
+)
+KNOWN_FIXTURES = frozenset({RF016, *STABLE_FIXTURES, *CONTESTED_FIXTURES})
+DEFAULT_CLASSIFICATIONS = Path(__file__).parents[1] / "guard_classification.json"
+
+RunOnce = Callable[[Callable[[ReviewAttemptObservation], None]], ExecutionReviewResult]
+
+
+def load_guard_classifications(path: Path) -> dict[str, str]:
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError("guard classification file must contain an object")
+    result: dict[str, str] = {}
+    for code, entry in raw.items():
+        if not isinstance(entry, dict) or entry.get("class") not in {
+            "A",
+            "B",
+            "UNKNOWN",
+        }:
+            raise ValueError(f"invalid classification for {code}")
+        result[str(code)] = str(entry["class"])
+    return result
+
+
+def classify_guard_codes(
+    codes: Iterable[str], classifications: dict[str, str]
+) -> Classification:
+    observed = tuple(codes)
+    if not observed:
+        return "OK"
+    resolved = [classifications.get(code) for code in observed]
+    if any(value is None or value == "UNKNOWN" for value in resolved):
+        return "UNCLASSIFIED"
+    if any(value == "A" for value in resolved):
+        return "A"
+    return "B"
+
+
+def fixture_class(fixture_id: str) -> FixtureClass:
+    if fixture_id == RF016:
+        return "RF016"
+    if fixture_id in STABLE_FIXTURES:
+        return "STABLE"
+    if fixture_id in CONTESTED_FIXTURES:
+        return "CONTESTED"
+    raise FixtureError(f"fixture has no conformance policy: {fixture_id}")
+
+
+def _guard_codes(observation: ReviewAttemptObservation) -> list[str]:
+    return [problem.code.value for problem in observation.guard_problems]
+
+
+def _observation_dict(observation: ReviewAttemptObservation) -> dict[str, Any]:
+    ledger = [
+        {
+            key: entry[key]
+            for key in ("read_id", "normalized_path", "offset", "returned_lines")
+            if key in entry
+        }
+        for entry in observation.ledger
+    ]
+    return {
+        "stage": observation.stage,
+        "attempt": observation.attempt,
+        "artifact": observation.artifact,
+        "evaluated_artifact": observation.evaluated_artifact,
+        "guard_problems": [
+            {"code": problem.code.value, "detail": problem.detail}
+            for problem in observation.guard_problems
+        ],
+        "ledger": ledger,
+        "error_type": observation.error_type,
+        "error_message": observation.error_message,
+    }
+
+
+def _first_pass_classification(
+    observations: list[ReviewAttemptObservation], classifications: dict[str, str]
+) -> Classification:
+    first = next((item for item in observations if item.stage == "INSPECTION"), None)
+    if first is None:
+        return "ERROR"
+    if first.error_type:
+        return "B"
+    return classify_guard_codes(_guard_codes(first), classifications)
+
+
+def _eventual_classification(
+    observations: list[ReviewAttemptObservation],
+    classifications: dict[str, str],
+    error: BaseException | None,
+) -> Classification:
+    final = next(
+        (item for item in reversed(observations) if item.stage == "FINALIZATION"),
+        None,
+    )
+    if final is not None:
+        return classify_guard_codes(_guard_codes(final), classifications)
+    rejected = [
+        item
+        for item in observations
+        if item.stage == "INSPECTION" and item.guard_problems
+    ]
+    if isinstance(error, ReviewFinalizationError) and rejected:
+        return classify_guard_codes(_guard_codes(rejected[-1]), classifications)
+    return "ERROR"
+
+
+def _fixture_success(
+    kind: FixtureClass,
+    result: ExecutionReviewResult | None,
+    expected_verdict: str | None,
+) -> bool:
+    if result is None:
+        return False
+    if kind == "STABLE":
+        return result.verdict == expected_verdict
+    return True
+
+
+def evaluate_runs(
+    *,
+    fixture_id: str,
+    model: str,
+    runs: int,
+    expected_verdict: str | None,
+    classifications: dict[str, str],
+    run_once: RunOnce,
+) -> dict[str, Any]:
+    if runs < 1:
+        raise ValueError("runs must be at least 1")
+    kind = fixture_class(fixture_id)
+    records: list[dict[str, Any]] = []
+    occurrence_histogram: Counter[str] = Counter()
+    run_histogram: Counter[str] = Counter()
+
+    for index in range(1, runs + 1):
+        observations: list[ReviewAttemptObservation] = []
+        result: ExecutionReviewResult | None = None
+        error: BaseException | None = None
+        try:
+            result = run_once(observations.append)
+        except Exception as exc:  # each failed invocation is measurement, not a retry
+            error = exc
+
+        per_run_codes: set[str] = set()
+        for observation in observations:
+            codes = _guard_codes(observation)
+            occurrence_histogram.update(codes)
+            per_run_codes.update(codes)
+        run_histogram.update(per_run_codes)
+
+        first_pass = _first_pass_classification(observations, classifications)
+        eventual = _eventual_classification(observations, classifications, error)
+        success = _fixture_success(kind, result, expected_verdict)
+        final = next(
+            (item for item in reversed(observations) if item.stage == "FINALIZATION"),
+            None,
+        )
+        raw_verdict = (
+            final.artifact.get("finalizer", {}).get("verdict") if final else None
+        )
+        records.append(
+            {
+                "run": index,
+                "first_pass": first_pass,
+                "eventual": eventual,
+                "eventual_success": success,
+                "result_verdict": result.verdict if result else None,
+                "raw_model_verdict": raw_verdict,
+                "guard_veto": bool(
+                    final
+                    and raw_verdict == "ACCEPT"
+                    and result is not None
+                    and result.verdict == "BLOCKED"
+                    and final.guard_problems
+                ),
+                "guard_codes": sorted(per_run_codes),
+                "exception": (
+                    {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                        "diagnostic": getattr(error, "diagnostic", None),
+                    }
+                    if error
+                    else None
+                ),
+                "observations": [_observation_dict(item) for item in observations],
+            }
+        )
+
+    first_counts = Counter(item["first_pass"] for item in records)
+    eventual_counts = Counter(item["eventual"] for item in records)
+    eventual_ok = sum(bool(item["eventual_success"]) for item in records)
+    all_classifications = [
+        value for item in records for value in (item["first_pass"], item["eventual"])
+    ]
+    first_rate = first_counts["OK"] / runs
+    eventual_rate = eventual_ok / runs
+    class_a_codes = {
+        code for code in occurrence_histogram if classifications.get(code) == "A"
+    }
+    unclassified_codes = {
+        code
+        for code in occurrence_histogram
+        if classifications.get(code) in {None, "UNKNOWN"}
+    }
+    class_a_runs = sum(
+        bool(set(item["guard_codes"]) & class_a_codes) for item in records
+    )
+    unclassified_runs = sum(
+        bool(set(item["guard_codes"]) & unclassified_codes) for item in records
+    )
+    failures = []
+    if first_rate < 0.95:
+        failures.append(f"first-pass {first_rate:.3f} < 0.950")
+    if eventual_rate != 1.0:
+        failures.append(f"bounded-eventual {eventual_rate:.3f} != 1.000")
+    if class_a_codes:
+        failures.append("Class A guard rejection observed")
+    if unclassified_codes:
+        failures.append("unclassified guard rejection observed")
+    if "ERROR" in all_classifications:
+        failures.append("unclassified operational error observed")
+
+    return {
+        "fixture": fixture_id,
+        "fixture_class": kind,
+        "model": model,
+        "runs": runs,
+        "expected_verdict": expected_verdict,
+        "first_pass": {
+            "counts": dict(sorted(first_counts.items())),
+            "rate": first_rate,
+        },
+        "eventual": {
+            "counts": dict(sorted(eventual_counts.items())),
+            "ok": eventual_ok,
+            "rate": eventual_rate,
+        },
+        "guard_histogram": dict(sorted(occurrence_histogram.items())),
+        "guard_run_histogram": dict(sorted(run_histogram.items())),
+        "class_a": {
+            "codes": sorted(class_a_codes),
+            "occurrences": sum(occurrence_histogram[code] for code in class_a_codes),
+            "runs": class_a_runs,
+            "rate": class_a_runs / runs,
+        },
+        "unclassified": {
+            "codes": sorted(unclassified_codes),
+            "occurrences": sum(
+                occurrence_histogram[code] for code in unclassified_codes
+            ),
+            "runs": unclassified_runs,
+        },
+        "verdict": "PASS" if not failures else "FAIL: " + "; ".join(failures),
+        "results": records,
+    }
+
+
+def _extract_worktree(archive: Path, destination: Path) -> None:
+    tar_path = destination / "worktree.tar"
+    with tar_path.open("wb") as output:
+        subprocess.run(
+            ["zstd", "-q", "-d", "-c", str(archive)],
+            stdout=output,
+            check=True,
+        )
+    subprocess.run(["tar", "-C", str(destination), "-xf", str(tar_path)], check=True)
+    tar_path.unlink()
+
+
+def run_fixture(
+    path: Path,
+    *,
+    model: str,
+    runs: int,
+    classifications: dict[str, str],
+) -> dict[str, Any]:
+    fixture = load_fixture(path)
+    derived_contract = review_requirement_contract(fixture["evidence"])
+    if derived_contract != fixture["contract"]:
+        raise FixtureError(f"contract drift for {path.name}")
+    fixture_id = str(fixture["fixture"]["fixture_id"])
+    expected_verdict = fixture["expected"].get("verdict")
+    kind = fixture_class(fixture_id)
+    if kind == "STABLE" and expected_verdict != "NEEDS_FIXES":
+        raise FixtureError(f"STABLE fixture has invalid expectation: {fixture_id}")
+
+    with tempfile.TemporaryDirectory(prefix="sweforge-conformance-") as temp:
+        worktree = Path(temp)
+        _extract_worktree(fixture["worktree_archive"], worktree)
+        authority = fixture["context"].get("repo_context")
+
+        def invoke(observer):
+            context = ReviewerContext(
+                worktree=str(worktree),
+                repo_context=RepoAgentContext(**authority) if authority else None,
+                live_input_provider=None,
+                live_delivered_event_keys=set(),
+            )
+            return review_execution(
+                context=context,
+                model=model,
+                evidence=fixture["evidence"],
+                attempt_observer=observer,
+            )
+
+        report = evaluate_runs(
+            fixture_id=fixture_id,
+            model=model,
+            runs=runs,
+            expected_verdict=expected_verdict,
+            classifications=classifications,
+            run_once=invoke,
+        )
+    report["execution_evidence_ids"] = sorted(
+        str(item["evidence_id"])
+        for item in fixture["evidence"].get("execution_observations", [])
+        if item.get("evidence_id")
+    )
+    return report
+
+
+def replay_fixture_offline(path: Path, *, runs: int) -> dict[str, Any]:
+    """Validate and inventory stored fixture outcomes without claiming conformance."""
+    fixture = load_fixture(path)
+    fixture_id = str(fixture["fixture"]["fixture_id"])
+    kind = fixture_class(fixture_id)
+    if review_requirement_contract(fixture["evidence"]) != fixture["contract"]:
+        raise FixtureError(f"contract drift for {fixture_id}")
+    stored = fixture["outcome"]
+    expected_verdict = fixture["expected"].get("verdict")
+    if kind == "STABLE" and (
+        stored is None or stored.get("verdict") != expected_verdict
+    ):
+        raise FixtureError(f"STABLE stored verdict mismatch: {fixture_id}")
+    if kind == "CONTESTED" and (stored is None or stored.get("verdict") != "BLOCKED"):
+        raise FixtureError(f"CONTESTED stored verdict mismatch: {fixture_id}")
+    if kind == "RF016" and stored is not None:
+        raise FixtureError("RF-016 unexpectedly has a stored outcome")
+    guard_codes = fixture["diagnostics"].get("guard_codes", [])
+    return {
+        "fixture": fixture_id,
+        "fixture_class": kind,
+        "runs": runs,
+        "stored_verdict": stored.get("verdict") if stored else None,
+        "stored_failure": fixture["diagnostics"] if stored is None else None,
+        "expected_verdict": expected_verdict,
+        "first_pass": {"counts": {"UNMEASURED": runs}, "rate": None},
+        "eventual": {"counts": {"UNMEASURED": runs}, "ok": None, "rate": None},
+        "guard_histogram": dict(sorted(Counter(guard_codes).items())),
+        "guard_run_histogram": {code: runs for code in sorted(set(guard_codes))},
+        "class_a": {"codes": [], "occurrences": 0, "runs": 0, "rate": 0.0},
+        "unclassified": {"codes": [], "occurrences": 0, "runs": 0},
+        "verdict": "OFFLINE_BASELINE_VALID",
+        "results": [],
+    }
+
+
+def discover_fixtures(paths: Iterable[Path]) -> list[Path]:
+    discovered: dict[str, Path] = {}
+    for path in paths:
+        if (path / "fixture.json").is_file():
+            discovered[path.name] = path
+            continue
+        if not path.is_dir():
+            raise FixtureError(f"fixture path does not exist: {path}")
+        for child in path.iterdir():
+            if child.is_dir() and (child / "fixture.json").is_file():
+                discovered[child.name] = child
+    unknown = sorted(set(discovered) - KNOWN_FIXTURES)
+    if unknown:
+        raise FixtureError("unknown fixtures: " + ", ".join(unknown))
+    return [discovered[name] for name in sorted(discovered)]
+
+
+def _summary(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "model": report["model"],
+        "runs_per_fixture": report["runs_per_fixture"],
+        "verdict": report["verdict"],
+        "fixtures": [
+            {
+                key: fixture[key]
+                for key in (
+                    "fixture",
+                    "fixture_class",
+                    "first_pass",
+                    "eventual",
+                    "guard_histogram",
+                    "guard_run_histogram",
+                    "class_a",
+                    "unclassified",
+                    "verdict",
+                )
+            }
+            for fixture in report["fixtures"]
+        ],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("fixtures", type=Path, nargs="+")
+    parser.add_argument("--model")
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--classifications", type=Path, default=DEFAULT_CLASSIFICATIONS)
+    parser.add_argument("--report", type=Path)
+    args = parser.parse_args(argv)
+
+    if not args.offline and not args.model:
+        parser.error("--model is required unless --offline is selected")
+
+    paths = discover_fixtures(args.fixtures)
+    if args.offline:
+        fixtures = [replay_fixture_offline(path, runs=args.runs) for path in paths]
+        model = "offline-stored-outcome"
+        overall_verdict = "OFFLINE_BASELINE_VALID"
+    else:
+        classifications = load_guard_classifications(args.classifications)
+        fixtures = [
+            run_fixture(
+                path,
+                model=args.model,
+                runs=args.runs,
+                classifications=classifications,
+            )
+            for path in paths
+        ]
+        model = args.model
+        overall_verdict = (
+            "PASS"
+            if fixtures and all(item["verdict"] == "PASS" for item in fixtures)
+            else "FAIL"
+        )
+    report = {
+        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "model": model,
+        "runs_per_fixture": args.runs,
+        "fixtures": fixtures,
+        "verdict": overall_verdict,
+    }
+    if args.report:
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(_summary(report), indent=2, sort_keys=True))
+    return 0 if report["verdict"] in {"PASS", "OFFLINE_BASELINE_VALID"} else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
