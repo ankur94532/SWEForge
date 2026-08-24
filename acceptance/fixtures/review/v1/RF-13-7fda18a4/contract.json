@@ -1,0 +1,52 @@
+[
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:1",
+    "text": "Confirm scope: DiscountPolicy.discountRate applies a 10% bulk discount when subtotalCents >= 10_000 for REGULAR-tier customers (VIP always gets 20% regardless of subtotal, so use CustomerTier.REGULAR / default Order constructor for these tests to isolate the bulk threshold)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:2",
+    "text": "In /src/test/java/com/sweforge/pricing/PricingCalculatorTest.java, add three new @Test methods matching the existing style (single Item per order via `new Order(List.of(new Item(cents)))`, assertEquals on calculateTotalCents result): just below threshold (9,999 cents) expecting no discount (total 9,999); at threshold (10,000 cents) expecting 10% discount (total 9,000); just above threshold (10,001 cents) expecting 10% discount (total 9,001)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:3",
+    "text": "Name the new test methods descriptively and consistently with existing naming, e.g. subtotalJustBelowBulkThresholdHasNoDiscount, subtotalAtBulkThresholdGetsBulkDiscount, subtotalJustAboveBulkThresholdGetsBulkDiscount."
+  },
+  {
+    "classification": "STRUCTURAL",
+    "requirement_id": "plan:step:4",
+    "text": "Do not modify any file under /src/main/java (production code must remain unchanged) - verify by diffing only the test file after edits."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:step:5",
+    "text": "Run the targeted test class, e.g. `mvn -Dtest=PricingCalculatorTest test`, under Java 21 to confirm the new boundary tests pass alongside existing ones."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:step:6",
+    "text": "Run the full test suite with `mvn test` to confirm no regressions elsewhere, per repository convention of finishing with a full-suite run."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:1",
+    "text": "New tests compile and pass for 9,999 (no discount), 10,000 (10% discount), and 10,001 (10% discount) subtotal cents."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:validation:2",
+    "text": "`mvn -Dtest=PricingCalculatorTest test` passes with all (existing + new) tests green."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:validation:3",
+    "text": "`mvn test` (full suite) passes with no failures."
+  },
+  {
+    "classification": "STRUCTURAL",
+    "requirement_id": "plan:validation:4",
+    "text": "No changes present in any file under /src/main/java - only PricingCalculatorTest.java is modified."
+  }
+]

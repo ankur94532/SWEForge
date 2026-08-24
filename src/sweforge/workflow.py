@@ -2,7 +2,10 @@
 
 import hashlib
 import json
+import logging
+import os
 import re
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -75,7 +78,8 @@ from .memory_learning import (
     curate_repository_memory,
 )
 from .planner import PlannerContext, generate_plan, validate_canonical_plan_text
-from .reviewer import ExecutionReviewResult, ReviewerContext, review_execution
+from .review_fixture import build_review_evidence, write_fixture
+from .reviewer import ExecutionReviewResult, review_execution
 from .workspace import ThreadWorkspace, Workspace, WorkspaceError
 
 _PREFIX_RE = re.compile(r"^\s*@agent\b", re.IGNORECASE)
@@ -86,6 +90,7 @@ MAX_REPAIR_FINDINGS_CHARS = 14_000
 MAX_REPAIR_INSTRUCTIONS_CHARS = 12_000
 MAX_REPAIR_REVIEW_CHARS = 30_000
 MAX_REPAIR_TASK_CHARS = 50_000
+_LOGGER = logging.getLogger(__name__)
 
 
 def _flush_execution_evidence(
@@ -2201,57 +2206,54 @@ class WorkflowEngine:
         )
         if execution is None or workspace is None:
             raise ValueError("review evidence is unavailable")
-        evidence = {
-            "plan": {
-                "id": plan.plan_id,
-                "version": plan.version,
-                "text": plan.plan_text,
-            },
-            "execution": dict(execution),
-            "attempt": attempt.__dict__,
-            "current_head": execution["end_head_sha"],
-            "base_head": workspace.base_commit,
-            "execution_observations": [
-                record.__dict__
-                for record in self.store.execution_tool_evidence_for_cycle(
-                    state.thread_id, state.cycle_id
-                )
-            ],
-        }
-        inspection = Workspace(
-            Path(workspace.workspace_path),
-            Path(workspace.workspace_path),
-            workspace.base_commit,
+        evidence, review_context, _ = build_review_evidence(
+            self.store,
+            thread_id=state.thread_id,
+            cycle_id=state.cycle_id,
+            workspace_path=workspace.workspace_path,
+            attempt_id=attempt.attempt_id,
         )
-        evidence["changed_files"] = inspection.changed_files()[:500]
-        evidence["diff"] = inspection.diff()[:60_000]
-        evidence["dirty"] = not inspection.is_clean()
-        source = self.store.source_event(state.root_event_key)
-        evidence["source"] = dict(source) if source else {}
-        if source:
-            evidence["source_request"] = format_source_context(
-                source, normalize_task(source["body"])
+        review_context = replace(
+            review_context, memory_store=memory_store, memory_namespace=None
+        )
+        result = None
+        review_error: BaseException | None = None
+        try:
+            result = self.reviewer(
+                context=review_context, model=model, evidence=evidence
             )
-        if attempt.parent_review_id:
-            previous = self.store.execution_review(attempt.parent_review_id)
-            evidence["previous_review"] = previous.__dict__ if previous else {}
-        review_delivered: set[str] = set()
-        result = self.reviewer(
-            context=ReviewerContext(
-                worktree=workspace.workspace_path,
-                repo_context=RepoAgentContext(
-                    repo_id=state.repo_id,
-                    repo_full_name=state.repo_full_name,
-                    thread_id=state.thread_id,
-                ),
-                memory_store=memory_store,
-                memory_namespace=None,
-                live_input_provider=None,
-                live_delivered_event_keys=review_delivered,
-            ),
-            model=model,
-            evidence=evidence,
-        )
+        except BaseException as exc:
+            review_error = exc
+        if os.getenv("SWEFORGE_REVIEW_FIXTURE_DIR"):
+            try:
+                fixture_id = (
+                    "RF-"
+                    + _stable_id(
+                        state.thread_id, str(state.cycle_id), attempt.attempt_id
+                    )[:16]
+                    + "-"
+                    + uuid.uuid4().hex[:8]
+                )
+                write_fixture(
+                    os.environ["SWEFORGE_REVIEW_FIXTURE_DIR"],
+                    fixture_id=fixture_id,
+                    evidence=evidence,
+                    context=review_context,
+                    provenance=build_review_evidence(
+                        self.store,
+                        thread_id=state.thread_id,
+                        cycle_id=state.cycle_id,
+                        workspace_path=workspace.workspace_path,
+                        attempt_id=attempt.attempt_id,
+                    )[2],
+                    outcome=result,
+                    error=review_error,
+                )
+            except Exception as capture_error:  # capture must never affect review
+                _LOGGER.warning("review fixture capture failed: %s", capture_error)
+        if review_error is not None:
+            raise review_error
+        assert result is not None
         review_id = "review-" + _stable_id(
             attempt.attempt_id, json.dumps(result.model_dump(), sort_keys=True)
         )

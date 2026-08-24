@@ -1,0 +1,62 @@
+[
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:1",
+    "text": "Confirm threshold logic: DiscountPolicy.discountRate() returns 0.10 when subtotalCents >= 10_000 for CustomerTier.REGULAR, else 0.0; PricingCalculator.calculateTotalCents rounds subtotal * (1 - discountRate)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:2",
+    "text": "In /src/test/java/com/sweforge/pricing/PricingCalculatorTest.java, add three @Test methods following the existing style (single Order built via List.of(new Item(...)), assertEquals(expected, calculator.calculateTotalCents(order)))."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:step:3",
+    "text": "Case 1 (9,999 cents, below threshold): build an order whose items sum to 9,999 cents, e.g. new Item(9_999); expect no discount so expected total = 9,999."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:step:4",
+    "text": "Case 2 (10,000 cents, at threshold): build an order summing to 10,000 cents, e.g. new Item(10_000); expect 10% discount so expected total = 9,000."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:step:5",
+    "text": "Case 3 (10,001 cents, just above threshold): build an order summing to 10,001 cents, e.g. new Item(10_001); expect 10% discount so expected total = 9,001 (10_001 * 0.9 = 9000.9, rounds to 9001)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:6",
+    "text": "Name the new tests descriptively per existing convention, e.g. subtotalJustBelowThresholdHasNoDiscount, subtotalAtThresholdGetsBulkDiscount, subtotalJustAboveThresholdGetsBulkDiscount."
+  },
+  {
+    "classification": "STRUCTURAL",
+    "requirement_id": "plan:step:7",
+    "text": "Do not modify DiscountPolicy.java, PricingCalculator.java, or any other production source file."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:step:8",
+    "text": "Run the relevant tests: mvn -Dtest=PricingCalculatorTest test (Java 21) and confirm all cases pass, then optionally run the full mvn test per repository convention."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:1",
+    "text": "All three new tests pass, confirming 9,999 -> no discount, 10,000 and 10,001 -> 10% discount (rounded)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:2",
+    "text": "Existing tests (smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, vipOrderGetsVipDiscount) still pass unmodified."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:3",
+    "text": "Diff shows changes only in PricingCalculatorTest.java; no production code files (DiscountPolicy.java, PricingCalculator.java, Item.java, Order.java, CustomerTier.java) are modified."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:4",
+    "text": "mvn test completes successfully for the whole module."
+  }
+]

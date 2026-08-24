@@ -1,0 +1,52 @@
+[
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:1",
+    "text": "Confirm the threshold logic in DiscountPolicy.discountRate: REGULAR tier gets 0% discount below 10,000 cents subtotal and 10% at/above 10,000 cents; PricingCalculator rounds subtotalCents * (1 - discountRate)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:2",
+    "text": "In /src/test/java/com/sweforge/pricing/PricingCalculatorTest.java, following the existing style (Order built from a List<Item>, @Test methods with assertEquals), add a test with subtotal 9,999 cents (e.g. new Item(9_999)) asserting no discount applies (expected total 9_999)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:3",
+    "text": "Add a test with subtotal exactly 10,000 cents asserting the 10% discount applies (expected total 9_000)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:4",
+    "text": "Add a test with subtotal 10,001 cents asserting the 10% discount applies (expected total = round(10_001 * 0.9) = 9_001)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:5",
+    "text": "Use plain REGULAR-tier orders (default single-arg Order constructor, no CustomerTier.VIP) so only the bulk-discount threshold is exercised, independent of the VIP rule."
+  },
+  {
+    "classification": "STRUCTURAL",
+    "requirement_id": "plan:step:6",
+    "text": "Do not modify DiscountPolicy.java, PricingCalculator.java, Order.java, Item.java, or CustomerTier.java \u2014 production code stays unchanged."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:step:7",
+    "text": "Run the relevant tests: mvn -Dtest=PricingCalculatorTest test (Java 21/Maven per repo convention), and optionally follow with a full mvn test to ensure nothing else regressed."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:1",
+    "text": "mvn -Dtest=PricingCalculatorTest test passes with all existing and 3 new tests green"
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:2",
+    "text": "mvn test (full suite) passes"
+  },
+  {
+    "classification": "STRUCTURAL",
+    "requirement_id": "plan:validation:3",
+    "text": "Diff limited to /src/test/java/com/sweforge/pricing/PricingCalculatorTest.java only; no changes under /src/main"
+  }
+]

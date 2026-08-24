@@ -1,0 +1,47 @@
+[
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:1",
+    "text": "Confirm current threshold logic in /src/main/java/com/sweforge/pricing/DiscountPolicy.java: no discount below 10,000 cents subtotal, 10% discount at/above 10,000 cents (for REGULAR tier)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:2",
+    "text": "Edit /src/test/java/com/sweforge/pricing/PricingCalculatorTest.java to add three new @Test methods, following the existing style used by smallRegularOrderHasNoDiscount and largeRegularOrderGetsBulkDiscount: (1) justBelowThresholdHasNoDiscount - Order with a single Item(9_999) expecting total 9_999 (no discount); (2) atThresholdGetsBulkDiscount - Order with a single Item(10_000) expecting total 9_000 (10% off: 10_000*0.90=9_000); (3) justAboveThresholdGetsBulkDiscount - Order with a single Item(1"
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:3",
+    "text": "Leave all production code files (DiscountPolicy.java, PricingCalculator.java, Order.java, Item.java, CustomerTier.java) untouched."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:step:4",
+    "text": "Run the relevant tests: mvn -Dtest=PricingCalculatorTest test (or equivalent Maven test command scoped to this class) under Java 21, per repository conventions."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:step:5",
+    "text": "Optionally run the full suite with mvn test to ensure no unrelated regressions, per the pricing-build-validation skill guidance."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:1",
+    "text": "New test class compiles and all three new boundary tests (9,999 / 10,000 / 10,001 cents) pass."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:2",
+    "text": "Existing tests (smallRegularOrderHasNoDiscount, largeRegularOrderGetsBulkDiscount, vipOrderGetsVipDiscount) continue to pass unchanged."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:3",
+    "text": "Diff shows changes only in the test file; no production source files modified."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:validation:4",
+    "text": "mvn test (full run) completes successfully with no failures."
+  }
+]

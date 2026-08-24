@@ -21,6 +21,8 @@ sweforge-github-publish = "sweforge.github_publish_cli:main"
 sweforge-serve = "sweforge.server_cli:main"
 sweforge-repo-memory = "sweforge.repo_memory_cli:main"
 sweforge-repo-skills = "sweforge.skills_cli:main"
+sweforge-review-freeze = "sweforge.review_fixture_cli:freeze_main"
+sweforge-review-replay = "sweforge.review_fixture_cli:replay_main"
 
 [dependency-groups]
 dev = [

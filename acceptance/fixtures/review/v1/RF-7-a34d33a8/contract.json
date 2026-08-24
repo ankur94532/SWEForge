@@ -1,0 +1,57 @@
+[
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:1",
+    "text": "Confirm the threshold logic in DiscountPolicy.discountRate: subtotalCents >= 10_000 triggers a 10% discount for REGULAR customers (VIP always gets 20%, so use REGULAR tier orders for these tests)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:2",
+    "text": "In /src/test/java/com/sweforge/pricing/PricingCalculatorTest.java, add a @Test method for subtotal 9,999 cents (single Item(9_999)) asserting the total equals 9,999 (no discount, since 9,999 < 10,000)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:3",
+    "text": "Add a @Test method for subtotal exactly 10,000 cents (single Item(10_000)) asserting the total equals 9,000 (10% discount applied at the boundary, since 10,000 >= 10,000)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:4",
+    "text": "Add a @Test method for subtotal 10,001 cents (single Item(10_001)) asserting the total equals 9,001 rounded per Math.round(10_001 * 0.90) = 9,001 (10% discount applied above the boundary)."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:step:5",
+    "text": "Follow existing test conventions: use the shared 'calculator' field, List.of(...) for items, default REGULAR tier via the single-arg Order constructor, and assertEquals(expected, actual) formatting consistent with existing tests."
+  },
+  {
+    "classification": "STRUCTURAL",
+    "requirement_id": "plan:step:6",
+    "text": "Do not modify DiscountPolicy.java, PricingCalculator.java, or any other production source file \u2014 this is a test-only change."
+  },
+  {
+    "classification": "VALIDATION",
+    "requirement_id": "plan:step:7",
+    "text": "Run the focused test class (e.g., mvn -Dtest=PricingCalculatorTest test) under Java 21 to verify the three new boundary tests and existing tests pass, then run the full 'mvn test' suite as a final validation per the pricing-build-validation skill."
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:1",
+    "text": "mvn -Dtest=PricingCalculatorTest test passes with all 6 tests (3 existing + 3 new) green"
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:2",
+    "text": "mvn test (full suite) passes with no failures"
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:3",
+    "text": "Diff shows changes only in PricingCalculatorTest.java; no production files under src/main modified"
+  },
+  {
+    "classification": "BEHAVIORAL",
+    "requirement_id": "plan:validation:4",
+    "text": "New tests explicitly cover subtotal values 9_999, 10_000, and 10_001 cents"
+  }
+]

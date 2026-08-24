@@ -1,0 +1,8 @@
+{
+  "exception_type": "ReviewFinalizationError",
+  "failure_count": 3,
+  "guard_codes": [
+    "IA-MISSING-DIRECT-CODE-OBSERVATION"
+  ],
+  "message": "inspector returned an invalid inspection artifact after correction"
+}

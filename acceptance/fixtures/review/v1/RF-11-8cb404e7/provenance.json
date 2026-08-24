@@ -1,0 +1,15 @@
+{
+  "attempt_id": "attempt-permit-1e572935370cfd103fb47ecc3f04a812fd1a02794040a2f60eaca995e7fe67bb",
+  "attempt_kind": "INITIAL",
+  "cycle_id": 1,
+  "execution_id": null,
+  "issue_number": 11,
+  "plan_id": "plan-e2c6629dc4d070b0fa2cdcf12790f0c5536ecab174e1e5e9d813cd0de624d302",
+  "plan_version": 1,
+  "repo_full_name": "ankur94532/sweforge-test-pricing",
+  "repo_id": 1341401850,
+  "review_iteration": 1,
+  "root_event_key": "1341401850:issue:5228475475:2026-08-23T18:40:43Z",
+  "root_input_id": null,
+  "thread_id": "github:1341401850:issue:11"
+}
