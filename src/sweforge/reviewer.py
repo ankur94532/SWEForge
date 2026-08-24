@@ -96,7 +96,10 @@ class EvidenceRef(BaseModel):
             "sequence label, prose, or a reconstructed identifier. For "
             "INSPECTED_FILE evidence in a final requirement check, copy the exact "
             "non-empty source_id supplied in the evidence catalog; never omit, "
-            "invent, or reconstruct a repository read ID."
+            "invent, or reconstruct a repository read ID. For "
+            "INSPECTOR_OBSERVATION evidence, copy the exact observation_id emitted "
+            "in the same inspection artifact into source_id; ref_id is not the "
+            "observation identity."
         ),
     )
     path: str = Field(default="", max_length=500)
@@ -837,8 +840,11 @@ INSPECTOR_SYSTEM_PROMPT = (
     "text, sequence labels, prose, or reconstructed identifiers in EXECUTION "
     "source_id. CODE and TEST observations must use a concrete file path and "
     "matching line range, never a directory path. CODE is not inherently required "
-    "for validation-only requirements. Never mark VERIFIED when these proof "
-    "obligations are missing, and executor prose is never evidence."
+    "for validation-only requirements. If an evidence ref uses "
+    "INSPECTOR_OBSERVATION, its source_id must copy the exact observation_id from "
+    "an observation in this same artifact; ref_id does not identify an observation. "
+    "Never mark VERIFIED when these proof obligations are missing, and executor "
+    "prose is never evidence."
 )
 
 
