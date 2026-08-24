@@ -2793,7 +2793,10 @@ def test_reviewer_prompts_require_full_contract_semantics():
     assert "never a directory path" in INSPECTOR_SYSTEM_PROMPT
     assert "exact observation_id" in INSPECTOR_SYSTEM_PROMPT
     assert "ref_id does not identify" in INSPECTOR_SYSTEM_PROMPT
+    assert "separate observation for each" in INSPECTOR_SYSTEM_PROMPT
+    assert "whitespace-only reformatting" in INSPECTOR_SYSTEM_PROMPT
     assert "exact non-empty source_id" in FINALIZER_SYSTEM_PROMPT
+    assert "whitespace-only reformatting" in FINALIZER_SYSTEM_PROMPT
 
 
 def test_inspector_schema_describes_exact_execution_and_file_authority():
@@ -2824,6 +2827,7 @@ def test_inspector_schema_describes_exact_execution_and_file_authority():
     assert "exact non-empty source_id" in ref_description
     assert "exact observation_id" in ref_description
     assert "ref_id is not" in ref_description
+    assert "same requirement_id" in ref_description
     assert "never use a directory" in observation_description
     assert "never replace" in kind_description
     assert "at least one CODE" in observations_description
