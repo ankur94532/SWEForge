@@ -1,14 +1,22 @@
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 from typing import TypedDict
 
 import pytest
+from deepagents.backends import LocalShellBackend
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.graph import END, START, StateGraph
+from pydantic import PrivateAttr
 
 from sweforge.agent import run_task
+from sweforge.context import RepoAgentContext
 from sweforge.execution import (
     SQLiteCheckpointer,
     ThreadLockUnavailable,
@@ -79,6 +87,51 @@ def persist(store, event: SourceEvent, stream: str = "issues") -> None:
     )
 
 
+def _tool_name(item) -> str:
+    if isinstance(item, dict):
+        function = item.get("function", {})
+        return item.get("name") or function.get("name") or ""
+    return item.name
+
+
+class RecordingToolModel(BaseChatModel):
+    """Deterministic chat model that records the real bound tool schemas."""
+
+    _responses: list[AIMessage] = PrivateAttr()
+    _surfaces: list[tuple[str, ...]] = PrivateAttr(default_factory=list)
+    _messages: list[list] = PrivateAttr(default_factory=list)
+    _barrier: Barrier | None = PrivateAttr(default=None)
+
+    def __init__(self, responses: list[AIMessage], *, barrier: Barrier | None = None):
+        super().__init__()
+        self._responses = list(responses)
+        self._barrier = barrier
+
+    @property
+    def _llm_type(self) -> str:
+        return "sweforge-recording-tools"
+
+    @property
+    def surfaces(self) -> list[tuple[str, ...]]:
+        return self._surfaces
+
+    @property
+    def messages(self) -> list[list]:
+        return self._messages
+
+    def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+        self._surfaces.append(tuple(sorted(_tool_name(item) for item in tools)))
+        if self._barrier is not None:
+            self._barrier.wait(timeout=5)
+            self._barrier = None
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        self._messages.append(list(messages))
+        message = self._responses.pop(0)
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
 def test_run_task_uses_native_checkpointer_and_thread_config(monkeypatch):
     calls = {}
 
@@ -108,30 +161,287 @@ def test_run_task_uses_native_checkpointer_and_thread_config(monkeypatch):
     assert calls["invoke"][1] == {"configurable": {"thread_id": "github:1:issue:7"}}
 
 
-def test_repair_mode_removes_delegation_target(monkeypatch):
-    created = []
+def test_initial_and_repair_actual_tool_surfaces(tmp_path):
+    initial_model = RecordingToolModel([AIMessage(content="initial done")])
+    repair_model = RecordingToolModel([AIMessage(content="repair done")])
 
-    class FakeAgent:
-        def invoke(self, state, config=None, durability=None):
-            return {"messages": [SimpleNamespace(content="done")]}
-
-    def fake_create(**kwargs):
-        created.append(kwargs)
-        return FakeAgent()
-
-    monkeypatch.setattr("sweforge.agent.create_deep_agent", fake_create)
-    common = dict(
-        model="provider:model",
-        worktree="/tmp/worktree",
-        task="repair it",
-        thread_id="github:1:issue:7",
-        checkpointer=None,
+    run_task(
+        model=initial_model,
+        worktree=str(tmp_path),
+        task="inspect",
     )
-    run_task(**common)
-    run_task(**common, repair_mode=True)
-    assert len(created[0]["subagents"]) == 1
-    assert created[1]["subagents"] == []
-    assert "do not delegate" in created[1]["system_prompt"]
+    run_task(
+        model=repair_model,
+        worktree=str(tmp_path),
+        task="repair",
+        repair_mode=True,
+    )
+
+    initial_tools = set(initial_model.surfaces[-1])
+    repair_tools = set(repair_model.surfaces[-1])
+    expected_filesystem = {
+        "ls",
+        "read_file",
+        "write_file",
+        "edit_file",
+        "glob",
+        "grep",
+        "execute",
+    }
+    assert "task" in initial_tools
+    assert "task" not in repair_tools
+    assert expected_filesystem <= initial_tools
+    assert expected_filesystem <= repair_tools
+
+
+def test_repair_rejects_stale_task_call_without_dispatch(tmp_path):
+    model = RecordingToolModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "delegate",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "stale-task",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="stopped"),
+        ]
+    )
+
+    assert (
+        run_task(
+            model=model,
+            worktree=str(tmp_path),
+            task="repair",
+            repair_mode=True,
+        )
+        == "stopped"
+    )
+    assert all("task" not in surface for surface in model.surfaces)
+    tool_messages = [
+        message
+        for invocation in model.messages
+        for message in invocation
+        if getattr(message, "type", None) == "tool"
+    ]
+    assert any("not a valid tool" in str(message.content) for message in tool_messages)
+
+
+def test_default_subagent_reproduces_async_structured_tool_sync_failure(tmp_path):
+    from deepagents import create_deep_agent
+    from langchain_core.tools import StructuredTool
+
+    async def async_probe(operation_id: str) -> str:
+        return operation_id
+
+    probe = StructuredTool.from_function(
+        coroutine=async_probe,
+        name="acceptance_retryable_probe",
+        description="Async-only acceptance probe.",
+    )
+    model = RecordingToolModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "invoke the probe",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "delegate-probe",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "acceptance_retryable_probe",
+                        "args": {"operation_id": "repair"},
+                        "id": "sync-probe",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+        ]
+    )
+    agent = create_deep_agent(
+        model=model,
+        tools=[probe],
+        subagents=[],
+        backend=LocalShellBackend(root_dir=str(tmp_path), virtual_mode=True),
+    )
+
+    with pytest.raises(
+        NotImplementedError, match="StructuredTool does not support sync invocation"
+    ):
+        agent.invoke({"messages": [{"role": "user", "content": "repair"}]})
+    assert "task" in model.surfaces[0]
+
+
+def test_repair_cannot_reach_async_tool_through_stale_task_call(tmp_path):
+    from langchain_core.tools import StructuredTool
+
+    from sweforge.agent import _build_backend, _create_repair_agent
+
+    calls = []
+
+    async def async_probe(operation_id: str) -> str:
+        calls.append(operation_id)
+        return operation_id
+
+    probe = StructuredTool.from_function(
+        coroutine=async_probe,
+        name="acceptance_retryable_probe",
+        description="Async-only acceptance probe.",
+    )
+    model = RecordingToolModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "invoke the probe",
+                            "subagent_type": "general-purpose",
+                        },
+                        "id": "stale-delegation",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="rejected"),
+        ]
+    )
+    agent = _create_repair_agent(
+        model=model,
+        tools=[probe],
+        backend=_build_backend(str(tmp_path)),
+        system_prompt="repair directly",
+        memory=None,
+        skills=None,
+        permissions=None,
+        store=None,
+        context_schema=None,
+        checkpointer=None,
+        middleware=[],
+    )
+
+    result = agent.invoke({"messages": [{"role": "user", "content": "repair"}]})
+    assert result["messages"][-1].content == "rejected"
+    assert all("task" not in surface for surface in model.surfaces)
+    assert calls == []
+
+
+def test_repair_filesystem_and_execute_record_evidence(tmp_path):
+    observations = []
+    model = RecordingToolModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "write_file",
+                        "args": {
+                            "file_path": "/repair.txt",
+                            "content": "repair-file\n",
+                        },
+                        "id": "write-repair",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "read_file",
+                        "args": {"file_path": "/repair.txt"},
+                        "id": "read-repair",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "execute",
+                        "args": {"command": "printf 'repair-evidence\\n'"},
+                        "id": "execute-repair",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="repair complete"),
+        ]
+    )
+    context = RepoAgentContext(1, "example/repo", "github:1:issue:7")
+
+    result = run_task(
+        model=model,
+        worktree=str(tmp_path),
+        task="repair",
+        repo_context=context,
+        secure_execution=True,
+        sandbox_backend_provider=lambda **_: LocalShellBackend(
+            root_dir=str(tmp_path), virtual_mode=True
+        ),
+        execution_evidence_sink=lambda **item: observations.append(item),
+        repair_mode=True,
+    )
+
+    assert result == "repair complete"
+    assert (tmp_path / "repair.txt").read_text() == "repair-file\n"
+    assert len(observations) == 1, [
+        (getattr(message, "name", None), str(message.content))
+        for invocation in model.messages
+        for message in invocation
+        if getattr(message, "type", None) == "tool"
+    ]
+    assert observations[0]["command"] == "printf 'repair-evidence\\n'"
+    assert observations[0]["exit_code"] == 0
+    assert observations[0]["output"] == "repair-evidence\n"
+
+
+def test_concurrent_initial_and_repair_tool_surfaces_are_isolated(tmp_path):
+    for _ in range(10):
+        barrier = Barrier(2)
+        initial_model = RecordingToolModel(
+            [AIMessage(content="initial")], barrier=barrier
+        )
+        repair_model = RecordingToolModel(
+            [AIMessage(content="repair")], barrier=barrier
+        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            initial = pool.submit(
+                run_task,
+                model=initial_model,
+                worktree=str(tmp_path),
+                task="initial",
+            )
+            repair = pool.submit(
+                run_task,
+                model=repair_model,
+                worktree=str(tmp_path),
+                task="repair",
+                repair_mode=True,
+            )
+            assert initial.result(timeout=10) == "initial"
+            assert repair.result(timeout=10) == "repair"
+        assert "task" in initial_model.surfaces[-1]
+        assert "task" not in repair_model.surfaces[-1]
 
 
 def test_normalize_task_removes_only_invocation_token():

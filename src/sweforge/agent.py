@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from typing import Annotated, Any
 
 from deepagents import create_deep_agent
+from deepagents._models import resolve_model
 from deepagents.backends import (
     CompositeBackend,
     LocalShellBackend,
@@ -14,8 +15,16 @@ from deepagents.backends import (
     StoreBackend,
 )
 from deepagents.backends.protocol import SandboxBackendProtocol
+from deepagents.graph import DeepAgentState
+from deepagents.middleware.filesystem import FilesystemMiddleware
+from deepagents.middleware.memory import MemoryMiddleware
+from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from deepagents.middleware.permissions import FilesystemPermission
+from deepagents.middleware.skills import SkillsMiddleware
+from deepagents.middleware.summarization import create_summarization_middleware
+from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.store.base import BaseStore
@@ -185,9 +194,69 @@ def _build_backend(
     )
 
 
+def _create_repair_agent(
+    *,
+    model: str | BaseChatModel,
+    tools: list[Any],
+    backend: CompositeBackend,
+    system_prompt: str,
+    memory: list[str] | None,
+    skills: list[str] | None,
+    permissions: list[FilesystemPermission] | None,
+    store: BaseStore | None,
+    context_schema: type | None,
+    checkpointer: object | None,
+    middleware: list[AgentMiddleware],
+):
+    """Build the repair harness without synchronous subagent middleware.
+
+    Deep Agents 0.7.8 auto-adds its general-purpose subagent when
+    ``create_deep_agent(..., subagents=[])`` is used. Repair therefore assembles
+    the same core filesystem, skills, summarization, memory and custom
+    middleware directly on LangChain's agent builder. With no
+    ``SubAgentMiddleware``, the compiled graph has no ``task`` tool or
+    synchronous subagent dispatch path.
+    """
+    resolved_model = resolve_model(model)
+    repair_middleware: list[AgentMiddleware] = []
+    if skills is not None:
+        repair_middleware.append(SkillsMiddleware(backend=backend, sources=skills))
+    repair_middleware.extend(
+        [
+            FilesystemMiddleware(backend=backend, _permissions=permissions),
+            create_summarization_middleware(resolved_model, backend),
+            PatchToolCallsMiddleware(),
+            *middleware,
+        ]
+    )
+    if memory is not None:
+        repair_middleware.append(
+            MemoryMiddleware(
+                backend=backend,
+                sources=memory,
+                add_cache_control=True,
+            )
+        )
+    return create_agent(
+        resolved_model,
+        system_prompt=system_prompt,
+        tools=tools,
+        middleware=repair_middleware,
+        context_schema=context_schema,
+        checkpointer=checkpointer,
+        store=store,
+        state_schema=DeepAgentState,
+    ).with_config(
+        {
+            "recursion_limit": 9_999,
+            "metadata": {"ls_integration": "sweforge-repair"},
+        }
+    )
+
+
 def run_task(
     *,
-    model: str,
+    model: str | BaseChatModel,
     worktree: str,
     task: str,
     thread_id: str | None = None,
@@ -349,60 +418,80 @@ def run_task(
         mcp_tools, _ = asyncio.run(
             load_repo_mcp_tools(capability_registry, repo_context)
         )
-    # The general-purpose subagent is read-only research: it may search
-    # historical cases and inspect files, but proposing durable repository
-    # knowledge and interrupting for a human stay with the main agent, which
-    # owns the lifecycle.  Overriding the default subagent is what withholds
-    # them; by default deepagents grants a subagent every parent tool.
-    subagents = (
-        []
-        if repair_mode
-        else [
-            {
-                "name": "general-purpose",
-                "description": (
-                    "Read-only investigator for researching questions, searching "
-                    "code and gathering evidence. Returns a written report; it "
-                    "cannot propose repository memory or ask the human anything."
-                ),
-                "system_prompt": (
-                    "Investigate the request within this repository worktree and "
-                    "report concise, concrete findings with file paths and line "
-                    "numbers. Do not modify application state."
-                ),
-                "tools": [*mcp_tools, *research_tools],
-            }
-        ]
+    # INITIAL keeps a read-only research subagent. Repair uses a dedicated
+    # no-subagent assembly below because Deep Agents 0.7.8 auto-adds its default
+    # general-purpose subagent when an empty list is passed.
+    subagents = [
+        {
+            "name": "general-purpose",
+            "description": (
+                "Read-only investigator for researching questions, searching "
+                "code and gathering evidence. Returns a written report; it "
+                "cannot propose repository memory or ask the human anything."
+            ),
+            "system_prompt": (
+                "Investigate the request within this repository worktree and "
+                "report concise, concrete findings with file paths and line "
+                "numbers. Do not modify application state."
+            ),
+            "tools": [*mcp_tools, *research_tools],
+        }
+    ]
+    system_prompt = (
+        "Work only within the provided repository worktree. Inspect the code, "
+        "make the requested changes, and run relevant tests or validation. "
+        "Filesystem tool paths are virtual paths rooted at the repository. "
+        "Shell commands already execute with the repository root as their "
+        "working directory, so use relative repository paths in shell commands "
+        "rather than virtual absolute paths. "
+        "Summarize what you changed and any validation results."
+        + (
+            " This is a repair execution: perform the authorized repair directly; "
+            "do not delegate work to another agent."
+            if repair_mode
+            else ""
+        )
     )
-    agent = create_deep_agent(
-        model=model,
-        tools=[*mcp_tools, *clarification_tools, *memory_tools, *research_tools],
-        subagents=subagents,
-        backend=backend,
-        system_prompt=(
-            "Work only within the provided repository worktree. Inspect the code, "
-            "make the requested changes, and run relevant tests or validation. "
-            "Filesystem tool paths are virtual paths rooted at the repository. "
-            "Shell commands already execute with the repository root as their "
-            "working directory, so use relative repository paths in shell commands "
-            "rather than virtual absolute paths. "
-            "Summarize what you changed and any validation results."
-            + (
-                " This is a repair execution: perform the authorized repair directly; "
-                "do not delegate work to another agent."
-                if repair_mode
-                else ""
-            )
-        ),
-        memory=memory,
-        skills=[SKILLS_VIRTUAL_PATH]
+    agent_tools = [
+        *mcp_tools,
+        *clarification_tools,
+        *memory_tools,
+        *research_tools,
+    ]
+    skills = (
+        [SKILLS_VIRTUAL_PATH]
         if effective_skills_store is not None and repo_context is not None
-        else None,
-        permissions=permissions,
-        store=memory_store,
-        context_schema=RepoAgentContext if repo_context is not None else None,
-        checkpointer=checkpointer,
-        middleware=middleware,
+        else None
+    )
+    agent = (
+        _create_repair_agent(
+            model=model,
+            tools=agent_tools,
+            backend=backend,
+            system_prompt=system_prompt,
+            memory=memory,
+            skills=skills,
+            permissions=permissions,
+            store=memory_store,
+            context_schema=RepoAgentContext if repo_context is not None else None,
+            checkpointer=checkpointer,
+            middleware=middleware,
+        )
+        if repair_mode
+        else create_deep_agent(
+            model=model,
+            tools=agent_tools,
+            subagents=subagents,
+            backend=backend,
+            system_prompt=system_prompt,
+            memory=memory,
+            skills=skills,
+            permissions=permissions,
+            store=memory_store,
+            context_schema=RepoAgentContext if repo_context is not None else None,
+            checkpointer=checkpointer,
+            middleware=middleware,
+        )
     )
     input_state: dict[str, Any] | None = {
         "messages": [{"role": "user", "content": task}]

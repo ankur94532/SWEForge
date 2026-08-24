@@ -71,7 +71,7 @@ def bounded_excerpt(value: str, limit: int = MAX_OUTPUT_CHARS) -> tuple[str, boo
     return value[:head] + marker + value[-tail:], True
 
 
-class RecordingSandboxBackend:
+class RecordingSandboxBackend(SandboxBackendProtocol):
     """Delegate all sandbox operations while recording completed execute calls."""
 
     def __init__(self, backend: SandboxBackendProtocol, sink: Callable[..., Any]):

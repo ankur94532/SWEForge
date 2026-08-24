@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from queue import Empty, SimpleQueue
 
 from langgraph.store.base import BaseStore
 
@@ -85,6 +86,29 @@ MAX_REPAIR_FINDINGS_CHARS = 14_000
 MAX_REPAIR_INSTRUCTIONS_CHARS = 12_000
 MAX_REPAIR_REVIEW_CHARS = 30_000
 MAX_REPAIR_TASK_CHARS = 50_000
+
+
+def _flush_execution_evidence(
+    store: SQLiteGitHubStore,
+    observations: SimpleQueue[dict],
+    *,
+    attempt_id: str,
+    thread_id: str,
+    cycle_id: int,
+) -> None:
+    """Persist tool-thread observations on the store-owning workflow thread."""
+    while True:
+        try:
+            observation = observations.get_nowait()
+        except Empty:
+            return
+        store.record_execution_tool_evidence(
+            attempt_id=attempt_id,
+            thread_id=thread_id,
+            cycle_id=cycle_id,
+            kind="SHELL",
+            **observation,
+        )
 
 
 @dataclass(frozen=True)
@@ -734,15 +758,10 @@ class WorkflowEngine:
                     authorization_id=permit.permit_id,
                     created_at=utc_timestamp(clock()),
                 )
+                execution_evidence: SimpleQueue[dict] = SimpleQueue()
 
                 def record_execution_evidence(**observation) -> None:
-                    self.store.record_execution_tool_evidence(
-                        attempt_id=attempt.attempt_id,
-                        thread_id=permit.thread_id,
-                        cycle_id=permit.cycle_id,
-                        kind="SHELL",
-                        **observation,
-                    )
+                    execution_evidence.put(observation)
 
                 def resolve_resume(pending: tuple[dict, ...]):
                     """Answer the interrupt that is pending, or nothing at all.
@@ -849,37 +868,49 @@ class WorkflowEngine:
                         ),
                     )
 
-                result = _execute_claim(
-                    store=self.store,
-                    event=event,
-                    lock_root=lock_root,
-                    live_input_provider=None,
-                    live_delivered_event_keys=delivered,
-                    clarification_request_sink=persist_request,
-                    resume_resolver=resolve_resume,
-                    repo_memory_proposal_sink=record_proposal,
-                    issue_memory_search=lambda query, limit: self.search_issue_memory(
-                        repo_id=state_repo_id, query=query, limit=limit
-                    ),
-                    approved_plan_text=plan.plan_text,
-                    approved_plan_id=plan.plan_id,
-                    approved_plan_version=plan.version,
-                    deferred_id=plan.root_input_id
-                    if plan.root_input_id and plan.root_input_id.startswith("deferred-")
-                    else None,
-                    now=clock,
-                    model=model,
-                    repo_paths=repo_paths,
-                    workspace_root=workspace_root,
-                    checkpointer=checkpointer,
-                    runner=runner or run_task,
-                    memory_store=memory_store,
-                    capability_registry=capability_registry,
-                    sandbox_backend_provider=sandbox_backend_provider,
-                    secure_execution=secure_execution,
-                    unsafe_local_shell=unsafe_local_shell,
-                    execution_evidence_sink=record_execution_evidence,
-                )
+                try:
+                    result = _execute_claim(
+                        store=self.store,
+                        event=event,
+                        lock_root=lock_root,
+                        live_input_provider=None,
+                        live_delivered_event_keys=delivered,
+                        clarification_request_sink=persist_request,
+                        resume_resolver=resolve_resume,
+                        repo_memory_proposal_sink=record_proposal,
+                        issue_memory_search=lambda query, limit: (
+                            self.search_issue_memory(
+                                repo_id=state_repo_id, query=query, limit=limit
+                            )
+                        ),
+                        approved_plan_text=plan.plan_text,
+                        approved_plan_id=plan.plan_id,
+                        approved_plan_version=plan.version,
+                        deferred_id=plan.root_input_id
+                        if plan.root_input_id
+                        and plan.root_input_id.startswith("deferred-")
+                        else None,
+                        now=clock,
+                        model=model,
+                        repo_paths=repo_paths,
+                        workspace_root=workspace_root,
+                        checkpointer=checkpointer,
+                        runner=runner or run_task,
+                        memory_store=memory_store,
+                        capability_registry=capability_registry,
+                        sandbox_backend_provider=sandbox_backend_provider,
+                        secure_execution=secure_execution,
+                        unsafe_local_shell=unsafe_local_shell,
+                        execution_evidence_sink=record_execution_evidence,
+                    )
+                finally:
+                    _flush_execution_evidence(
+                        self.store,
+                        execution_evidence,
+                        attempt_id=attempt.attempt_id,
+                        thread_id=permit.thread_id,
+                        cycle_id=permit.cycle_id,
+                    )
                 for event_key in delivered:
                     self._acknowledge_delivered(
                         event_key, thread_id=permit.thread_id, cycle_id=permit.cycle_id
@@ -1096,45 +1127,49 @@ class WorkflowEngine:
                     expected_thread_id=permit.thread_id,
                     now=utc_timestamp(clock()),
                 )
+                execution_evidence: SimpleQueue[dict] = SimpleQueue()
 
                 def record_execution_evidence(**observation) -> None:
-                    self.store.record_execution_tool_evidence(
+                    execution_evidence.put(observation)
+
+                try:
+                    result = _execute_claim(
+                        store=self.store,
+                        event=event,
+                        lock_root=lock_root,
+                        model=model,
+                        repo_paths=repo_paths,
+                        workspace_root=workspace_root,
+                        checkpointer=checkpointer,
+                        runner=runner or run_task,
+                        memory_store=memory_store,
+                        live_input_provider=None,
+                        live_delivered_event_keys=delivered,
+                        clarification_enabled=False,
+                        approved_plan_text=None,
+                        approved_plan_id=None,
+                        approved_plan_version=None,
+                        now=clock,
+                        persist_execution=False,
+                        allow_dirty_workspace=True,
+                        message_id="sweforge:review-repair:"
+                        + hashlib.sha256(permit_id.encode()).hexdigest(),
+                        prepared_task=task,
+                        capability_registry=capability_registry,
+                        sandbox_backend_provider=sandbox_backend_provider,
+                        secure_execution=secure_execution,
+                        unsafe_local_shell=unsafe_local_shell,
+                        execution_evidence_sink=record_execution_evidence,
+                        repair_mode=True,
+                    )
+                finally:
+                    _flush_execution_evidence(
+                        self.store,
+                        execution_evidence,
                         attempt_id=attempt.attempt_id,
                         thread_id=permit.thread_id,
                         cycle_id=permit.cycle_id,
-                        kind="SHELL",
-                        **observation,
                     )
-
-                result = _execute_claim(
-                    store=self.store,
-                    event=event,
-                    lock_root=lock_root,
-                    model=model,
-                    repo_paths=repo_paths,
-                    workspace_root=workspace_root,
-                    checkpointer=checkpointer,
-                    runner=runner or run_task,
-                    memory_store=memory_store,
-                    live_input_provider=None,
-                    live_delivered_event_keys=delivered,
-                    clarification_enabled=False,
-                    approved_plan_text=None,
-                    approved_plan_id=None,
-                    approved_plan_version=None,
-                    now=clock,
-                    persist_execution=False,
-                    allow_dirty_workspace=True,
-                    message_id="sweforge:review-repair:"
-                    + hashlib.sha256(permit_id.encode()).hexdigest(),
-                    prepared_task=task,
-                    capability_registry=capability_registry,
-                    sandbox_backend_provider=sandbox_backend_provider,
-                    secure_execution=secure_execution,
-                    unsafe_local_shell=unsafe_local_shell,
-                    execution_evidence_sink=record_execution_evidence,
-                    repair_mode=True,
-                )
                 for event_key in delivered:
                     self._acknowledge_delivered(
                         event_key, thread_id=permit.thread_id, cycle_id=permit.cycle_id

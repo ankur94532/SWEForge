@@ -151,6 +151,11 @@ def test_wrapper_exposes_complete_installed_protocol_surface():
     assert expected <= set(dir(RecordingSandboxBackend))
 
 
+def test_wrapper_is_recognized_as_installed_sandbox_protocol():
+    backend = RecordingSandboxBackend(FakeBackend([]), lambda **_: None)
+    assert isinstance(backend, SandboxBackendProtocol)
+
+
 def test_filesystem_operations_forward_without_recording_shell_evidence():
     observations = []
     backend = ForwardingBackend([])

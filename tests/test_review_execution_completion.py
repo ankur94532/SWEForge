@@ -502,6 +502,226 @@ def test_repair_ready_executes_same_workspace_and_reaches_accept(tmp_path):
     assert store.eligible_publication_id("github:1:issue:7") is not None
 
 
+def test_issue12_like_repair_uses_real_no_task_agent_and_records_maven(tmp_path):
+    from deepagents.backends import LocalShellBackend
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.messages import AIMessage
+    from langchain_core.outputs import ChatGeneration, ChatResult
+    from langgraph.checkpoint.memory import InMemorySaver
+    from pydantic import PrivateAttr
+
+    from sweforge.agent import run_task
+
+    class RepairModel(BaseChatModel):
+        _responses: list[AIMessage] = PrivateAttr()
+        _surfaces: list[tuple[str, ...]] = PrivateAttr(default_factory=list)
+
+        def __init__(self, responses):
+            super().__init__()
+            self._responses = list(responses)
+
+        @property
+        def _llm_type(self):
+            return "issue12-repair-fixture"
+
+        @property
+        def surfaces(self):
+            return self._surfaces
+
+        def bind_tools(self, tools, *, tool_choice=None, **kwargs):
+            self._surfaces.append(tuple(sorted(tool.name for tool in tools)))
+            return self
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            return ChatResult(
+                generations=[ChatGeneration(message=self._responses.pop(0))]
+            )
+
+    source = tmp_path / "source"
+    source.mkdir()
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=source, check=True, capture_output=True
+        )
+
+    git("init", "-q")
+    (source / "pom.xml").write_text("<project/>\n")
+    test_file = source / "src/test/java/example/PricingCalculatorTest.java"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text("class PricingCalculatorTest {}\n")
+    git("add", ".")
+    git(
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "base",
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_maven = fake_bin / "mvn"
+    fake_maven.write_text("#!/bin/sh\nprintf 'Tests run: 1\\nBUILD SUCCESS\\n'\n")
+    fake_maven.chmod(0o755)
+
+    repo = RepositoryRef(1, "example/repo")
+    root = event(repo, "1", "@agent add boundary tests", "2026-01-01T00:00:00Z")
+    approval = event(repo, "2", "@agent approve", "2026-01-01T00:01:00Z")
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    seed(store, repo, [root, approval])
+    engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:00:30Z")
+    engine.start_cycle(
+        event_key=root.event_key,
+        plan_text="Add test-only boundary coverage and run mvn test",
+        posted_comment_id=1,
+    )
+    engine.approve(event_key=approval.event_key)
+
+    repair_model = RepairModel(
+        [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "execute",
+                        "args": {"command": "mvn test"},
+                        "id": "maven-repair",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="Maven validation completed"),
+        ]
+    )
+    invocations = []
+
+    def runner(**kwargs):
+        invocations.append(kwargs["repair_mode"])
+        if not kwargs["repair_mode"]:
+            workspace_test = (
+                Path(kwargs["worktree"])
+                / "src/test/java/example/PricingCalculatorTest.java"
+            )
+            workspace_test.write_text(
+                "class PricingCalculatorTest { /* boundary regression */ }\n"
+            )
+            return "tests added; Maven not run"
+        return run_task(**{**kwargs, "model": repair_model})
+
+    verdicts = iter(
+        [
+            ExecutionReviewResult(
+                verdict="NEEDS_FIXES",
+                summary="trusted Maven evidence is missing",
+                requirement_checks=[
+                    ReviewRequirementCheck(
+                        requirement_id="plan:validation:1",
+                        status=ReviewRequirementStatus.UNVERIFIED,
+                        repairability=ReviewRepairability.IN_SCOPE_REPAIR,
+                        evidence="no trusted mvn test observation",
+                    )
+                ],
+                repair_instructions=["Run mvn test and capture trusted output."],
+            ),
+            ExecutionReviewResult(
+                verdict="ACCEPT",
+                summary="trusted Maven evidence proves success",
+                requirement_checks=[
+                    ReviewRequirementCheck(
+                        requirement_id="plan:validation:1",
+                        status=ReviewRequirementStatus.SATISFIED,
+                        repairability=ReviewRepairability.NOT_APPLICABLE,
+                        evidence="REVIEW_REPAIR mvn test exited 0 with BUILD SUCCESS",
+                    )
+                ],
+            ),
+        ]
+    )
+    engine.reviewer = lambda **_: next(verdicts)
+    thread_id = "github:1:issue:7"
+
+    def provider(**kwargs):
+        return LocalShellBackend(
+            root_dir=kwargs["worktree"],
+            virtual_mode=True,
+            env={"PATH": str(fake_bin)},
+            inherit_env=False,
+        )
+
+    execute_kwargs = {
+        "model": "unused-by-test-runner",
+        "repo_paths": {repo.full_name: source},
+        "workspace_root": tmp_path / "workspaces",
+        "lock_root": tmp_path / "locks",
+        "checkpointer": InMemorySaver(),
+        "runner": runner,
+        "sandbox_backend_provider": provider,
+        "secure_execution": True,
+    }
+    initial = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert initial.phase is WorkflowPhase.REVIEW_EXECUTION
+    initial_attempt = store.latest_attempt(thread_id, 1)
+    assert initial_attempt is not None
+    assert store.execution_tool_evidence_for_attempt(initial_attempt.attempt_id) == ()
+
+    reviewed = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        review_model="review-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert reviewed.phase is WorkflowPhase.REPAIR_READY
+    repaired = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+    assert repaired.phase is WorkflowPhase.REVIEW_EXECUTION
+    repair_attempt = store.latest_attempt(thread_id, 1)
+    assert repair_attempt is not None
+    repair_evidence = store.execution_tool_evidence_for_attempt(
+        repair_attempt.attempt_id
+    )
+    assert [(item.command, item.exit_code) for item in repair_evidence] == [
+        ("mvn test", 0)
+    ]
+    assert "BUILD SUCCESS" in repair_evidence[0].output
+    accepted = engine.advance(
+        thread_id=thread_id,
+        model="planning-sonnet",
+        review_model="review-sonnet",
+        repo_paths=execute_kwargs["repo_paths"],
+        workspace_root=execute_kwargs["workspace_root"],
+        execute_kwargs=execute_kwargs,
+    )
+
+    assert accepted.phase is WorkflowPhase.AWAITING_PUBLICATION
+    assert invocations == [False, True]
+    assert "task" not in repair_model.surfaces[-1]
+    assert repair_attempt.kind.value == "REVIEW_REPAIR"
+    assert repair_attempt.retry_count == 0
+    assert repair_attempt.repair_recovery_count == 0
+    assert store.execution_review_for_attempt(initial_attempt.attempt_id).verdict == (
+        "NEEDS_FIXES"
+    )
+    assert store.execution_review_for_attempt(repair_attempt.attempt_id).verdict == (
+        "ACCEPT"
+    )
+
+
 def test_execution_review_requirement_coverage_is_durable(tmp_path):
     store, engine, repo, root, thread_id, execute_kwargs = execution_ready_fixture(
         tmp_path, plan_text="Requirements:\n1. edit README\n2. run tests"
