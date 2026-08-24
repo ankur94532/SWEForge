@@ -705,7 +705,17 @@ INSPECTOR_SYSTEM_PROMPT = (
     "not prove a behavioral requirement; inspect the assertion and observable "
     "evidence. Classification is supplied by the deterministic contract; do not "
     "reproduce or alter it. "
-    "Return narrow code facts, not broad semantic conclusions."
+    "Return narrow code facts, not broad semantic conclusions. For every VERIFIED "
+    "STRUCTURAL requirement, cite appropriate trusted diff or inspected-file "
+    "authority. For every VERIFIED BEHAVIORAL requirement, emit a CODE observation "
+    "for that exact requirement with a concrete relevant path; if the path is "
+    "unchanged, use read_repo_file first and cite the matching inspected-file/read "
+    "ledger authority. When test semantics matter, emit a TEST observation with "
+    "the actual assertion_or_signal. Execution success may supplement behavioral "
+    "proof but never replaces CODE grounding. For every VERIFIED VALIDATION "
+    "requirement, cite the exact authoritative EXECUTION evidence; CODE is not "
+    "inherently required. Never mark VERIFIED when these proof obligations are "
+    "missing, and executor prose is never evidence."
 )
 
 
@@ -2434,6 +2444,109 @@ def _reference_problems(
     return problems
 
 
+def _inspection_authority_problems(
+    inspection: RequirementInspection,
+    *,
+    requirement: dict[str, str],
+    observations: dict[str, InspectionObservation],
+    ledger_by_id: dict[str, dict],
+    changed_files: set[str],
+    has_execution: bool,
+    execution_ids: set[str] | None = None,
+    refs: list[EvidenceRef] | None = None,
+) -> list[str]:
+    """Validate the proof shape required before finalization can use VERIFIED."""
+    if inspection.status is not InspectionStatus.VERIFIED:
+        return []
+    requirement_id = inspection.requirement_id
+    refs = inspection.evidence_refs if refs is None else refs
+    problems = _reference_problems(
+        refs,
+        requirement_id=requirement_id,
+        observations=observations,
+        ledger_by_id=ledger_by_id,
+        changed_files=changed_files,
+        has_execution=has_execution,
+        execution_ids=execution_ids,
+    )
+    requirement_observations = [
+        observation
+        for observation in observations.values()
+        if observation.requirement_id == requirement_id
+    ]
+    classification = requirement["classification"]
+    for observation in requirement_observations:
+        if observation.kind in {"CODE", "TEST"}:
+            grounded = observation.path in changed_files or any(
+                ref.kind is EvidenceKind.INSPECTED_FILE
+                and ref.source_id in ledger_by_id
+                and ref.path == observation.path
+                for ref in refs
+            )
+            if not grounded:
+                problems.append(
+                    f"ungrounded {observation.kind.lower()} observation "
+                    f"for {requirement_id}"
+                )
+    if classification == ReviewRequirementClassification.BEHAVIORAL.value:
+        if not any(item.kind == "CODE" for item in requirement_observations):
+            problems.append(f"missing direct code observation for {requirement_id}")
+        for observation in requirement_observations:
+            if observation.kind == "TEST" and not observation.assertion_or_signal:
+                problems.append(f"missing assertion or signal for {requirement_id}")
+    elif classification == ReviewRequirementClassification.VALIDATION.value:
+        if not any(ref.kind is EvidenceKind.EXECUTION for ref in refs):
+            problems.append(f"missing direct execution evidence for {requirement_id}")
+    elif classification == ReviewRequirementClassification.STRUCTURAL.value:
+        if not refs:
+            problems.append(f"missing structural evidence for {requirement_id}")
+    return problems
+
+
+def _inspection_artifact_problems(
+    contract: list[dict[str, str]],
+    inspection: InspectionReport,
+    *,
+    ledger: list[dict],
+    evidence: dict,
+) -> list[str]:
+    """Reject VERIFIED inspection output that cannot satisfy the authority guard."""
+    expected = {item["requirement_id"]: item for item in contract}
+    observations = {item.observation_id: item for item in inspection.observations}
+    ledger_by_id = {item["read_id"]: item for item in ledger if item.get("read_id")}
+    changed_files = set(evidence.get("changed_files", []))
+    execution_ids = {
+        str(item.get("evidence_id"))
+        for item in evidence.get("execution_observations", [])
+        if item.get("evidence_id")
+    }
+    if not execution_ids:
+        execution_ids = None
+    problems: list[str] = []
+    for observation in inspection.observations:
+        if observation.requirement_id not in expected:
+            problems.append(
+                f"unknown observation requirement: {observation.requirement_id}"
+            )
+    for current in inspection.inspections:
+        requirement = expected.get(current.requirement_id)
+        if requirement is None:
+            problems.append(f"unknown inspection requirement: {current.requirement_id}")
+            continue
+        problems.extend(
+            _inspection_authority_problems(
+                current,
+                requirement=requirement,
+                observations=observations,
+                ledger_by_id=ledger_by_id,
+                changed_files=changed_files,
+                has_execution=bool(evidence.get("execution")),
+                execution_ids=execution_ids,
+            )
+        )
+    return problems
+
+
 def _artifact_problems(
     result: ExecutionReviewResult,
     contract: list[dict[str, str]],
@@ -2531,38 +2644,21 @@ def _artifact_problems(
         if not current.evidence_refs and not check.evidence_refs:
             problems.append(f"missing evidence for {check.requirement_id}")
         refs = [*current.evidence_refs, *check.evidence_refs]
-        requirement_observations = [
-            observation
-            for observation in observations.values()
-            if observation.requirement_id == check.requirement_id
-        ]
-        for observation in requirement_observations:
-            if observation.kind in {"CODE", "TEST"}:
-                grounded = observation.path in changed_files or any(
-                    ref.kind is EvidenceKind.INSPECTED_FILE
-                    and ref.source_id in ledger_by_id
-                    and ref.path == observation.path
-                    for ref in refs
-                )
-                if not grounded:
-                    problems.append(
-                        f"ungrounded {observation.kind.lower()} observation "
-                        f"for {check.requirement_id}"
-                    )
+        authority_problems = _inspection_authority_problems(
+            current,
+            requirement=requirement,
+            observations=observations,
+            ledger_by_id=ledger_by_id,
+            changed_files=changed_files,
+            has_execution=bool((evidence or {}).get("execution")),
+            execution_ids=execution_ids,
+            refs=refs,
+        )
+        problems.extend(authority_problems)
         if (
             requirement["classification"]
             == ReviewRequirementClassification.BEHAVIORAL.value
         ):
-            behavioral_observations = requirement_observations
-            if not any(item.kind == "CODE" for item in behavioral_observations):
-                problems.append(
-                    f"missing direct code observation for {check.requirement_id}"
-                )
-            for observation in behavioral_observations:
-                if observation.kind == "TEST" and not observation.assertion_or_signal:
-                    problems.append(
-                        f"missing assertion or signal for {check.requirement_id}"
-                    )
             if semantic_review is None:
                 challenger = challenges.get(check.requirement_id)
                 if challenger is None:
@@ -2583,14 +2679,6 @@ def _artifact_problems(
                             execution_ids=execution_ids,
                         )
                     )
-        elif requirement[
-            "classification"
-        ] == ReviewRequirementClassification.VALIDATION.value and not any(
-            ref.kind is EvidenceKind.EXECUTION for ref in refs
-        ):
-            problems.append(
-                f"missing direct execution evidence for {check.requirement_id}"
-            )
     problems.extend(semantic_problems)
     return problems
 
@@ -2612,6 +2700,26 @@ def _bounded_inspection_prompt(evidence: dict) -> str:
         "Stop when sufficient evidence exists.\n\n"
         "[Current review contract]\n" + contract + "\n\n"
         "[changed_files]\n" + changed_files + "\n\n" + render_review_evidence(evidence)
+    )
+
+
+def _inspection_correction_prompt(evidence: dict, problems: list[str]) -> str:
+    return (
+        _bounded_inspection_prompt(evidence)
+        + "\n\n[Deterministic inspection-artifact correction]\n"
+        + json.dumps(
+            {
+                "problems": problems,
+                "instruction": (
+                    "Correct only the inspection artifact. Do not mark a requirement "
+                    "VERIFIED unless its classification-specific proof obligations "
+                    "are satisfied. For behavioral requirements, read unchanged "
+                    "files with read_repo_file before emitting grounded CODE facts; "
+                    "for validation requirements cite authoritative EXECUTION refs."
+                ),
+            },
+            sort_keys=True,
+        )
     )
 
 
@@ -2918,22 +3026,39 @@ def review_execution(
         else []
     )
     inspection_truncated = False
-    try:
-        inspection_agent = build_reviewer(inspection_context, model=model)
-        inspection_input = {
-            "messages": [
-                {"role": "user", "content": _bounded_inspection_prompt(evidence)}
-            ]
-        }
-        if inspection_context.repo_context is None:
-            inspection = inspection_agent.invoke(inspection_input)
-        else:
-            inspection = inspection_agent.invoke(
-                inspection_input, context=inspection_context.repo_context
+    inspection_prompt = _bounded_inspection_prompt(evidence)
+    for inspection_attempt in range(2):
+        try:
+            inspection_agent = build_reviewer(inspection_context, model=model)
+            inspection_input = {
+                "messages": [{"role": "user", "content": inspection_prompt}]
+            }
+            if inspection_context.repo_context is None:
+                inspection = inspection_agent.invoke(inspection_input)
+            else:
+                inspection = inspection_agent.invoke(
+                    inspection_input, context=inspection_context.repo_context
+                )
+            inspection_report = _structured(inspection, InspectionReport)
+        except (ModelCallLimitExceededError, ToolCallLimitExceededError):
+            inspection_truncated = True
+            break
+        resolved = _resolved_evidence(evidence, inspection_report, ledger)
+        inspection_report = _fail_closed_unavailable_inspections(
+            inspection_report, set(resolved.unavailable_requirement_ids)
+        )
+        artifact_problems = _inspection_artifact_problems(
+            contract, inspection_report, ledger=ledger, evidence=evidence
+        )
+        if not artifact_problems:
+            break
+        if inspection_attempt == 1:
+            raise ReviewFinalizationError(
+                "inspector returned an invalid inspection artifact after correction"
             )
-        inspection_report = _structured(inspection, InspectionReport)
-    except (ModelCallLimitExceededError, ToolCallLimitExceededError):
-        inspection_truncated = True
+        inspection_prompt = _inspection_correction_prompt(evidence, artifact_problems)
+    else:
+        raise ReviewFinalizationError("inspector inspection attempts exhausted")
     resolved = _resolved_evidence(evidence, inspection_report, ledger)
     inspection_report = _fail_closed_unavailable_inspections(
         inspection_report, set(resolved.unavailable_requirement_ids)

@@ -60,6 +60,7 @@ from sweforge.reviewer import (
     _finalizer_prompt,
     _guard_accept_coverage,
     _guard_repairability,
+    _inspection_artifact_problems,
     _invoke_specialist,
     _lexical_tokens,
     _resolve_reviewer_file,
@@ -2411,6 +2412,118 @@ def test_review_execution_partial_accept_fails_closed(monkeypatch):
     assert result.repair_instructions == []
 
 
+def test_inspector_artifact_correction_runs_once_before_finalizer(monkeypatch):
+    evidence = _review_evidence()
+    evidence["diff"] = (
+        "diff --git a/src/main.py b/src/main.py\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+    )
+    expected_ids = [
+        item["requirement_id"] for item in review_requirement_contract(evidence)
+    ]
+    malformed = InspectionReport(
+        inspections=[
+            RequirementInspection(requirement_id=requirement_id, status="VERIFIED")
+            for requirement_id in expected_ids
+        ]
+    )
+    corrected = InspectionReport(
+        inspections=[
+            RequirementInspection(
+                requirement_id=requirement_id,
+                status="VERIFIED",
+                evidence_refs=[
+                    EvidenceRef(
+                        ref_id=f"diff-{requirement_id}",
+                        requirement_id=requirement_id,
+                        kind=EvidenceKind.TRUSTED_DIFF,
+                        path="src/main.py",
+                    )
+                ],
+            )
+            for requirement_id in expected_ids
+        ],
+        observations=[
+            InspectionObservation(
+                observation_id=f"code-{requirement_id}",
+                requirement_id=requirement_id,
+                kind="CODE",
+                path="src/main.py",
+                fact="the changed implementation satisfies the requirement",
+            )
+            for requirement_id in expected_ids
+        ],
+    )
+    agents = [
+        _FakeAgent({"structured_response": malformed}),
+        _FakeAgent({"structured_response": corrected}),
+    ]
+    created_agents = []
+    finalizer = _FakeAgent(
+        {
+            "structured_response": ExecutionReviewResult(
+                verdict="ACCEPT",
+                summary="accepted",
+                requirement_checks=_complete_review_checks(evidence),
+            )
+        }
+    )
+    monkeypatch.setattr(
+        "sweforge.reviewer.build_reviewer",
+        lambda *args, **kwargs: (
+            created_agents.append(agents.pop(0)) or created_agents[-1]
+        ),
+    )
+    monkeypatch.setattr(
+        "sweforge.reviewer._split_semantic_review",
+        lambda **kwargs: SemanticReviewArtifact(
+            implementation=SpecialistStageReport(
+                stage="IMPLEMENTATION", status="SKIPPED", applicable=False
+            ),
+            test_validation=SpecialistStageReport(
+                stage="TEST_VALIDATION", status="SKIPPED", applicable=False
+            ),
+        ),
+    )
+    monkeypatch.setattr("sweforge.reviewer._build_finalizer", lambda *a, **k: finalizer)
+    result = review_execution(
+        context=ReviewerContext(worktree="/tmp/worktree"),
+        model="reviewer",
+        evidence=evidence,
+    )
+    assert result.verdict == "ACCEPT", (
+        result.findings[0].evidence if result.findings else result.summary
+    )
+    assert len(finalizer.calls) == 1
+    assert len(agents) == 0
+    assert len(created_agents) == 2
+    assert (
+        "inspection-artifact correction"
+        in created_agents[1].calls[0]["messages"][0]["content"]
+    )
+
+
+def test_inspector_artifact_correction_exhaustion_is_operational(monkeypatch):
+    evidence = _review_evidence()
+    malformed = _inspection_report("plan:step:1")
+    agents = [
+        _FakeAgent({"structured_response": malformed}),
+        _FakeAgent({"structured_response": malformed}),
+    ]
+    finalizer = _FakeAgent()
+    monkeypatch.setattr(
+        "sweforge.reviewer.build_reviewer",
+        lambda *args, **kwargs: agents.pop(0),
+    )
+    monkeypatch.setattr("sweforge.reviewer._build_finalizer", lambda *a, **k: finalizer)
+    with pytest.raises(ReviewFinalizationError, match="invalid inspection artifact"):
+        review_execution(
+            context=ReviewerContext(worktree="/tmp/worktree"),
+            model="reviewer",
+            evidence=evidence,
+        )
+    assert finalizer.calls == []
+
+
 def test_needs_fixes_with_incomplete_coverage_remains_needs_fixes(monkeypatch):
     evidence = _review_evidence()
     inspector = _FakeAgent({"messages": []})
@@ -2439,6 +2552,14 @@ def test_reviewer_prompts_require_full_contract_semantics():
         assert "previous" in prompt.lower()
         assert "test name" in prompt.lower() or "test names" in prompt.lower()
         assert "interleavings" in prompt or "behavioral" in prompt
+
+    assert "STRUCTURAL" in INSPECTOR_SYSTEM_PROMPT
+    assert "BEHAVIORAL" in INSPECTOR_SYSTEM_PROMPT
+    assert "VALIDATION" in INSPECTOR_SYSTEM_PROMPT
+    assert "read_repo_file" in INSPECTOR_SYSTEM_PROMPT
+    assert "assertion_or_signal" in INSPECTOR_SYSTEM_PROMPT
+    assert "never replaces CODE grounding" in INSPECTOR_SYSTEM_PROMPT
+    assert "Never mark VERIFIED" in INSPECTOR_SYSTEM_PROMPT
 
 
 def test_finalizer_prompt_declares_uncommitted_worktree_authority():
@@ -2578,6 +2699,213 @@ class _FakeAgent:
         return self.result
 
 
+def _inspection_contract(classification, requirement_id="plan:step:1"):
+    return [
+        {
+            "requirement_id": requirement_id,
+            "text": "requirement",
+            "classification": classification,
+        }
+    ]
+
+
+def _inspection_report(
+    requirement_id, *, status="VERIFIED", refs=None, observations=None
+):
+    return InspectionReport(
+        inspections=[
+            RequirementInspection(
+                requirement_id=requirement_id,
+                status=status,
+                evidence_refs=refs or [],
+            )
+        ],
+        observations=observations or [],
+    )
+
+
+def test_inspection_artifact_accepts_grounded_behavioral_changed_file():
+    requirement_id = "plan:step:1"
+    report = _inspection_report(
+        requirement_id,
+        observations=[
+            InspectionObservation(
+                observation_id="code-1",
+                requirement_id=requirement_id,
+                kind="CODE",
+                path="src/test.py",
+                fact="threshold assertion is present",
+            ),
+            InspectionObservation(
+                observation_id="test-1",
+                requirement_id=requirement_id,
+                kind="TEST",
+                path="src/test.py",
+                assertion_or_signal="asserts 9,999, 10,000, and 10,001",
+            ),
+        ],
+    )
+    assert (
+        _inspection_artifact_problems(
+            _inspection_contract(ReviewRequirementClassification.BEHAVIORAL.value),
+            report,
+            ledger=[],
+            evidence={"changed_files": ["src/test.py"]},
+        )
+        == []
+    )
+
+
+def test_inspection_artifact_accepts_grounded_behavioral_unchanged_file_read():
+    requirement_id = "plan:step:1"
+    read_ref = EvidenceRef(
+        ref_id="read-ref",
+        requirement_id=requirement_id,
+        kind=EvidenceKind.INSPECTED_FILE,
+        source_id="read-1",
+        path="src/main.py",
+    )
+    report = _inspection_report(
+        requirement_id,
+        refs=[read_ref],
+        observations=[
+            InspectionObservation(
+                observation_id="code-1",
+                requirement_id=requirement_id,
+                kind="CODE",
+                path="src/main.py",
+                fact="threshold implementation is present",
+            )
+        ],
+    )
+    assert (
+        _inspection_artifact_problems(
+            _inspection_contract(ReviewRequirementClassification.BEHAVIORAL.value),
+            report,
+            ledger=[
+                {
+                    "read_id": "read-1",
+                    "normalized_path": "src/main.py",
+                    "returned_lines": [1, 10],
+                    "excerpt": "threshold implementation",
+                }
+            ],
+            evidence={"changed_files": []},
+        )
+        == []
+    )
+
+
+def test_inspection_artifact_rejects_ungrounded_unchanged_code():
+    requirement_id = "plan:step:1"
+    report = _inspection_report(
+        requirement_id,
+        observations=[
+            InspectionObservation(
+                observation_id="code-1",
+                requirement_id=requirement_id,
+                kind="CODE",
+                path="src/main.py",
+            )
+        ],
+    )
+    problems = _inspection_artifact_problems(
+        _inspection_contract(ReviewRequirementClassification.BEHAVIORAL.value),
+        report,
+        ledger=[],
+        evidence={"changed_files": []},
+    )
+    assert "ungrounded code observation for plan:step:1" in problems
+
+
+def test_inspection_artifact_requires_execution_for_validation():
+    requirement_id = "plan:validation:1"
+    ref = EvidenceRef(
+        ref_id="execution-ref",
+        requirement_id=requirement_id,
+        kind=EvidenceKind.EXECUTION,
+        source_id="exec-1",
+    )
+    contract = _inspection_contract(
+        ReviewRequirementClassification.VALIDATION.value, requirement_id
+    )
+    valid = _inspection_report(requirement_id, refs=[ref])
+    evidence = {
+        "execution": [{"evidence_id": "exec-1"}],
+        "execution_observations": [{"evidence_id": "exec-1"}],
+    }
+    assert (
+        _inspection_artifact_problems(contract, valid, ledger=[], evidence=evidence)
+        == []
+    )
+    invalid = _inspection_report(requirement_id)
+    assert "missing direct execution evidence for plan:validation:1" in (
+        _inspection_artifact_problems(contract, invalid, ledger=[], evidence={})
+    )
+
+
+def test_inspection_artifact_accepts_structural_diff_authority():
+    requirement_id = "plan:step:4"
+    ref = EvidenceRef(
+        ref_id="diff-ref",
+        requirement_id=requirement_id,
+        kind=EvidenceKind.TRUSTED_DIFF,
+        path="src/test.py",
+    )
+    assert (
+        _inspection_artifact_problems(
+            _inspection_contract(
+                ReviewRequirementClassification.STRUCTURAL.value, requirement_id
+            ),
+            _inspection_report(requirement_id, refs=[ref]),
+            ledger=[],
+            evidence={"changed_files": ["src/test.py"]},
+        )
+        == []
+    )
+
+
+def test_real_unverified_inspection_is_not_an_artifact_error():
+    requirement_id = "plan:step:1"
+    problems = _inspection_artifact_problems(
+        _inspection_contract(ReviewRequirementClassification.BEHAVIORAL.value),
+        _inspection_report(requirement_id, status="UNVERIFIED"),
+        ledger=[],
+        evidence={},
+    )
+    assert problems == []
+
+
+def test_inspection_artifact_rejects_test_without_assertion_signal():
+    requirement_id = "plan:step:1"
+    report = _inspection_report(
+        requirement_id,
+        observations=[
+            InspectionObservation(
+                observation_id="code-1",
+                requirement_id=requirement_id,
+                kind="CODE",
+                path="src/test.py",
+            ),
+            InspectionObservation(
+                observation_id="test-1",
+                requirement_id=requirement_id,
+                kind="TEST",
+                path="src/test.py",
+            ),
+        ],
+    )
+    assert (
+        "missing assertion or signal for plan:step:1"
+        in _inspection_artifact_problems(
+            _inspection_contract(ReviewRequirementClassification.BEHAVIORAL.value),
+            report,
+            ledger=[],
+            evidence={"changed_files": ["src/test.py"]},
+        )
+    )
+
+
 def _review_evidence():
     return {
         "plan": {"id": "plan-1", "version": 1, "text": "edit src/main.py"},
@@ -2690,14 +3018,25 @@ def test_review_execution_uses_split_semantic_artifact_not_broad_challenger(
                         status="VERIFIED",
                         evidence_refs=[
                             EvidenceRef(
-                                ref_id=f"execution-{requirement_id}",
+                                ref_id=f"diff-{requirement_id}",
                                 requirement_id=requirement_id,
-                                kind="EXECUTION",
+                                kind="TRUSTED_DIFF",
+                                path="src/main.py",
                             )
                         ],
                     )
                     for requirement_id in expected_ids
-                ]
+                ],
+                observations=[
+                    InspectionObservation(
+                        observation_id=f"code-{requirement_id}",
+                        requirement_id=requirement_id,
+                        kind="CODE",
+                        path="src/main.py",
+                        fact="relevant callback/test code",
+                    )
+                    for requirement_id in expected_ids
+                ],
             )
         }
     )
