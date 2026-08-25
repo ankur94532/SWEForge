@@ -193,7 +193,13 @@ def s8_timeout_probe(root_dir) -> Observation:
         assert call.result_class == "timeout_exception"
         attempt = world.store.latest_attempt(thread_id, 1)
         assert attempt.status == "FAILED", "a timeout must surface as a failure"
-    return world.observation()
+        observation = world.observation()
+        # The bound on a timeout is that it is spent once and not retried
+        # hot. Recorded from the ledger the run actually produced.
+        observation.record_bound(
+            "S8_TIMEOUT", actual=ledger.count("timeout_probe"), expected=1
+        )
+    return observation
 
 
 @scenario(
