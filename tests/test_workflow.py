@@ -141,14 +141,21 @@ def test_plan_feedback_approval_and_permit_bind_current_plan(tmp_path):
 
 
 class WorkflowGitHub:
-    def __init__(self, labels=None):
+    def __init__(self, labels=None, permissions=None, default_permission="write"):
         self.repo = RepositoryRef(123, "example/repo")
         self.labels = labels or []
         self.created = []
         self.review_numbers = []
+        # Approval requires repository write access; these tests are about
+        # other properties, so their commenters are writers by default.
+        self.permissions = permissions or {}
+        self.default_permission = default_permission
 
     def repository(self, full_name):
         return self.repo
+
+    def collaborator_permission(self, repo, login):
+        return self.permissions.get(login, self.default_permission)
 
     def issue(self, repo, number):
         return {"labels": [{"name": label} for label in self.labels]}

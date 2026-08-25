@@ -39,11 +39,19 @@ class FakeGitHub:
         *,
         default_repo_id: int = 1,
         clock=None,
+        permissions: dict[str, str] | None = None,
+        default_permission: str = "write",
     ) -> None:
         self.repositories = repositories or {}
         self.responses = responses or {}
         self.issue_payloads = issue_payloads or {}
         self.default_repo_id = default_repo_id
+        # Approval requires repository write access. Scenarios that are not
+        # about authorization get a writer by default; one testing refusal
+        # sets permissions={"login": "read"} explicitly.
+        self.permissions = permissions or {}
+        self.default_permission = default_permission
+        self.permission_calls: list[tuple[int, str]] = []
         # One time source per world. Without this the fake invents comment
         # timestamps on a different timeline than the engine clock, and
         # posted_at (which comes from the comment) lands ahead of everything.
@@ -74,6 +82,11 @@ class FakeGitHub:
         if self.repositories:
             return self.repositories[full_name]
         return RepositoryRef(self.default_repo_id, full_name, "main")
+
+    def collaborator_permission(self, repo: RepositoryRef, login: str) -> str:
+        self._record("collaborator_permission", repo.repo_id, login)
+        self.permission_calls.append((repo.repo_id, login))
+        return self.permissions.get(login, self.default_permission)
 
     def issue(self, repo: RepositoryRef, number: int) -> dict:
         self._record("issue", repo.repo_id, number)

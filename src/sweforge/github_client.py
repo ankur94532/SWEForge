@@ -33,6 +33,8 @@ class GitHubClient(Protocol):
 
     def issue(self, repo: RepositoryRef, number: int) -> dict: ...
 
+    def collaborator_permission(self, repo: RepositoryRef, login: str) -> str: ...
+
     def pull_requests(
         self, repo: RepositoryRef, *, head: str, base: str
     ) -> list[dict]: ...
@@ -95,6 +97,19 @@ class HttpxGitHubClient:
             f"/repos/{repo.full_name}/issues/{number}",
             token_scope=repo.full_name,
         ).json()
+
+    def collaborator_permission(self, repo: RepositoryRef, login: str) -> str:
+        """Return GitHub's permission level for a login on a repository.
+
+        One of "admin", "maintain", "write", "triage", "read", or "none".
+        Callers treat any failure as unauthorized rather than guessing.
+        """
+        payload = self._request(
+            "GET",
+            f"/repos/{repo.full_name}/collaborators/{login}/permission",
+            token_scope=repo.full_name,
+        ).json()
+        return str(payload.get("permission", "none"))
 
     def issues(self, repo: RepositoryRef, since: str, etag: str | None) -> PollResponse:
         return self._poll(repo, "issues", since, etag)

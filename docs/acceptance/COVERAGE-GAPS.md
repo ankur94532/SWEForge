@@ -194,8 +194,19 @@ repository-permission layer, and on a private repository only collaborators can
 comment. On a **public** repository, any GitHub user can comment on an issue,
 which would make plan approval open to anyone.
 
-**Not changed.** Whether this is a defect depends on the intended deployment
-model, which is a product decision rather than an evidence question. It is
-logged here with the exact call site so the choice is explicit. If approver
-policy is wanted, it belongs in `WorkflowEngine.approve` alongside the existing
+**RESOLVED 2026-08-25.** The deployment decision was made: approval requires
+repository **write access**. `WorkflowEngine._require_authorized_approver`
+now runs immediately before the permit is minted, alongside the existing
 conversation-target and plan-version checks.
+
+`APPROVER_PERMISSIONS` is `{admin, maintain, write}`. `triage` and `read` are
+deliberately excluded: both can comment, neither can change the repository,
+and approval is exactly what lets the agent write to it.
+
+The check fails closed. An indeterminate permission — an unreachable API, a
+client that cannot answer, a missing author or repository — is refused rather
+than assumed, and a refused approval mints no permit, so the thread stays in
+WAITING_FOR_PLAN_APPROVAL.
+
+`GitHubClient.collaborator_permission` was added for this, backed by
+`GET /repos/{owner}/{repo}/collaborators/{username}/permission`.

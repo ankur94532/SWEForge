@@ -161,6 +161,20 @@ def matches_current_conversation_target(event: dict, state) -> bool:
     return True
 
 
+class UnauthorizedApprover(PermissionError):
+    """The commenter lacks write access, so their approval authorizes nothing."""
+
+
+# GitHub permission levels that may authorize execution. "triage" and "read"
+# are deliberately absent: both can comment, neither can change the repository,
+# and approval is what lets the agent write to it.
+APPROVER_PERMISSIONS = frozenset({"admin", "maintain", "write"})
+
+
+def _authorized_to_approve(permission: str) -> bool:
+    return permission.strip().casefold() in APPROVER_PERMISSIONS
+
+
 def _is_approval_eligible(event: dict, plan: PlanRecord) -> bool:
     if not plan.posted_at:
         return False
@@ -589,6 +603,7 @@ class WorkflowEngine:
                 purpose=InputPurpose.EARLY_PLAN_APPROVAL,
             )
             raise ValueError("approval predates the visible plan")
+        self._require_authorized_approver(event, author_login=author_login)
         timestamp = self.clock()
         permit = ExecutionPermit(
             permit_id="permit-"
@@ -1276,6 +1291,47 @@ class WorkflowEngine:
             return ExecutionResult(status="BLOCKED", event=event)
         except ThreadLockUnavailable:
             return ExecutionResult(status="BUSY", event=event)
+
+    def _require_authorized_approver(
+        self, event: dict, *, author_login: str | None
+    ) -> None:
+        """Refuse an approval from someone who cannot write to the repository.
+
+        Every other approval precondition was already enforced -- exact text,
+        phase, conversation target, posted plan, ordering -- but the author was
+        recorded and never checked, so any commenter could authorize execution.
+        On a public repository that is every GitHub user.
+
+        Fails closed: an indeterminate permission is refused, never assumed.
+        """
+        # `event` is a sqlite3.Row, which has no .get(); membership goes
+        # through keys().
+        columns = set(event.keys())
+        recorded = event["author_login"] if "author_login" in columns else None
+        login = (author_login or recorded or "").strip()
+        if not login:
+            raise UnauthorizedApprover("approval carries no author to authorize")
+        if self.client is None:
+            # No GitHub to authorize against. Callers that construct an engine
+            # without a client are offline; there is no repository to protect.
+            return
+        repo_full_name = (
+            event["repo_full_name"] if "repo_full_name" in columns else ""
+        ) or ""
+        if not repo_full_name:
+            raise UnauthorizedApprover("approval carries no repository to check")
+        try:
+            repo = self.client.repository(repo_full_name)
+            permission = self.client.collaborator_permission(repo, login)
+        except Exception as exc:
+            raise UnauthorizedApprover(
+                f"could not determine repository permission for {login}"
+            ) from exc
+        if not _authorized_to_approve(permission):
+            raise UnauthorizedApprover(
+                f"{login} has {permission or 'no'} access; "
+                "approval requires write access"
+            )
 
     def _acknowledge_delivered(
         self,

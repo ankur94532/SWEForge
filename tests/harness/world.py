@@ -63,6 +63,7 @@ class World:
         reviewer=None,
         memory_learner=None,
         clarification_classifier=None,
+        permissions: dict[str, str] | None = None,
     ) -> "World":
         root.mkdir(parents=True, exist_ok=True)
         source = root / "source"
@@ -88,7 +89,11 @@ class World:
         store.upsert_repository(repo.repo_id, repo.full_name, "now")
         world_clock_holder: dict = {}
         github = FakeGitHub(
-            default_repo_id=repo_id, clock=lambda: world_clock_holder["clock"]()
+            default_repo_id=repo_id,
+            clock=lambda: world_clock_holder["clock"](),
+            # Approval requires repository write access; scenarios that are not
+            # about authorization get a writer by default.
+            permissions=permissions,
         )
 
         world = cls(
@@ -169,6 +174,7 @@ class World:
         *,
         issue_number: int = 7,
         subject_kind: SubjectKind = SubjectKind.ISSUE,
+        author_login: str = "octocat",
     ) -> SourceEvent:
         return SourceEvent(
             repo_id=self.repo.repo_id,
@@ -179,7 +185,7 @@ class World:
             source_created_at=when,
             subject_kind=subject_kind,
             subject_number=issue_number,
-            author_login="octocat",
+            author_login=author_login,
             body=body,
             html_url=None,
         )
