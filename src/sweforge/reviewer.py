@@ -517,6 +517,7 @@ class ReviewFinalizationError(RuntimeError):
         super().__init__(message)
 
 
+MAX_OPERATIONAL_MESSAGE_CHARS = 200
 REVIEW_INSPECTION_MODEL_CALL_LIMIT = 8
 REVIEW_INSPECTION_TOOL_CALL_LIMIT = 24
 REVIEW_FINALIZER_MODEL_CALL_LIMIT = 3
@@ -3270,6 +3271,30 @@ def _inspection_failure_diagnostic(
     }
 
 
+def _operational_failure_diagnostic(exc: BaseException) -> dict:
+    """Describe why finalization failed operationally.
+
+    The operational wrapper re-raises `from exc`, but callers serialize only
+    `.diagnostic`, so every operational failure previously reported an empty
+    `{}` and a batch could not tell a provider timeout from a tool-strategy
+    bug.  Walking the chain here keeps the cause attached to the error.
+    """
+    chain: list[dict[str, str]] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(chain) < 5:
+        seen.add(id(current))
+        chain.append(
+            {
+                "type": type(current).__name__,
+                # Bounded: provider messages are long and may echo request URLs.
+                "message": str(current)[:MAX_OPERATIONAL_MESSAGE_CHARS],
+            }
+        )
+        current = current.__cause__ or current.__context__
+    return {"stage": "finalizer", "guard_codes": [], "cause": chain}
+
+
 def _inspection_artifact_problems(
     contract: list[dict[str, str]],
     inspection: InspectionReport,
@@ -3992,7 +4017,8 @@ def review_execution(
         # operational.  Let the durable dispatcher backoff retry this same
         # successful execution; they are not semantic review decisions.
         raise ReviewFinalizationError(
-            "execution review finalization failed operationally"
+            "execution review finalization failed operationally",
+            diagnostic=_operational_failure_diagnostic(exc),
         ) from exc
 
     try:
@@ -4005,7 +4031,8 @@ def review_execution(
             raise ValueError("reviewer did not return a structured review")
     except Exception as exc:
         raise ReviewFinalizationError(
-            "execution review returned an invalid structured verdict"
+            "execution review returned an invalid structured verdict",
+            diagnostic=_operational_failure_diagnostic(exc),
         ) from exc
     raw_finalizer_artifact = parsed.model_dump(mode="json")
     parsed = _canonical_finalizer_provenance(parsed, evidence=evidence)

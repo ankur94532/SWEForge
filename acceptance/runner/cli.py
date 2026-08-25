@@ -22,8 +22,9 @@ from typing import Any
 from acceptance.runner.allowlist import check_live_target
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_STATUS_PATH = REPO_ROOT / "acceptance" / "reports" / "campaign-status.json"
-DEFAULT_RUNS_ROOT = REPO_ROOT / "acceptance" / "reports" / "runs"
+DEFAULT_CAMPAIGN_ROOT = REPO_ROOT / "acceptance" / "reports" / "campaign"
+DEFAULT_STATUS_PATH = DEFAULT_CAMPAIGN_ROOT / "campaign-status.json"
+DEFAULT_RUNS_ROOT = DEFAULT_CAMPAIGN_ROOT / "runs"
 MANIFEST_NAME = "run-manifest.json"
 MANIFEST_VERSION = 1
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -197,6 +198,93 @@ def execute_scenario(
     return result
 
 
+def _result_signature(result: Any) -> tuple[Any, ...]:
+    """Stable, complete comparison surface for repeated scenario results."""
+    return (
+        result.scenario_id,
+        str(result.layer),
+        result.ok,
+        result.error,
+        tuple((check.invariant_id, check.ok, check.detail) for check in result.checks),
+    )
+
+
+def execute_campaign(
+    scenario_ids: list[str],
+    *,
+    repetitions: int,
+    status_path: Path,
+    runs_root: Path,
+    campaign_id: str | None = None,
+) -> dict[str, Any]:
+    """Run scenarios sequentially and retain every repetition's evidence."""
+    if repetitions < 1:
+        raise ValueError("campaign repetitions must be at least 1")
+    requested = [item.strip().upper() for item in scenario_ids if item.strip()]
+    if not requested:
+        raise ValueError("campaign requires at least one scenario id")
+    if len(requested) != len(set(requested)):
+        raise ValueError("campaign scenario ids must be unique")
+
+    registry = discover_scenarios()
+    unknown = sorted(set(requested) - set(registry))
+    if unknown:
+        raise KeyError(f"unknown campaign scenarios: {', '.join(unknown)}")
+
+    identity = _validate_run_id(campaign_id or _new_run_id("campaign"))
+    campaign_runs_root = runs_root.expanduser().resolve() / identity
+    repeated_results: list[list[Any]] = []
+    for repetition in range(1, repetitions + 1):
+        current = []
+        for scenario_id in requested:
+            run_id = f"pass-{repetition}-{scenario_id.lower()}"
+            result = execute_scenario(
+                scenario_id,
+                registry[scenario_id].layer,
+                repo_full_name=None,
+                status_path=(campaign_runs_root / "per-run" / f"{run_id}-status.json"),
+                runs_root=campaign_runs_root / "scenario-runs",
+                run_id=run_id,
+            )
+            current.append(result)
+        repeated_results.append(current)
+
+    per_scenario = {}
+    for index, scenario_id in enumerate(requested):
+        signatures = [_result_signature(results[index]) for results in repeated_results]
+        per_scenario[scenario_id] = {
+            "identical": all(item == signatures[0] for item in signatures[1:]),
+            "runs": repetitions,
+        }
+    reproducible = all(item["identical"] for item in per_scenario.values())
+
+    harness = _harness()
+    final_results = repeated_results[-1]
+    status = harness.write_campaign_status(status_path, final_results)
+    status.update(
+        {
+            "schema_version": 2,
+            "campaign_id": identity,
+            "generated_at": _now(),
+            "requested_scenarios": requested,
+            "repetitions": [
+                {
+                    "index": repetition,
+                    "status": harness.campaign_status(results),
+                }
+                for repetition, results in enumerate(repeated_results, start=1)
+            ],
+            "reproducibility": {
+                "required_runs": repetitions,
+                "identical": reproducible,
+                "scenarios": per_scenario,
+            },
+        }
+    )
+    _atomic_json(status_path, status)
+    return status
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -282,6 +370,15 @@ def _parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--runs-root", type=Path, default=DEFAULT_RUNS_ROOT)
     run_parser.add_argument("--run-id")
 
+    campaign_parser = commands.add_parser(
+        "campaign", help="run scenarios sequentially with repeatability evidence"
+    )
+    campaign_parser.add_argument("scenario_ids", nargs="+")
+    campaign_parser.add_argument("--repetitions", type=int, default=2)
+    campaign_parser.add_argument("--status", type=Path, default=DEFAULT_STATUS_PATH)
+    campaign_parser.add_argument("--runs-root", type=Path, default=DEFAULT_RUNS_ROOT)
+    campaign_parser.add_argument("--campaign-id")
+
     reap_parser = commands.add_parser(
         "reap", help="clean explicitly owned paths left by crashed runs"
     )
@@ -302,6 +399,34 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(result.report())
         return 0 if result.ok else 1
+
+    if args.command == "campaign":
+        try:
+            status = execute_campaign(
+                args.scenario_ids,
+                repetitions=args.repetitions,
+                status_path=args.status,
+                runs_root=args.runs_root,
+                campaign_id=args.campaign_id,
+            )
+        except Exception as exc:
+            print(f"ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        for repetition in status["repetitions"]:
+            print(f"REPETITION {repetition['index']}")
+            for result in repetition["status"]["scenarios"]:
+                verdict = "PASS" if result["ok"] else "FAIL"
+                print(f"{result['id']}  {verdict}  [{result['layer']}]")
+                if result["error"]:
+                    print(f"  scenario body raised: {result['error']}")
+                for check in result["checks"]:
+                    check_verdict = "PASS" if check["ok"] else "FAIL"
+                    print(
+                        f"  {check['invariant']:<32} {check_verdict}  {check['detail']}"
+                    )
+        reproducible = status["reproducibility"]["identical"]
+        print(f"REPRODUCIBILITY  {'IDENTICAL' if reproducible else 'DIFFERENT'}")
+        return 0 if not status["failed"] and reproducible else 1
 
     reaped, errors = reap_runs(args.runs_root)
     for run_id in reaped:
