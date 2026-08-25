@@ -4,8 +4,7 @@ import json
 from dataclasses import dataclass
 
 import pytest
-from harness.github_fake import FakeGitHub
-from harness.observation import LedgerGitHubFacts, Observation
+from harness.observation import Observation
 from harness.scenario import (
     SCENARIOS,
     Layer,
@@ -150,11 +149,13 @@ def test_declaring_faults_without_a_ledger_is_unevaluable():
         run("X10")
 
 
-def test_scenario_body_receives_arguments():
-    scenario("X11", layer=Layer.L1, invariants=["INV-NO-PUBLICATION"])(
-        lambda facts: Observation(github=facts)
+def test_scenario_body_receives_arguments(tmp_path):
+    """INV-ONE-ROOT needs only events, so this stays a test of argument
+    passing rather than of any particular invariant's inputs."""
+    scenario("X11", layer=Layer.L1, invariants=["INV-ONE-ROOT"])(
+        lambda kind: Observation(events=[ev(kind)])
     )
-    assert run("X11", LedgerGitHubFacts(FakeGitHub())).ok
+    assert run("X11", "ROOT_INGESTED").ok
 
 
 def test_campaign_status_is_machine_checkable(tmp_path):

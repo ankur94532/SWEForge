@@ -275,12 +275,24 @@ def inv_no_publication(observation: Observation) -> InvariantResult:
     facts = observation.github
     if facts is None:
         raise RuntimeError("INV-NO-PUBLICATION needs GitHubFacts on the Observation")
-    prs = facts.pull_requests()
     published = facts.comments_matching("sweforge:publication:")
-    if prs or published:
+    # SWEForge's own publications, from the store rather than from a count of
+    # the repository's pull requests. A live repository legitimately contains
+    # pull requests SWEForge never opened -- S20 opens one deliberately as its
+    # test subject -- and counting those conflates a fixture with a
+    # publication.
+    store = observation.store
+    if store is None:
+        raise RuntimeError("INV-NO-PUBLICATION needs the store to attribute a PR")
+    rows = _rows(
+        store,
+        "SELECT publication_id, pr_number FROM logical_publications "
+        "WHERE pr_number IS NOT NULL",
+    )
+    if rows or published:
         return _fail(
-            f"{len(prs)} pull request(s) and {len(published)} publication "
-            "comment(s) exist"
+            f"{len(rows)} publication(s) with a pull request and "
+            f"{len(published)} publication comment(s) exist"
         )
     return _ok("nothing was published")
 

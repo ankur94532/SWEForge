@@ -215,30 +215,63 @@ def test_one_publication_needs_github_facts_rather_than_passing_blind():
         check("INV-ONE-PUBLICATION", obs(ev("PLAN_CREATED")))
 
 
-def test_no_publication_passes_when_nothing_was_created():
-    assert check("INV-NO-PUBLICATION", obs(github=LedgerGitHubFacts(FakeGitHub()))).ok
+def _pub_obs(seeded, github):
+    """Publication attribution reads the store, so it must be supplied."""
+    return Observation(
+        events=[ev("ROOT_INGESTED")], store=seeded["store"], github=github
+    )
 
 
-def test_no_publication_fails_when_a_pr_exists():
-    r = check("INV-NO-PUBLICATION", obs(github=_published()))
-    assert not r.ok and "pull request" in r.detail
+def test_no_publication_passes_when_nothing_was_created(seeded):
+    result = check(
+        "INV-NO-PUBLICATION", _pub_obs(seeded, LedgerGitHubFacts(FakeGitHub()))
+    )
+    assert result.ok
 
 
-def test_no_publication_ignores_a_posted_plan_comment():
+def test_no_publication_ignores_a_pull_request_sweforge_did_not_open(seeded):
+    """A live repository contains pull requests SWEForge never opened; S20
+    opens one deliberately. Only the store attributes a publication."""
+    result = check("INV-NO-PUBLICATION", _pub_obs(seeded, _published()))
+    assert result.ok, result.detail
+
+
+def test_no_publication_fails_when_the_store_records_one(seeded):
+    seeded["store"].connection.execute(
+        "INSERT INTO logical_publications "
+        "(publication_id,source_event_key,thread_id,cycle_id,root_input_id,repo_id,"
+        " repo_full_name,issue_number,status,branch_name,pr_number,"
+        " created_at,updated_at) "
+        "VALUES ('pub-1',?,?,?,?,1,'example/repo',7,'COMPLETED','b',42,'now','now')",
+        (
+            seeded["root_event_key"],
+            seeded["thread_id"],
+            seeded["cycle_id"],
+            seeded["root_event_key"],
+        ),
+    )
+    seeded["store"].connection.commit()
+    result = check(
+        "INV-NO-PUBLICATION", _pub_obs(seeded, LedgerGitHubFacts(FakeGitHub()))
+    )
+    assert not result.ok and "publication(s) with a pull request" in result.detail
+
+
+def test_no_publication_ignores_a_posted_plan_comment(seeded):
     """A plan comment is not a publication."""
     fake = FakeGitHub()
     fake.create_comment(
         fake.repository("example/repo"), 7, "<!-- sweforge:plan:p1 --> plan"
     )
-    assert check("INV-NO-PUBLICATION", obs(github=LedgerGitHubFacts(fake))).ok
+    assert check("INV-NO-PUBLICATION", _pub_obs(seeded, LedgerGitHubFacts(fake))).ok
 
 
-def test_no_publication_fails_on_a_publication_comment():
+def test_no_publication_fails_on_a_publication_comment(seeded):
     fake = FakeGitHub()
     fake.create_comment(
         fake.repository("example/repo"), 7, "<!-- sweforge:publication:p1 --> done"
     )
-    r = check("INV-NO-PUBLICATION", obs(github=LedgerGitHubFacts(fake)))
+    r = check("INV-NO-PUBLICATION", _pub_obs(seeded, LedgerGitHubFacts(fake)))
     assert not r.ok and "publication comment" in r.detail
 
 
