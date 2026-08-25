@@ -656,7 +656,22 @@ def _absence_scope_covers_target(
     scope: str, target: str, changed_files: set[str] | None = None
 ) -> bool:
     if "/" in target:
-        return target == scope or target.startswith(scope + "/")
+        if target == scope or target.startswith(scope + "/"):
+            return True
+        # Symmetric to the directory-subsumes-file case below: naming every
+        # file under a directory asserts exactly what naming the directory
+        # asserts, but a child scope can never prefix-match its parent. The
+        # tree cannot be enumerated here, so acceptance requires both that
+        # the model cited absence evidence inside the target and that the
+        # trusted diff shows nothing under the target changed -- the same
+        # evidence a directory scope would itself have rested on.
+        if not _absence_directory_scope(target) or changed_files is None:
+            return False
+        if not scope.startswith(target + "/"):
+            return False
+        return not any(
+            path == target or path.startswith(target + "/") for path in changed_files
+        )
     if PurePosixPath(scope).name == target:
         return True
     # A bare filename lifted from requirement prose carries no directory, so it
