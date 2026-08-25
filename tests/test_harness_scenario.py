@@ -55,7 +55,7 @@ def test_duplicate_scenario_id_is_rejected():
     scenario("X3", layer=Layer.L1, invariants=["INV-ONE-ROOT"])(
         lambda: Observation(events=[ev("ROOT_INGESTED")])
     )
-    with pytest.raises(ValueError, match="duplicate scenario id"):
+    with pytest.raises(ValueError, match="duplicate scenario"):
         scenario("X3", layer=Layer.L1, invariants=["INV-ONE-ROOT"])(
             lambda: Observation(events=[ev("ROOT_INGESTED")])
         )

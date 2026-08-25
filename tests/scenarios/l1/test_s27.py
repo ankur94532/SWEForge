@@ -115,13 +115,13 @@ def test_review_recovery_bound_is_positive():
 
 
 def test_scenario_passes(tmp_path):
-    result = run("S27", tmp_path / "s27")
+    result = run("S27", tmp_path / "s27", layer=Layer.L1)
     assert result.ok, "\n" + result.report()
 
 
 def test_the_scenario_records_the_bound_it_reached(tmp_path):
     """E4 evidence must come from the run, not from the constant."""
-    result = run("S27", tmp_path / "s27-bound")
+    result = run("S27", tmp_path / "s27-bound", layer=Layer.L1)
     evidence = result.bounded_paths["S26_BACKOFF"]
     assert evidence == {
         "observed": True,

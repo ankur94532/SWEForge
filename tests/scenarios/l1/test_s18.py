@@ -82,13 +82,13 @@ def s18_unsolicited_followup(root_dir) -> Observation:
 
 
 def test_s18_passes(tmp_path):
-    result = run("S18", tmp_path / "s18")
+    result = run("S18", tmp_path / "s18", layer=Layer.L1)
     assert result.ok, "\n" + result.report()
 
 
 def test_s18_actually_emitted_a_deferral(tmp_path):
     """Guards against INV-NO-INJECTION passing because nothing was recorded."""
-    result = run("S18", tmp_path / "s18-evidence")
+    result = run("S18", tmp_path / "s18-evidence", layer=Layer.L1)
     assert result.ok, "\n" + result.report()
     detail = next(
         c.detail for c in result.checks if c.invariant_id == "INV-DEFERRED-PRESERVED"

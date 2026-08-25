@@ -181,5 +181,5 @@ def test_review_retry_budget_is_bounded():
 
 @pytest.mark.parametrize("scenario_id", ["S24", "S25", "S26"])
 def test_scenario_passes(scenario_id, tmp_path):
-    result = run(scenario_id, tmp_path / scenario_id.lower())
+    result = run(scenario_id, tmp_path / scenario_id.lower(), layer=Layer.L1)
     assert result.ok, "\n" + result.report()

@@ -47,6 +47,10 @@ class World:
     thread_ids: set[str] = field(default_factory=set)
     probe_ledger_path: Path | None = None
     outside_markers: tuple[tuple[str, str], ...] = ()
+    # A live body sets this to RestGitHubFacts once its issue exists; the
+    # issue number is not known until then. Left unset, observation() reads
+    # the fake's recorded calls as every L1 scenario does.
+    github_facts: Any = None
     _clock_tick: int = 0
 
     # -- construction -------------------------------------------------------
@@ -281,7 +285,7 @@ class World:
             thread_ids=frozenset(self.thread_ids),
             repo_ids=frozenset({self.repo.repo_id}),
             git=GitFacts(repo=self.source, origin=self.origin),
-            github=LedgerGitHubFacts(self.github),
+            github=self.github_facts or LedgerGitHubFacts(self.github),
             outside_markers=self.outside_markers,
             probes=(
                 ProbeLedger(self.probe_ledger_path)

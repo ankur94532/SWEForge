@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 from harness.models import ScriptedPlanner, ScriptedReviewer
 from harness.observation import Observation
-from harness.scenario import Layer, run, scenario
+from harness.scenario import Layer, layers_for, run, scenario
 from harness.world import World
 
 from sweforge.execution import ThreadLockUnavailable, thread_lock
@@ -204,5 +204,8 @@ def s14_singleton_server(root_dir) -> Observation:
 
 @pytest.mark.parametrize("scenario_id", ["S10", "S11", "S12", "S13", "S14"])
 def test_scenario_passes(scenario_id, tmp_path):
-    result = run(scenario_id, tmp_path / scenario_id.lower())
+    # S14 is the singleton-server scenario and is registered for L1_PROCESS;
+    # resolve each id at the layer it was actually registered for.
+    (layer,) = layers_for(scenario_id)
+    result = run(scenario_id, tmp_path / scenario_id.lower(), layer=layer)
     assert result.ok, "\n" + result.report()

@@ -135,5 +135,5 @@ def s19_no_change_execution(root_dir) -> Observation:
 
 @pytest.mark.parametrize("scenario_id", ["S1", "S19"])
 def test_scenario_passes(scenario_id, tmp_path):
-    result = run(scenario_id, tmp_path / scenario_id.lower())
+    result = run(scenario_id, tmp_path / scenario_id.lower(), layer=Layer.L1)
     assert result.ok, "\n" + result.report()

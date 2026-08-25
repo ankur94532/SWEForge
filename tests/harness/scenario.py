@@ -74,7 +74,11 @@ class Scenario:
     description: str = ""
 
 
-SCENARIOS: dict[str, Scenario] = {}
+# Keyed by (scenario id, layer): the campaign gives every scenario a
+# deterministic run AND an integration run, so S1 exists at both L1 and
+# LIVE_GITHUB. Keying on the id alone made the second registration a hard
+# error and the pair indistinguishable.
+SCENARIOS: dict[tuple[str, "Layer"], Scenario] = {}
 
 
 def scenario(
@@ -88,8 +92,8 @@ def scenario(
     """Register one scenario. Unknown invariant ids are rejected at import."""
 
     def wrap(body: Callable[..., Observation]) -> Scenario:
-        if scenario_id in SCENARIOS:
-            raise ValueError(f"duplicate scenario id: {scenario_id}")
+        if (scenario_id, layer) in SCENARIOS:
+            raise ValueError(f"duplicate scenario: {scenario_id} at {layer}")
         unknown = [item for item in invariants if item not in REGISTRY]
         if unknown:
             raise ValueError(f"{scenario_id} declares unknown invariants: {unknown}")
@@ -108,7 +112,7 @@ def scenario(
             if body.__doc__
             else "",
         )
-        SCENARIOS[scenario_id] = item
+        SCENARIOS[(scenario_id, layer)] = item
         return item
 
     return wrap
@@ -131,11 +135,35 @@ def _drained(declared: Sequence[str], observation: Observation) -> InvariantResu
     return InvariantResult(True, f"{len(declared)} declared fault(s) all fired")
 
 
-def run(scenario_id: str, *args, **kwargs) -> ScenarioResult:
-    """Execute one scenario body and evaluate every invariant it declared."""
-    item = SCENARIOS.get(scenario_id)
-    if item is None:
+def layers_for(scenario_id: str) -> list["Layer"]:
+    """Every layer this scenario id is registered for."""
+    return [key[1] for key in SCENARIOS if key[0] == scenario_id]
+
+
+def resolve(scenario_id: str, layer=None) -> Scenario:
+    """Find one scenario body, refusing an ambiguous id rather than guessing."""
+    if layer is not None:
+        item = SCENARIOS.get((scenario_id, layer))
+        if item is None:
+            known = layers_for(scenario_id)
+            raise KeyError(
+                f"{scenario_id} is not registered for {layer}"
+                + (f"; it exists at {known}" if known else "")
+            )
+        return item
+    known = layers_for(scenario_id)
+    if not known:
         raise KeyError(f"unknown scenario: {scenario_id}")
+    if len(known) > 1:
+        raise ValueError(
+            f"{scenario_id} is registered for {known}; pass layer= to choose"
+        )
+    return SCENARIOS[(scenario_id, known[0])]
+
+
+def run(scenario_id: str, *args, layer=None, **kwargs) -> ScenarioResult:
+    """Execute one scenario body and evaluate every invariant it declared."""
+    item = resolve(scenario_id, layer)
     try:
         observation = item.body(*args, **kwargs)
     except Exception as exc:  # the body failing is the scenario failing

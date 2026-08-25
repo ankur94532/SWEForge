@@ -26,17 +26,23 @@ def test_cli_discovers_and_runs_a_registered_scenario(tmp_path):
 
 
 def test_layer_mismatch_fails_instead_of_misreporting_l1_as_live(tmp_path):
+    """S5 has a deterministic body and no live one.
+
+    S1 was used here until it gained a LIVE_GITHUB body of its own; asking for
+    a layer that does exist would then test the allowlist, not resolution.
+    """
     status = tmp_path / "campaign-status.json"
     result = cli.execute_scenario(
-        "S1",
+        "S5",
         Layer.LIVE_GITHUB,
         repo_full_name="example/acceptance",
         status_path=status,
         runs_root=tmp_path / "runs",
     )
     assert not result.ok
-    assert "registered for L1" in result.error
-    assert json.loads(status.read_text())["failed"] == ["S1"]
+    assert "not registered for" in result.error
+    assert "L1" in result.error, "the error must say where the body does exist"
+    assert json.loads(status.read_text())["failed"] == ["S5"]
     assert not (tmp_path / "runs").exists()
 
 
@@ -44,7 +50,11 @@ def test_live_preflight_occurs_before_body_or_run_state(monkeypatch, tmp_path):
     class Registered:
         layer = Layer.LIVE_GITHUB
 
-    monkeypatch.setattr(cli, "discover_scenarios", lambda: {"X1": Registered()})
+    monkeypatch.setattr(
+        cli,
+        "discover_scenarios",
+        lambda: {("X1", Layer.LIVE_GITHUB): Registered()},
+    )
 
     def refused(repo):
         assert repo == "example/primary"

@@ -100,5 +100,5 @@ def test_deny_rules_are_write_scoped_not_read_scoped():
 
 
 def test_scenario_passes(tmp_path):
-    result = run("S22", tmp_path / "s22")
+    result = run("S22", tmp_path / "s22", layer=Layer.L1)
     assert result.ok, "\n" + result.report()

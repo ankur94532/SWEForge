@@ -95,12 +95,12 @@ def s20_unmapped_pr_mention(root_dir) -> Observation:
 
 @pytest.mark.parametrize("scenario_id", ["S15", "S20"])
 def test_scenario_passes(scenario_id, tmp_path):
-    result = run(scenario_id, tmp_path / scenario_id.lower())
+    result = run(scenario_id, tmp_path / scenario_id.lower(), layer=Layer.L1)
     assert result.ok, "\n" + result.report()
 
 
 def test_s15_reports_every_declared_invariant(tmp_path):
-    result = run("S15", tmp_path / "s15-report")
+    result = run("S15", tmp_path / "s15-report", layer=Layer.L1)
     reported = {check.invariant_id for check in result.checks}
     assert "INV-PERMIT-BOUND" in reported
     assert "FAULTS-DRAINED" in reported

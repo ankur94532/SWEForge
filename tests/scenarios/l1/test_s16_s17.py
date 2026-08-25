@@ -202,5 +202,5 @@ def test_recovery_bound_exists():
 
 @pytest.mark.parametrize("scenario_id", ["S16", "S17"])
 def test_scenario_passes(scenario_id, tmp_path):
-    result = run(scenario_id, tmp_path / scenario_id.lower())
+    result = run(scenario_id, tmp_path / scenario_id.lower(), layer=Layer.L1)
     assert result.ok, "\n" + result.report()

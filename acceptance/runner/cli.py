@@ -48,15 +48,19 @@ def _harness():
 
 def discover_scenarios() -> dict[str, Any]:
     """Import every L1 scenario module and return the populated registry."""
-    scenario_root = REPO_ROOT / "tests" / "scenarios" / "l1"
+    scenario_root = REPO_ROOT / "tests" / "scenarios"
     modules = sorted(
-        path for path in scenario_root.glob("*.py") if path.name != "__init__.py"
+        # Every layer package under tests/scenarios, not just l1: a live body
+        # is invisible to the runner if discovery only walks one directory.
+        path
+        for path in scenario_root.glob("*/*.py")
+        if path.name != "__init__.py"
     )
     if not modules:
         raise RuntimeError(f"no scenario modules found under {scenario_root}")
     _harness()
     for path in modules:
-        importlib.import_module(f"scenarios.l1.{path.stem}")
+        importlib.import_module(f"scenarios.{path.parent.name}.{path.stem}")
     registry = _harness().SCENARIOS
     if not registry:
         raise RuntimeError(
@@ -169,14 +173,17 @@ def execute_scenario(
     manifest: dict[str, Any] | None = None
     result = None
     try:
+        # Resolution is by (id, layer): a scenario has one body per layer, and
+        # asking for a layer with no body must say so rather than run another.
+        # Resolved from the registry discover_scenarios returns, so the lookup
+        # stays injectable for the preflight-ordering guard.
         registry = discover_scenarios()
-        registered = registry.get(scenario_id)
+        registered = registry.get((scenario_id, layer))
         if registered is None:
-            raise KeyError(f"unknown scenario: {scenario_id}")
-        if registered.layer is not layer:
-            raise ValueError(
-                f"{scenario_id} is registered for {registered.layer}, not {layer}; "
-                "a layer-specific body must exist before that layer can be run"
+            known = sorted(str(key[1]) for key in registry if key[0] == scenario_id)
+            raise KeyError(
+                f"{scenario_id} is not registered for {layer}"
+                + (f"; it exists at {known}" if known else "")
             )
 
         # The body is the first operation that can perform a live mutation.
@@ -191,7 +198,7 @@ def execute_scenario(
             layer,
         )
         workspace = Path(manifest["owned_paths"][0])
-        result = _harness().run(scenario_id, workspace)
+        result = _harness().run(scenario_id, workspace, layer=layer)
     except Exception as exc:
         result = _failure(scenario_id, layer, exc)
     finally:
@@ -227,6 +234,25 @@ def _result_signature(result: Any) -> tuple[Any, ...]:
     )
 
 
+def _deterministic_layer(registry, scenario_id: str, live_layer):
+    """The offline layer a campaign should run this scenario at.
+
+    A campaign measures deterministic reproducibility, so a scenario that also
+    has a LIVE_GITHUB body must still be run at its deterministic layer.
+    """
+    candidates = [
+        key[1] for key in registry if key[0] == scenario_id and key[1] is not live_layer
+    ]
+    if not candidates:
+        raise KeyError(f"{scenario_id} has no deterministic body to run")
+    if len(candidates) > 1:
+        raise ValueError(
+            f"{scenario_id} has several deterministic layers {candidates}; "
+            "a campaign cannot choose between them"
+        )
+    return candidates[0]
+
+
 def execute_campaign(
     scenario_ids: list[str],
     *,
@@ -245,12 +271,20 @@ def execute_campaign(
         raise ValueError("campaign scenario ids must be unique")
 
     registry = discover_scenarios()
-    unknown = sorted(set(requested) - set(registry))
+    # The registry is keyed by (id, layer); campaigns are requested by id.
+    registered_ids = {key[0] for key in registry}
+    unknown = sorted(set(requested) - registered_ids)
     if unknown:
         raise KeyError(f"unknown campaign scenarios: {', '.join(unknown)}")
 
     identity = _validate_run_id(campaign_id or _new_run_id("campaign"))
-    deterministic_scenarios = sorted(registry, key=_scenario_sort_key)
+    # Deterministic means offline: a LIVE_GITHUB body is an integration run and
+    # must not be counted toward deterministic reproducibility coverage.
+    live_layer = _harness().Layer.LIVE_GITHUB
+    deterministic_scenarios = sorted(
+        {key[0] for key in registry if key[1] is not live_layer},
+        key=_scenario_sort_key,
+    )
     campaign_runs_root = runs_root.expanduser().resolve() / identity
     repeated_results: list[list[Any]] = []
     contamination_snapshots = []
@@ -263,7 +297,7 @@ def execute_campaign(
             run_id = f"pass-{repetition}-{scenario_id.lower()}"
             result = execute_scenario(
                 scenario_id,
-                registry[scenario_id].layer,
+                _deterministic_layer(registry, scenario_id, live_layer),
                 repo_full_name=None,
                 status_path=(campaign_runs_root / "per-run" / f"{run_id}-status.json"),
                 runs_root=campaign_runs_root / "scenario-runs",
