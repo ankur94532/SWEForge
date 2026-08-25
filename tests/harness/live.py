@@ -134,3 +134,110 @@ def poll_until(
         f"polled {attempts} times over ~{attempts * delay:.0f}s without "
         f"observing the expected state on {full_name}"
     )
+
+
+def open_live_thread(
+    scenario_id: str,
+    root_dir,
+    *,
+    body: str,
+    planner=None,
+    reviewer=None,
+    clarification_classifier=None,
+):
+    """Open a real issue and return a world already bound to its thread.
+
+    Every live body repeats this preamble: create the issue, build a world
+    whose source is a clone of the real repository, poll until the thread
+    exists, and point the observation at REST rather than the fake's ledger.
+    """
+    from harness.observation import RestGitHubFacts
+    from harness.world import World
+    from sweforge.github_poller import GitHubPoller
+
+    full_name = live_repository()
+    client = live_client()
+    token = live_token()
+    marker = unique_marker(scenario_id)
+
+    issue, repo = create_issue(
+        client,
+        full_name,
+        title=f"[acceptance] {marker}",
+        body=f"{body}\n\nmarker: {marker}",
+    )
+    number = int(issue["number"])
+
+    world = World.build(
+        root_dir,
+        repo_id=repo.repo_id,
+        full_name=full_name,
+        client=client,
+        planner=planner,
+        reviewer=reviewer,
+        clarification_classifier=clarification_classifier,
+        source_clone_url=f"https://x-access-token:{token}@github.com/{full_name}.git",
+    )
+    poller = GitHubPoller(client, world.store)
+
+    def thread_for_issue():
+        row = world.store.connection.execute(
+            "SELECT thread_id FROM issue_threads WHERE repo_id=? AND issue_number=?",
+            (repo.repo_id, number),
+        ).fetchone()
+        return row["thread_id"] if row else None
+
+    thread_id = poll_until(poller, full_name, thread_for_issue)
+    # Polling is repository-wide, so a shared sandbox legitimately yields
+    # threads from earlier acceptance issues. Declaring what polling found
+    # keeps INV-THREAD-ISOLATION able to catch a thread this world never saw.
+    for row in world.store.connection.execute(
+        "SELECT thread_id FROM issue_threads WHERE repo_id=?", (repo.repo_id,)
+    ):
+        world.thread_ids.add(row["thread_id"])
+    world.github_facts = RestGitHubFacts(client, repo, number, repo.default_branch)
+    return LiveThread(
+        world=world,
+        client=client,
+        repo=repo,
+        full_name=full_name,
+        issue_number=number,
+        thread_id=thread_id,
+        poller=poller,
+        marker=marker,
+    )
+
+
+class LiveThread:
+    """One live issue plus everything a body needs to drive it."""
+
+    def __init__(
+        self, *, world, client, repo, full_name, issue_number, thread_id, poller, marker
+    ) -> None:
+        self.world = world
+        self.client = client
+        self.repo = repo
+        self.full_name = full_name
+        self.issue_number = issue_number
+        self.thread_id = thread_id
+        self.poller = poller
+        self.marker = marker
+
+    def say(self, text: str) -> None:
+        """Post a real comment and poll until it is stored."""
+        comment(self.client, self.full_name, self.issue_number, text)
+        store = self.world.store
+
+        def stored():
+            row = store.connection.execute(
+                "SELECT event_key FROM source_events WHERE thread_id=? AND body=? "
+                "ORDER BY rowid DESC LIMIT 1",
+                (self.thread_id, text),
+            ).fetchone()
+            return row["event_key"] if row else None
+
+        self.last_event_key = poll_until(self.poller, self.full_name, stored)
+
+    def approve(self):
+        self.say("@agent approve")
+        return self.world.engine.approve(event_key=self.last_event_key)
