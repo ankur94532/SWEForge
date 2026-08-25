@@ -51,6 +51,10 @@ class World:
     # issue number is not known until then. Left unset, observation() reads
     # the fake's recorded calls as every L1 scenario does.
     github_facts: Any = None
+    # A cross-repository scenario legitimately touches more than the world's
+    # own repository; declaring them keeps INV-REPO-ISOLATION able to catch a
+    # repository this world never saw.
+    extra_repo_ids: frozenset[int] = frozenset()
     _clock_tick: int = 0
 
     # -- construction -------------------------------------------------------
@@ -293,7 +297,7 @@ class World:
             events=events,
             store=self.store,
             thread_ids=frozenset(self.thread_ids),
-            repo_ids=frozenset({self.repo.repo_id}),
+            repo_ids=frozenset({self.repo.repo_id}) | self.extra_repo_ids,
             git=GitFacts(repo=self.source, origin=self.origin),
             github=self.github_facts or LedgerGitHubFacts(self.github),
             outside_markers=self.outside_markers,

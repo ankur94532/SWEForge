@@ -52,24 +52,53 @@ def live_client() -> HttpxGitHubClient:
     return HttpxGitHubClient(live_token())
 
 
-def live_repository() -> str:
-    """The single allowlisted live target, or a refusal.
-
-    Reading the allowlist rather than taking a caller's argument keeps a
-    scenario from naming its own target.
-    """
+def allowlisted_repositories() -> list[str]:
+    """Every repository the allowlist permits, in declared order."""
     raw = os.environ.get("SWEFORGE_ACCEPTANCE_REPOS", "")
     names = [item.strip() for item in raw.split(",") if item.strip()]
     if not names:
         raise LiveCredentialsUnavailable(
             "SWEFORGE_ACCEPTANCE_REPOS is unset; source acceptance/campaign.env"
         )
+    for name in names:
+        check_live_target(name)
+    return names
+
+
+def live_repository() -> str:
+    """The one repository a single-target scenario acts on.
+
+    SWEFORGE_ACCEPTANCE_REPO names it explicitly. Without that, a sole
+    allowlist entry is unambiguous and is used; several entries are refused
+    rather than guessed, so widening the allowlist for a cross-repo scenario
+    cannot silently redirect every other scenario.
+    """
+    names = allowlisted_repositories()
+    designated = os.environ.get("SWEFORGE_ACCEPTANCE_REPO", "").strip()
+    if designated:
+        if designated not in names:
+            raise LiveCredentialsUnavailable(
+                f"SWEFORGE_ACCEPTANCE_REPO={designated} is not allowlisted {names}"
+            )
+        check_live_target(designated)
+        return designated
     if len(names) > 1:
         raise LiveCredentialsUnavailable(
-            f"the live target must be unambiguous; allowlist names {names}"
+            f"the live target must be unambiguous; allowlist names {names}. "
+            "Set SWEFORGE_ACCEPTANCE_REPO to choose."
         )
-    check_live_target(names[0])
     return names[0]
+
+
+def live_repository_pair() -> tuple[str, str]:
+    """Two distinct allowlisted repositories, for cross-repository scenarios."""
+    names = allowlisted_repositories()
+    if len(names) < 2:
+        raise LiveCredentialsUnavailable(
+            f"a cross-repository scenario needs two allowlisted repositories; "
+            f"the allowlist names {names}"
+        )
+    return names[0], names[1]
 
 
 def unique_marker(scenario_id: str) -> str:
