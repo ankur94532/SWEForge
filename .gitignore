@@ -18,3 +18,4 @@ build/
 # The fixtures themselves (acceptance/fixtures/) ARE tracked — they are the
 # corpus. Reports are evidence of a particular run, not source.
 acceptance/reports/
+acceptance/campaign.env
