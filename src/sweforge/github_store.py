@@ -9,11 +9,12 @@ import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
+from .events import EventKind, emit
 from .github_models import (
     SourceEvent,
     SubjectKind,
@@ -443,6 +444,9 @@ class RecordBatchResult:
     threads_created: int = 0
     events_routed: int = 0
     pr_events_unrouted: int = 0
+    # Which threads were newly created, so ingestion can be announced after the
+    # transaction commits rather than from inside it.
+    created_thread_ids: list[str] = field(default_factory=list)
 
 
 class ExecutionStatus(StrEnum):
@@ -2007,6 +2011,15 @@ class SQLiteGitHubStore:
                    etag=excluded.etag,
                    last_successful_poll_at=excluded.last_successful_poll_at""",
                 (repo_id, stream, since, etag, polled_at),
+            )
+        # Announced only after the transaction commits: emitting inside it
+        # would claim an ingestion a rollback could erase.
+        for thread_id in result.created_thread_ids:
+            emit(
+                EventKind.ROOT_INGESTED,
+                thread_id=thread_id,
+                repo_id=repo_id,
+                source_kind=stream,
             )
         return result
 
@@ -4464,6 +4477,7 @@ class SQLiteGitHubStore:
                 ),
             )
             result.threads_created += 1
+            result.created_thread_ids.append(thread_id)
         result.events_routed += 1
         return thread_id
 

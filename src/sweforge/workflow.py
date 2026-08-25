@@ -1298,6 +1298,13 @@ class WorkflowEngine:
                 cycle_id=cycle_id,
                 consumed_at=self.clock(),
             )
+            emit(
+                EventKind.INPUT_DELIVERED,
+                thread_id=thread_id,
+                cycle_id=cycle_id,
+                event_key=input_id,
+                purpose=str(purpose),
+            )
             return
         self.store.consume_input(
             input_id,
@@ -1305,6 +1312,15 @@ class WorkflowEngine:
             cycle_id=cycle_id,
             purpose=purpose,
             claimed_at=self.clock(),
+        )
+        # Emitted after the durable consumption commits, so the log never
+        # claims delivery of an input the store did not actually consume.
+        emit(
+            EventKind.INPUT_DELIVERED,
+            thread_id=thread_id,
+            cycle_id=cycle_id,
+            event_key=input_id,
+            purpose=str(purpose),
         )
 
     def pending_live_inputs(self, thread_id: str) -> list[tuple[str, str]]:
