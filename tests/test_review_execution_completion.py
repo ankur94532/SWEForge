@@ -50,9 +50,11 @@ from sweforge.reviewer import (
     SpecialistStage,
     SpecialistStageReport,
     SpecialistStageStatus,
+    _absence_source_id,
     _authority_facts,
     _build_challenger,
     _candidate_requirement_associations,
+    _canonical_finalizer_provenance,
     _canonical_inspection_provenance,
     _challenger_prompt,
     _clusters_for_stage,
@@ -63,9 +65,11 @@ from sweforge.reviewer import (
     _guard_accept_coverage,
     _guard_repairability,
     _inspection_artifact_problems,
+    _inspection_correction_prompt,
     _inspection_failure_diagnostic,
     _invoke_specialist,
     _lexical_tokens,
+    _negative_change_targets,
     _resolve_reviewer_file,
     _resolved_evidence,
     _reviewer_read_tool,
@@ -1015,6 +1019,9 @@ def test_reviewer_prompt_declares_bounded_authority(monkeypatch):
         captured.update(kwargs)
         return object()
 
+    # Reviewer agents now build a bounded client before create_agent, so the
+    # model string must resolve even when create_agent itself is faked.
+    monkeypatch.setattr("sweforge.reviewer.init_chat_model", lambda *a, **k: object())
     monkeypatch.setattr("sweforge.reviewer.create_agent", fake_create_agent)
     build_reviewer(ReviewerContext(worktree="/tmp/worktree"), model="reviewer")
     prompt = captured["system_prompt"]
@@ -1176,7 +1183,13 @@ def test_requirement_classification_is_conservative_and_deterministic():
 
 
 def _coverage_guard_fixture(
-    requirement_id, classification, refs, *, execution=True, changed_files=None
+    requirement_id,
+    classification,
+    refs,
+    *,
+    execution=True,
+    changed_files=None,
+    requirement_text="requirement",
 ):
     inspection = InspectionReport(
         inspections=[
@@ -1203,7 +1216,7 @@ def _coverage_guard_fixture(
     contract = [
         {
             "requirement_id": requirement_id,
-            "text": "requirement",
+            "text": requirement_text,
             "classification": classification,
         }
     ]
@@ -1353,6 +1366,51 @@ def test_accept_guard_keeps_structural_diff_authority():
     assert guarded.verdict == "ACCEPT"
 
 
+def test_accept_guard_rejects_positive_diff_as_proof_of_absence():
+    requirement_id = "plan:step:4"
+    changed_path = "src/test/java/example/ExampleTest.java"
+    guarded = _coverage_guard_fixture(
+        requirement_id,
+        ReviewRequirementClassification.STRUCTURAL.value,
+        [
+            EvidenceRef(
+                ref_id="irrelevant-diff",
+                requirement_id=requirement_id,
+                kind=EvidenceKind.TRUSTED_DIFF,
+                path=changed_path,
+            )
+        ],
+        changed_files=[changed_path],
+        requirement_text="Do not modify any file under /src/main/java.",
+    )
+
+    assert guarded.verdict == "BLOCKED"
+    assert "missing relevant absence-of-change evidence" in guarded.findings[0].evidence
+
+
+def test_accept_guard_allows_application_bound_absence_of_change():
+    requirement_id = "plan:step:4"
+    scope = "src/main/java"
+    changed_files = {"src/test/java/example/ExampleTest.java"}
+    ref = EvidenceRef(
+        ref_id="absence-ref",
+        requirement_id=requirement_id,
+        kind=EvidenceKind.ABSENCE_OF_CHANGE,
+        source_id=_absence_source_id(scope, changed_files),
+        path=scope,
+    )
+
+    guarded = _coverage_guard_fixture(
+        requirement_id,
+        ReviewRequirementClassification.STRUCTURAL.value,
+        [ref],
+        changed_files=sorted(changed_files),
+        requirement_text="Do not modify any file under /src/main/java.",
+    )
+
+    assert guarded.verdict == "ACCEPT"
+
+
 def test_accept_guard_passes_exact_issue13_requirement_modes():
     source = "@agent Add focused threshold regression tests."
     plan = (
@@ -1390,6 +1448,17 @@ def test_accept_guard_passes_exact_issue13_requirement_modes():
                     requirement_id=requirement_id,
                     kind=EvidenceKind.EXECUTION,
                     source_id=execution_refs[requirement_id],
+                )
+            )
+        elif _negative_change_targets(item["text"]) is not None:
+            scope = _negative_change_targets(item["text"])[0]
+            refs.append(
+                EvidenceRef(
+                    ref_id=f"ref-{requirement_id}",
+                    requirement_id=requirement_id,
+                    kind=EvidenceKind.ABSENCE_OF_CHANGE,
+                    source_id=_absence_source_id(scope, {changed_path}),
+                    path=scope,
                 )
             )
         else:
@@ -2797,6 +2866,8 @@ def test_reviewer_prompts_require_full_contract_semantics():
     assert "whitespace-only reformatting" in INSPECTOR_SYSTEM_PROMPT
     assert "exact non-empty source_id" in FINALIZER_SYSTEM_PROMPT
     assert "whitespace-only reformatting" in FINALIZER_SYSTEM_PROMPT
+    assert "ABSENCE_OF_CHANGE" in INSPECTOR_SYSTEM_PROMPT
+    assert "positive diff for a different path" in FINALIZER_SYSTEM_PROMPT
 
 
 def test_inspector_schema_describes_exact_execution_and_file_authority():
@@ -2816,9 +2887,18 @@ def test_inspector_schema_describes_exact_execution_and_file_authority():
     kind_description = InspectionObservation.model_json_schema()["properties"]["kind"][
         "description"
     ]
+    evidence_kind_description = EvidenceRef.model_json_schema()["properties"]["kind"][
+        "description"
+    ]
     observations_description = InspectionReport.model_json_schema()["properties"][
         "observations"
     ]["description"]
+    observation_start_description = InspectionObservation.model_json_schema()[
+        "properties"
+    ]["start_line"]["description"]
+    observation_end_description = InspectionObservation.model_json_schema()[
+        "properties"
+    ]["end_line"]["description"]
     final_refs_description = ReviewRequirementCheck.model_json_schema()["properties"][
         "evidence_refs"
     ]["description"]
@@ -2830,8 +2910,41 @@ def test_inspector_schema_describes_exact_execution_and_file_authority():
     assert "same requirement_id" in ref_description
     assert "never use a directory" in observation_description
     assert "never replace" in kind_description
+    assert "ABSENCE_OF_CHANGE" in evidence_kind_description
     assert "at least one CODE" in observations_description
+    assert "exact returned_lines range" in observation_start_description
+    assert "exact returned_lines range" in observation_end_description
     assert "exact non-empty source_id" in final_refs_description
+
+
+def test_inspector_correction_prompt_supplies_exact_available_read_ranges():
+    prompt = _inspection_correction_prompt(
+        _review_evidence(),
+        [
+            GuardProblem(
+                code=GuardCode.IA_UNGROUNDED_OBSERVATION,
+                detail="ungrounded code observation for plan:step:3",
+            )
+        ],
+        [
+            {
+                "normalized_path": "src/main/java/example/Item.java",
+                "read_id": "read:opaque",
+                "returned_lines": [1, 5],
+            },
+            {
+                "normalized_path": "src/main/java/example/Item.java",
+                "read_id": "read:opaque",
+                "returned_lines": [1, 5],
+            },
+        ],
+    )
+
+    assert '"path": "src/main/java/example/Item.java"' in prompt
+    assert '"returned_lines": [1, 5]' in prompt
+    assert prompt.count('"returned_lines": [1, 5]') == 1
+    assert "inside one exact returned_lines range" in prompt
+    assert "read:opaque" not in prompt
 
 
 def test_finalizer_prompt_declares_uncommitted_worktree_authority():
@@ -2853,6 +2966,9 @@ def test_reviewer_is_structurally_read_only(monkeypatch, path):
         captured.update(kwargs)
         return object()
 
+    # Reviewer agents now build a bounded client before create_agent, so the
+    # model string must resolve even when create_agent itself is faked.
+    monkeypatch.setattr("sweforge.reviewer.init_chat_model", lambda *a, **k: object())
     monkeypatch.setattr("sweforge.reviewer.create_agent", fake_create_agent)
     build_reviewer(
         ReviewerContext(
@@ -2873,6 +2989,9 @@ def test_reviewer_limits_and_tool_surface_are_scoped(monkeypatch):
         captured.update(kwargs)
         return object()
 
+    # Reviewer agents now build a bounded client before create_agent, so the
+    # model string must resolve even when create_agent itself is faked.
+    monkeypatch.setattr("sweforge.reviewer.init_chat_model", lambda *a, **k: object())
     monkeypatch.setattr("sweforge.reviewer.create_agent", fake_create_agent)
     build_reviewer(ReviewerContext(worktree="/tmp/worktree"), model="reviewer")
 
@@ -2933,6 +3052,9 @@ def test_finalizer_construction_has_no_filesystem_tools(monkeypatch):
         captured.update(kwargs)
         return object()
 
+    # Reviewer agents now build a bounded client before create_agent, so the
+    # model string must resolve even when create_agent itself is faked.
+    monkeypatch.setattr("sweforge.reviewer.init_chat_model", lambda *a, **k: object())
     monkeypatch.setattr("sweforge.reviewer.create_agent", fake_create_agent)
     _build_finalizer(
         ReviewerContext(worktree="/tmp/worktree"),
@@ -2950,6 +3072,9 @@ def test_challenger_construction_has_one_two_call_budget(monkeypatch):
         captured.update(kwargs)
         return object()
 
+    # Reviewer agents now build a bounded client before create_agent, so the
+    # model string must resolve even when create_agent itself is faked.
+    monkeypatch.setattr("sweforge.reviewer.init_chat_model", lambda *a, **k: object())
     monkeypatch.setattr("sweforge.reviewer.create_agent", fake_create_agent)
     _build_challenger(model="reviewer", live_middleware=[])
     assert captured["tools"] == []
@@ -3141,6 +3266,121 @@ def test_inspection_artifact_accepts_structural_diff_authority():
         )
         == []
     )
+
+
+def test_canonical_absence_of_change_is_application_bound_and_scope_checked():
+    requirement_id = "plan:step:4"
+    scope = "src/main/java"
+    changed_path = "src/test/java/example/ExampleTest.java"
+    raw = InspectionReport(
+        inspections=[
+            RequirementInspection(
+                requirement_id=requirement_id,
+                status=InspectionStatus.VERIFIED,
+                evidence_refs=[
+                    EvidenceRef(
+                        ref_id="model-absence",
+                        requirement_id=requirement_id,
+                        kind=EvidenceKind.ABSENCE_OF_CHANGE,
+                        path=scope,
+                    )
+                ],
+            )
+        ]
+    )
+    evidence = {"changed_files": [changed_path]}
+    contract = [
+        {
+            "requirement_id": requirement_id,
+            "classification": ReviewRequirementClassification.STRUCTURAL.value,
+            "text": "Do not modify any file under /src/main/java.",
+        }
+    ]
+
+    canonical = _canonical_inspection_provenance(raw, evidence=evidence, ledger=[])
+    ref = canonical.inspections[0].evidence_refs[0]
+    assert ref.kind is EvidenceKind.ABSENCE_OF_CHANGE
+    assert ref.path == scope
+    assert ref.source_id == _absence_source_id(scope, {changed_path})
+    assert (
+        _inspection_artifact_problems(contract, canonical, ledger=[], evidence=evidence)
+        == []
+    )
+
+    changed_scope_evidence = {"changed_files": ["src/main/java/example/App.java"]}
+    rejected = _canonical_inspection_provenance(
+        raw, evidence=changed_scope_evidence, ledger=[]
+    )
+    problems = _inspection_artifact_problems(
+        contract, rejected, ledger=[], evidence=changed_scope_evidence
+    )
+    assert [problem.code for problem in problems] == [
+        GuardCode.IA_MISSING_ABSENCE_OF_CHANGE
+    ]
+
+
+def test_canonical_finalizer_absence_matches_inspector_binding():
+    requirement_id = "plan:step:4"
+    scope = "src/main/java"
+    changed_path = "src/test/java/example/ExampleTest.java"
+    raw_ref = EvidenceRef(
+        ref_id="model-finalizer-absence",
+        requirement_id=requirement_id,
+        kind=EvidenceKind.ABSENCE_OF_CHANGE,
+        path=scope,
+    )
+    raw = ExecutionReviewResult(
+        verdict="ACCEPT",
+        summary="accepted",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id=requirement_id,
+                status=ReviewRequirementStatus.SATISFIED,
+                evidence="no production change",
+                evidence_refs=[raw_ref],
+            )
+        ],
+    )
+
+    canonical = _canonical_finalizer_provenance(
+        raw, evidence={"changed_files": [changed_path]}
+    )
+    ref = canonical.requirement_checks[0].evidence_refs[0]
+
+    assert raw.requirement_checks[0].evidence_refs[0].source_id == ""
+    assert ref.kind is EvidenceKind.ABSENCE_OF_CHANGE
+    assert ref.path == scope
+    assert ref.source_id == _absence_source_id(scope, {changed_path})
+    assert ref.ref_id.startswith("bind:")
+
+
+def test_canonical_finalizer_drops_absence_scope_containing_a_change():
+    requirement_id = "plan:step:4"
+    raw = ExecutionReviewResult(
+        verdict="ACCEPT",
+        summary="accepted",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id=requirement_id,
+                status=ReviewRequirementStatus.SATISFIED,
+                evidence="no production change",
+                evidence_refs=[
+                    EvidenceRef(
+                        ref_id="model-finalizer-absence",
+                        requirement_id=requirement_id,
+                        kind=EvidenceKind.ABSENCE_OF_CHANGE,
+                        path="src/main/java",
+                    )
+                ],
+            )
+        ],
+    )
+
+    canonical = _canonical_finalizer_provenance(
+        raw, evidence={"changed_files": ["src/main/java/example/App.java"]}
+    )
+
+    assert canonical.requirement_checks[0].evidence_refs == []
 
 
 def test_real_unverified_inspection_is_not_an_artifact_error():

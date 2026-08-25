@@ -28,8 +28,18 @@ sweforge-review-replay = "sweforge.review_fixture_cli:replay_main"
 dev = [
     "langchain-openai>=1.6.0",
     "pytest>=8.0",
+    # Parallel test execution: the suite is run several times per work chunk,
+    # and it is dominated by many independent SQLite/tmpdir tests.
+    "pytest-xdist>=3.6",
     "ruff>=0.9",
+    # Operator sandbox provider. Strict GitHub execution fails closed without a
+    # registered `sweforge.sandbox_backends` entry point, so no live acceptance
+    # scenario can run unless this is installed. Dev-only: never in the wheel.
+    "sweforge-acceptance-sandbox",
 ]
+
+[tool.uv.sources]
+sweforge-acceptance-sandbox = { path = "acceptance/sandbox", editable = true }
 
 [build-system]
 requires = ["hatchling"]

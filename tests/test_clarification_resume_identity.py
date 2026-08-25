@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Annotated, TypedDict
 
 import pytest
+from harness.github_fake import FakeGitHub
 from langchain_core.messages import AIMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -50,35 +51,6 @@ def source_event(repo, source_id, body, created):
         body=body,
         html_url=None,
     )
-
-
-class FakeGitHub:
-    def __init__(self):
-        self.created = []
-
-    def repository(self, full_name):
-        return RepositoryRef(1, full_name, "main")
-
-    def issue(self, repo, number):
-        return {"labels": []}
-
-    def comments(self, repo, number):
-        return list(self.created)
-
-    def review_comments_for_pull_request(self, repo, number):
-        return list(self.created)
-
-    def create_comment(self, repo, number, body):
-        item = {
-            "id": len(self.created) + 1,
-            "body": body,
-            "created_at": f"2026-01-01T00:{len(self.created) + 10:02d}:00Z",
-        }
-        self.created.append(item)
-        return item
-
-    def create_review_comment_reply(self, repo, pull_number, comment_id, body):
-        return self.create_comment(repo, pull_number, body)
 
 
 class State(TypedDict):

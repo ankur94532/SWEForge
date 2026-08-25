@@ -42,6 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resolution-model")
     parser.add_argument("--clarification-model")
     parser.add_argument("--capabilities-config", type=Path)
+    parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--sandbox-provider")
     parser.add_argument("--unsafe-local-shell", action="store_true")
     parser.add_argument(
@@ -105,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
             clarification_model=args.clarification_model,
             capabilities_config=args.capabilities_config,
             sandbox_provider=args.sandbox_provider,
+            ready_file=args.ready_file,
             unsafe_local_shell=args.unsafe_local_shell,
             api_url=args.api_url,
             api_version=args.api_version,

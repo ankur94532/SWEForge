@@ -16,6 +16,7 @@ from langgraph.store.base import BaseStore
 
 from .capabilities import RepoCapabilityRegistry
 from .context import RepoAgentContext
+from .events import EventKind, emit
 from .execution import (
     ClarificationRequestProposal,
     ExecutionResult,
@@ -83,7 +84,11 @@ from .review_fixture import (
     record_capture_failure,
     write_fixture,
 )
-from .reviewer import ExecutionReviewResult, review_execution
+from .reviewer import (
+    ExecutionReviewResult,
+    ReviewFinalizationError,
+    review_execution,
+)
 from .workspace import ThreadWorkspace, Workspace, WorkspaceError
 
 _PREFIX_RE = re.compile(r"^\s*@agent\b", re.IGNORECASE)
@@ -347,6 +352,16 @@ class WorkflowEngine:
             root_input_id=root_input_id,
         )
         self.store.begin_workflow_cycle(record, workflow_state, claimed_at=timestamp)
+        emit(
+            EventKind.PLAN_CREATED,
+            thread_id=thread_id,
+            cycle_id=cycle_id,
+            repo_id=thread["repo_id"],
+            plan_id=plan_id,
+            plan_version=version,
+            root_event_key=event_key,
+            root_input_id=root_input_id,
+        )
         return self.store.plan(plan_id)  # type: ignore[return-value]
 
     def plan_event(
@@ -591,12 +606,24 @@ class WorkflowEngine:
             consumed_at=None,
             invalidated_at=None,
         )
-        return self.store.approve_current_plan(
+        approved = self.store.approve_current_plan(
             event_key=event_key,
             author_login=author_login or event["author_login"],
             permit=permit,
             approved_at=timestamp,
         )
+        emit(
+            EventKind.PERMIT_CREATED,
+            thread_id=state.thread_id,
+            cycle_id=state.cycle_id,
+            repo_id=state.repo_id,
+            permit_id=permit.permit_id,
+            permit_source=str(PermitSource.USER),
+            plan_id=plan.plan_id,
+            plan_version=plan.version,
+            root_event_key=plan.root_event_key,
+        )
+        return approved
 
     def revise(self, *, event_key: str, plan_text: str) -> PlanRecord:
         event = self.store.source_event(event_key)
@@ -766,6 +793,16 @@ class WorkflowEngine:
                     root_event_key=plan.root_event_key,
                     authorization_id=permit.permit_id,
                     created_at=utc_timestamp(clock()),
+                )
+                emit(
+                    EventKind.EXECUTION_STARTED,
+                    thread_id=permit.thread_id,
+                    cycle_id=permit.cycle_id,
+                    attempt_id=attempt.attempt_id,
+                    attempt_kind=str(attempt.kind),
+                    attempt_number=attempt.attempt_number,
+                    retry_count=attempt.retry_count,
+                    permit_id=permit.permit_id,
                 )
                 execution_evidence: SimpleQueue[dict] = SimpleQueue()
 
@@ -943,6 +980,15 @@ class WorkflowEngine:
                         end_head_sha=execution["end_head_sha"] if execution else None,
                         end_dirty=bool(execution["end_dirty"]) if execution else False,
                     )
+                    emit(
+                        EventKind.EXECUTION_SUCCEEDED,
+                        thread_id=permit.thread_id,
+                        cycle_id=permit.cycle_id,
+                        attempt_id=attempt.attempt_id,
+                        attempt_kind=str(attempt.kind),
+                        attempt_number=attempt.attempt_number,
+                        retry_count=attempt.retry_count,
+                    )
                 elif result.status == "CLARIFICATION":
                     self.store.finish_execution_attempt(
                         attempt.attempt_id,
@@ -967,6 +1013,18 @@ class WorkflowEngine:
                         completed_at=utc_timestamp(clock()),
                         response_text=result.error,
                     )
+                    # No error text: the schema admits scalars only, and the
+                    # message is already durable on the attempt row. Putting it
+                    # here would be the free-text leak §I.3 exists to prevent.
+                    emit(
+                        EventKind.EXECUTION_FAILED,
+                        thread_id=permit.thread_id,
+                        cycle_id=permit.cycle_id,
+                        attempt_id=attempt.attempt_id,
+                        attempt_kind=str(attempt.kind),
+                        attempt_number=attempt.attempt_number,
+                        retry_count=attempt.retry_count,
+                    )
                 if current:
                     phase = (
                         WorkflowPhase.REVIEW_EXECUTION
@@ -983,6 +1041,14 @@ class WorkflowEngine:
                                 "updated_at": self.clock(),
                             }
                         )
+                    )
+                    emit(
+                        EventKind.PHASE_CHANGED,
+                        thread_id=permit.thread_id,
+                        cycle_id=permit.cycle_id,
+                        phase_from=str(current.phase),
+                        phase_to=str(phase),
+                        reason=result.status,
                     )
                 return result
         except ThreadLockUnavailable:
@@ -1299,11 +1365,19 @@ class WorkflowEngine:
             state.thread_id, after_event_key=state.root_event_key
         ):
             if _is_actionable_feedback(row):
-                self.store.defer_followup(
+                deferred = self.store.defer_followup(
                     source_event_key=row["event_key"],
                     thread_id=state.thread_id,
                     originating_cycle_id=state.cycle_id,
                     queued_at=self.clock(),
+                )
+                emit(
+                    EventKind.INPUT_DEFERRED,
+                    thread_id=state.thread_id,
+                    cycle_id=state.cycle_id,
+                    deferred_id=deferred.deferred_id,
+                    source_event_key=row["event_key"],
+                    purpose=str(InputPurpose.DEFERRED_FOLLOWUP),
                 )
 
     @staticmethod
@@ -1542,6 +1616,16 @@ class WorkflowEngine:
         # the thread returns to IDLE.  A stale publication fails closed here.
         learning = self.store.finalize_publication(
             target.publication_id, now=self.clock()
+        )
+        # Emitted only after the guarded finalization commits, so the log never
+        # claims a publication that a stale lifecycle failed to complete.
+        emit(
+            EventKind.PUBLICATION_COMPLETED,
+            thread_id=thread_id,
+            cycle_id=state.cycle_id,
+            repo_id=state.repo_id,
+            publication_id=target.publication_id,
+            comment_id=comment_id,
         )
         workspace = self.store.thread_workspace(thread_id)
         self._learn_repository_memory(
@@ -2221,6 +2305,13 @@ class WorkflowEngine:
             review_context, memory_store=memory_store, memory_namespace=None
         )
         result = None
+        emit(
+            EventKind.REVIEW_ATTEMPT,
+            thread_id=state.thread_id,
+            cycle_id=state.cycle_id,
+            attempt_id=attempt.attempt_id,
+            review_iteration=attempt.attempt_number,
+        )
         review_error: BaseException | None = None
         try:
             result = self.reviewer(
@@ -2258,6 +2349,25 @@ class WorkflowEngine:
                 record_capture_failure()
                 _LOGGER.warning("review fixture capture failed: %s", capture_error)
         if review_error is not None:
+            # guard_codes_count separates an infrastructure failure (0: nothing
+            # was judged) from a genuine guard rejection (>0), which is the same
+            # distinction the conformance runner draws. Emitted before the
+            # re-raise so instrumentation never alters control flow.
+            diagnostic = getattr(review_error, "diagnostic", None)
+            codes = (
+                diagnostic.get("guard_codes", [])
+                if isinstance(diagnostic, dict)
+                else []
+            )
+            emit(
+                EventKind.REVIEW_INFRA_FAILED,
+                thread_id=state.thread_id,
+                cycle_id=state.cycle_id,
+                attempt_id=attempt.attempt_id,
+                review_iteration=attempt.attempt_number,
+                error_type=type(review_error).__name__,
+                guard_codes_count=len(codes),
+            )
             raise review_error
         assert result is not None
         review_id = "review-" + _stable_id(
@@ -2541,19 +2651,46 @@ class WorkflowEngine:
                         )
                     review = self.store.execution_review_for_attempt(attempt.attempt_id)
                     if review is None:
-                        review = self._run_review_locked(
-                            state=state,
-                            attempt=attempt,
-                            plan=plan,
-                            memory_store=memory_store,
-                            model=review_model or model,
-                        )
+                        try:
+                            review = self._run_review_locked(
+                                state=state,
+                                attempt=attempt,
+                                plan=plan,
+                                memory_store=memory_store,
+                                model=review_model or model,
+                            )
+                        except ReviewFinalizationError:
+                            # Bounded at MAX_REVIEW_RECOVERIES. Below the bound
+                            # the error is re-raised so the dispatcher's
+                            # existing backoff drives the retry; at the bound
+                            # the thread fails closed instead of retrying
+                            # forever. The successful INITIAL attempt is left
+                            # untouched so recovery can still reuse it.
+                            outcome = self.store.record_review_infrastructure_failure(
+                                attempt.attempt_id, now=self.clock()
+                            )
+                            if outcome == "RETRY":
+                                raise
+                            return WorkflowAdvanceResult(
+                                WorkflowPhase.REVIEW_BLOCKED,
+                                thread_id,
+                                message="review infrastructure retries exhausted",
+                            )
             except ThreadLockUnavailable:
                 return WorkflowAdvanceResult(
                     WorkflowPhase.REVIEW_EXECUTION, thread_id, message="busy"
                 )
             if review.verdict == "ACCEPT":
                 self.store.accept_execution_review(review.review_id, now=self.clock())
+                emit(
+                    EventKind.REVIEW_ACCEPTED,
+                    thread_id=review.thread_id,
+                    cycle_id=review.cycle_id,
+                    review_id=review.review_id,
+                    attempt_id=review.attempt_id,
+                    review_iteration=review.review_iteration,
+                    verdict=review.verdict,
+                )
                 return WorkflowAdvanceResult(
                     WorkflowPhase.AWAITING_PUBLICATION,
                     thread_id,
@@ -2573,6 +2710,22 @@ class WorkflowEngine:
                     return WorkflowAdvanceResult(
                         WorkflowPhase.REVIEW_BLOCKED, thread_id, message=str(exc)
                     )
+                emit(
+                    EventKind.REVIEW_NEEDS_FIXES,
+                    thread_id=review.thread_id,
+                    cycle_id=review.cycle_id,
+                    review_id=review.review_id,
+                    attempt_id=review.attempt_id,
+                    review_iteration=review.review_iteration,
+                    verdict=review.verdict,
+                )
+                emit(
+                    EventKind.REPAIR_AUTHORIZED,
+                    thread_id=review.thread_id,
+                    cycle_id=review.cycle_id,
+                    permit_id=repair.permit_id,
+                    parent_review_id=review.review_id,
+                )
                 return WorkflowAdvanceResult(
                     WorkflowPhase.REPAIR_READY,
                     thread_id,
@@ -2580,6 +2733,15 @@ class WorkflowEngine:
                     message="repair authorized by execution review",
                 )
             self.store.block_execution_review(review.review_id, now=self.clock())
+            emit(
+                EventKind.REVIEW_BLOCKED,
+                thread_id=review.thread_id,
+                cycle_id=review.cycle_id,
+                review_id=review.review_id,
+                attempt_id=review.attempt_id,
+                review_iteration=review.review_iteration,
+                verdict=review.verdict,
+            )
             self.post_blocked_review_comment(thread_id, summary=review.summary)
             return WorkflowAdvanceResult(
                 WorkflowPhase.REVIEW_BLOCKED, thread_id, message=review.verdict

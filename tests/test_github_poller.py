@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from harness.github_fake import FakeGitHub
 
 from sweforge.github_models import PollResponse, RepositoryRef
 from sweforge.github_poller import GitHubPoller
@@ -34,34 +35,6 @@ def comment_item(
         "html_url": "https://github.com/example/repo/issues/7#issuecomment-9",
         "user": {"login": "octocat"},
     }
-
-
-class FakeGitHub:
-    def __init__(self, repositories, responses=None, issue_payloads=None):
-        self.repositories = repositories
-        self.responses = responses or {}
-        self.issue_payloads = issue_payloads or {}
-        self.issue_calls = []
-        self.stream_calls = []
-
-    def repository(self, full_name):
-        return self.repositories[full_name]
-
-    def issues(self, repo, since, etag):
-        self.stream_calls.append(("issues", since, etag))
-        return self.responses.get((repo.repo_id, "issues"), PollResponse())
-
-    def issue_comments(self, repo, since, etag):
-        self.stream_calls.append(("issue_comments", since, etag))
-        return self.responses.get((repo.repo_id, "issue_comments"), PollResponse())
-
-    def review_comments(self, repo, since, etag):
-        self.stream_calls.append(("review_comments", since, etag))
-        return self.responses.get((repo.repo_id, "review_comments"), PollResponse())
-
-    def issue(self, repo, number):
-        self.issue_calls.append((repo.repo_id, number))
-        return self.issue_payloads.get((repo.repo_id, number), {})
 
 
 def poller(fake, store):

@@ -13,3 +13,8 @@ dist/
 build/
 *.egg-info/
 .DS_Store
+
+# Conformance run output: 84MB and regenerable from the frozen fixtures.
+# The fixtures themselves (acceptance/fixtures/) ARE tracked — they are the
+# corpus. Reports are evidence of a particular run, not source.
+acceptance/reports/

@@ -78,6 +78,7 @@ class ReviewRequirementClassification(StrEnum):
 
 class EvidenceKind(StrEnum):
     TRUSTED_DIFF = "TRUSTED_DIFF"
+    ABSENCE_OF_CHANGE = "ABSENCE_OF_CHANGE"
     EXECUTION = "EXECUTION"
     INSPECTED_FILE = "INSPECTED_FILE"
     INSPECTOR_OBSERVATION = "INSPECTOR_OBSERVATION"
@@ -86,7 +87,22 @@ class EvidenceKind(StrEnum):
 class EvidenceRef(BaseModel):
     ref_id: str = Field(min_length=1, max_length=160)
     requirement_id: str = Field(min_length=1, max_length=120)
-    kind: EvidenceKind
+    kind: EvidenceKind = Field(
+        description=(
+            "Use ABSENCE_OF_CHANGE only for a negative structural requirement. "
+            "Put the exact repository-relative file or directory scope in path, "
+            "leave source_id empty, and omit line ranges; the application binds "
+            "the claim to authoritative changed_files. When the requirement "
+            "names several files, emit one ABSENCE_OF_CHANGE ref per named file; "
+            "when it names a directory scope you must cite that directory even "
+            "if it also enumerates files inside it, because citing the files "
+            "cannot prove that no other file under the directory changed; "
+            "when it names a directory, or an open-ended category such as 'any "
+            "other production source file', cite the narrowest directory scope "
+            "that covers it. Nothing else proves absence: not a diff for some "
+            "other path, and not reading a file and observing its contents."
+        )
+    )
     source_id: str = Field(
         default="",
         max_length=160,
@@ -101,12 +117,29 @@ class EvidenceRef(BaseModel):
             "in the same inspection artifact into source_id; ref_id is not the "
             "observation identity. That observation must have the same "
             "requirement_id as this evidence reference; never reuse an observation "
-            "across requirements."
+            "across requirements. For ABSENCE_OF_CHANGE, leave source_id empty; "
+            "the application supplies it only after validating the requested scope."
         ),
     )
     path: str = Field(default="", max_length=500)
-    start_line: int | None = Field(default=None, ge=1, le=100_000)
-    end_line: int | None = Field(default=None, ge=1, le=100_000)
+    start_line: int | None = Field(
+        default=None,
+        ge=1,
+        le=100_000,
+        description=(
+            "For inspected-file or inspector-observation evidence, this must fall "
+            "within the exact returned_lines range available for the cited path."
+        ),
+    )
+    end_line: int | None = Field(
+        default=None,
+        ge=1,
+        le=100_000,
+        description=(
+            "For inspected-file or inspector-observation evidence, this must fall "
+            "within the exact returned_lines range available for the cited path."
+        ),
+    )
 
 
 class InspectionObservation(BaseModel):
@@ -127,8 +160,24 @@ class InspectionObservation(BaseModel):
             "directory or an invented path."
         ),
     )
-    start_line: int | None = Field(default=None, ge=1, le=100_000)
-    end_line: int | None = Field(default=None, ge=1, le=100_000)
+    start_line: int | None = Field(
+        default=None,
+        ge=1,
+        le=100_000,
+        description=(
+            "Must fall within an exact returned_lines range supplied for this path; "
+            "never extend beyond the first or last returned line."
+        ),
+    )
+    end_line: int | None = Field(
+        default=None,
+        ge=1,
+        le=100_000,
+        description=(
+            "Must fall within an exact returned_lines range supplied for this path; "
+            "never extend beyond the first or last returned line."
+        ),
+    )
     fact: str = Field(default="", max_length=1_000)
     assertion_or_signal: str = Field(default="", max_length=1_000)
 
@@ -517,6 +566,15 @@ _STRUCTURAL_REQUIREMENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NEGATIVE_CHANGE_REQUIREMENT_RE = re.compile(
+    r"\bdo not modify\b|\bmust remain unchanged\b|\bstays? unchanged\b|"
+    r"\bno (?:changes?|modifications?)\b|\bnot be modified\b|\buntouched\b|"
+    r"\bkeep\b[^\n]{0,100}\bunchanged\b|\bcontinue\b[^\n]{0,100}\bunchanged\b",
+    re.IGNORECASE,
+)
+_REPOSITORY_SCOPE_RE = re.compile(r"/?(?:src|app|lib|tests?)(?:/[A-Za-z0-9_.-]+)+")
+_NAMED_FILE_RE = re.compile(r"\b[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}\b")
+
 _EXECUTION_REQUIREMENT_RE = re.compile(
     r"(?:^|\b)(?:run|execute|invoke|build|validate)\b"
     r"|`[^`\n]+`(?:\s+\([^\n)]{1,100}\))?\s+"
@@ -538,6 +596,105 @@ def _requirement_classification(
     ):
         return ReviewRequirementClassification.VALIDATION
     return ReviewRequirementClassification.BEHAVIORAL
+
+
+def _negative_change_targets(text: str) -> tuple[str, ...] | None:
+    """Return explicit unchanged scopes, or None for a non-negative requirement."""
+    if not _NEGATIVE_CHANGE_REQUIREMENT_RE.search(text):
+        return None
+    clauses = re.split(r";|\s+[—–-]\s+", text)
+    negative_clauses = [
+        clause for clause in clauses if _NEGATIVE_CHANGE_REQUIREMENT_RE.search(clause)
+    ]
+    targets: list[str] = []
+    for clause in negative_clauses:
+        for match in _REPOSITORY_SCOPE_RE.findall(clause):
+            target = match.lstrip("/").rstrip("/.,:;)")
+            if target and target not in targets:
+                targets.append(target)
+        for match in _NAMED_FILE_RE.findall(clause):
+            target = match.rstrip(".,:;)")
+            if target and target not in targets:
+                targets.append(target)
+    return tuple(targets)
+
+
+def _normalized_absence_scope(path: str) -> str | None:
+    candidate = path.strip().lstrip("/").rstrip("/")
+    if not candidate:
+        return None
+    pure = PurePosixPath(candidate)
+    if pure.is_absolute() or any(part in {"", ".", ".."} for part in pure.parts):
+        return None
+    return pure.as_posix()
+
+
+def _scope_contains_change(scope: str, changed_files: set[str]) -> bool:
+    return any(path == scope or path.startswith(scope + "/") for path in changed_files)
+
+
+def _absence_source_id(scope: str, changed_files: set[str]) -> str:
+    material = json.dumps(
+        {"scope": scope, "changed_files": sorted(changed_files)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "absence:" + hashlib.sha256(material.encode()).hexdigest()[:24]
+
+
+def _absence_directory_scope(scope: str) -> bool:
+    """True when a scope names a directory rather than a single file.
+
+    Absence refs are bound against authoritative changed_files, so a directory
+    verified unchanged already proves every file beneath it unchanged.
+    """
+    return "." not in PurePosixPath(scope).name
+
+
+def _absence_scope_covers_target(
+    scope: str, target: str, changed_files: set[str] | None = None
+) -> bool:
+    if "/" in target:
+        return target == scope or target.startswith(scope + "/")
+    if PurePosixPath(scope).name == target:
+        return True
+    # A bare filename lifted from requirement prose carries no directory, so it
+    # can never prefix-match. A verified-unchanged directory subsumes the files
+    # beneath it -- but only for a filename that genuinely did not change.
+    # Without that check an unrelated quiet directory would vacuously satisfy
+    # any named file, which is the same soundness hole in a new place.
+    if not _absence_directory_scope(scope):
+        return False
+    if changed_files is None:
+        return False
+    return not any(PurePosixPath(path).name == target for path in changed_files)
+
+
+def _has_required_absence_refs(
+    refs: list[EvidenceRef],
+    requirement_text: str,
+    changed_files: set[str] | None = None,
+) -> bool:
+    targets = _negative_change_targets(requirement_text)
+    if targets is None:
+        return True
+    scopes = [
+        scope
+        for ref in refs
+        if ref.kind is EvidenceKind.ABSENCE_OF_CHANGE
+        and (scope := _normalized_absence_scope(ref.path)) is not None
+    ]
+    if not scopes:
+        return False
+    if not targets:
+        return True
+    return all(
+        any(
+            _absence_scope_covers_target(scope, target, changed_files)
+            for scope in scopes
+        )
+        for target in targets
+    )
 
 
 def _normalized_requirement_literal(text: str) -> str:
@@ -831,7 +988,17 @@ INSPECTOR_SYSTEM_PROMPT = (
     "using semantic paths and line ranges; never invent or transcribe opaque read IDs. "
     "For every VERIFIED "
     "STRUCTURAL requirement, cite appropriate trusted diff or inspected-file "
-    "authority. For every VERIFIED BEHAVIORAL requirement, emit a CODE observation "
+    "authority. A negative structural requirement that code or a scope remain "
+    "unchanged requires ABSENCE_OF_CHANGE with the exact repository-relative file "
+    "or directory scope: one ref per file when the requirement names several, the "
+    "directory itself whenever the requirement names a directory scope (even if "
+    "it also enumerates files inside it), or "
+    "the narrowest covering directory when it names a directory or an open-ended "
+    "category such as 'any other production source file'. A TRUSTED_DIFF for a "
+    "file that did change is never proof that some other scope did not change, "
+    "and neither is reading a file and observing its current contents. "
+    "For every VERIFIED BEHAVIORAL "
+    "requirement, emit a CODE observation "
     "for that exact requirement with a concrete relevant path; if the path is "
     "unchanged, use read_repo_file first and cite the matching inspected-file/read "
     "ledger authority. TEST and EXECUTION observations never substitute for this "
@@ -920,6 +1087,9 @@ FINALIZER_SYSTEM_PROMPT = (
     "that named code remain unchanged, continue unchanged, or not be modified is "
     "contradicted by any textual diff to that named code, including whitespace-only "
     "reformatting, unless the contract explicitly defines unchanged as behavior-only. "
+    "A negative structural requirement is satisfied only by application-bound "
+    "ABSENCE_OF_CHANGE authority for the relevant scope; a positive diff for a "
+    "different path is not evidence of absence. "
     "Copy evidence "
     "authority from the supplied evidence catalog exactly. Every INSPECTED_FILE "
     "reference must preserve the catalog's exact non-empty source_id, path, and "
@@ -1033,6 +1203,18 @@ def _reviewer_read_tool(context: ReviewerContext) -> StructuredTool:
     )
 
 
+# Every reviewer model path must be bounded. An unbounded request can block a
+# worker indefinitely: a stalled provider connection once held a conformance
+# batch for 62 minutes on 3 seconds of CPU, producing no result and no error.
+# Retry policy belongs to SWEForge's dispatcher backoff, not the provider SDK.
+MODEL_REQUEST_TIMEOUT_SECONDS = 120
+
+
+def bounded_model(model: str):
+    """Return a chat model with a hard per-request timeout and no SDK retries."""
+    return init_chat_model(model, max_retries=0, timeout=MODEL_REQUEST_TIMEOUT_SECONDS)
+
+
 def build_reviewer(context: ReviewerContext, *, model: str):
     """Build the bounded reviewer-specific read-only inspection agent."""
     if context.repo_context is None and (context.memory_store is None) != (
@@ -1072,7 +1254,7 @@ def build_reviewer(context: ReviewerContext, *, model: str):
             )
         )
     return create_agent(
-        model=model,
+        model=bounded_model(model),
         tools=[_reviewer_read_tool(context)],
         response_format=ToolStrategy(InspectionReport),
         middleware=middleware
@@ -1094,7 +1276,7 @@ def build_reviewer(context: ReviewerContext, *, model: str):
 def _build_challenger(*, model: str, live_middleware: list[object]):
     """Build the bounded, tool-free adversarial evidence checker."""
     return create_agent(
-        model=model,
+        model=bounded_model(model),
         tools=[],
         response_format=ToolStrategy(ChallengeReport),
         middleware=live_middleware
@@ -1125,7 +1307,7 @@ def _build_finalizer(
     """Build a structured finalizer with no repository-capable tools."""
     del context
     return create_agent(
-        model=model,
+        model=bounded_model(model),
         tools=[],
         response_format=ToolStrategy(ExecutionReviewResult),
         middleware=live_middleware
@@ -1551,6 +1733,26 @@ def _resolved_evidence(
                 evidence_id = (
                     "diff:" + hashlib.sha256(identity.encode()).hexdigest()[:24]
                 )
+            elif ref.kind is EvidenceKind.ABSENCE_OF_CHANGE:
+                scope = _normalized_absence_scope(path)
+                changed_files = {
+                    str(item).lstrip("/") for item in evidence.get("changed_files", [])
+                }
+                if (
+                    scope is None
+                    or source_id != _absence_source_id(scope, changed_files)
+                    or _scope_contains_change(scope, changed_files)
+                ):
+                    continue
+                excerpt = json.dumps(
+                    {
+                        "scope": scope,
+                        "changed_files": sorted(changed_files),
+                        "assertion": "no changed file is within scope",
+                    },
+                    sort_keys=True,
+                )
+                evidence_id = source_id
             elif ref.kind is EvidenceKind.EXECUTION:
                 excerpt = json.dumps(
                     evidence.get("execution_observations")
@@ -2080,7 +2282,7 @@ def _invoke_specialist(
     prompt_chars = len(prompt)
     provider_requests = 0
     try:
-        direct_model = init_chat_model(model, max_retries=0, timeout=120)
+        direct_model = bounded_model(model)
         provider_requests = 1
         message = direct_model.invoke(
             [
@@ -2623,6 +2825,24 @@ def _reference_problems(
                         f"untrusted diff path for {requirement_id}",
                     )
                 )
+        if ref.kind is EvidenceKind.ABSENCE_OF_CHANGE:
+            scope = _normalized_absence_scope(ref.path)
+            expected_source = (
+                _absence_source_id(scope, changed_files) if scope is not None else None
+            )
+            if (
+                scope is None
+                or _scope_contains_change(scope, changed_files)
+                or ref.source_id != expected_source
+                or ref.start_line is not None
+                or ref.end_line is not None
+            ):
+                problems.append(
+                    _guard_problem(
+                        GuardCode.IA_INVALID_ABSENCE_OF_CHANGE,
+                        f"invalid absence-of-change evidence for {requirement_id}",
+                    )
+                )
         if ref.kind is EvidenceKind.EXECUTION and not has_execution:
             problems.append(
                 _guard_problem(
@@ -2747,7 +2967,16 @@ def _inspection_authority_problems(
                 )
             )
     elif classification == ReviewRequirementClassification.STRUCTURAL.value:
-        if not refs:
+        if _negative_change_targets(requirement["text"]) is not None and not (
+            _has_required_absence_refs(refs, requirement["text"], changed_files)
+        ):
+            problems.append(
+                _guard_problem(
+                    GuardCode.IA_MISSING_ABSENCE_OF_CHANGE,
+                    f"missing relevant absence-of-change evidence for {requirement_id}",
+                )
+            )
+        elif not refs:
             problems.append(
                 _guard_problem(
                     GuardCode.IA_MISSING_STRUCTURAL_EVIDENCE,
@@ -2785,6 +3014,68 @@ def _observation_range(observation: InspectionObservation) -> tuple[int, int] | 
     if observation.end_line < observation.start_line:
         return None
     return observation.start_line, observation.end_line
+
+
+def _canonical_absence_ref(
+    ref: EvidenceRef,
+    *,
+    requirement_id: str,
+    changed_files: set[str],
+) -> EvidenceRef | None:
+    """Bind a model-nominated unchanged scope to application-owned authority."""
+    scope = _normalized_absence_scope(ref.path.lstrip("/"))
+    if scope is None or _scope_contains_change(scope, changed_files):
+        return None
+    source_id = _absence_source_id(scope, changed_files)
+    return EvidenceRef(
+        ref_id=_canonical_ref_id(
+            requirement_id,
+            EvidenceKind.ABSENCE_OF_CHANGE,
+            source_id,
+            scope,
+            None,
+            None,
+        ),
+        requirement_id=requirement_id,
+        kind=EvidenceKind.ABSENCE_OF_CHANGE,
+        source_id=source_id,
+        path=scope,
+    )
+
+
+def _canonical_finalizer_provenance(
+    result: ExecutionReviewResult, *, evidence: dict
+) -> ExecutionReviewResult:
+    """Bind finalizer absence claims exactly as inspector absence claims are bound."""
+    changed_files = {
+        str(path).lstrip("/") for path in evidence.get("changed_files", [])
+    }
+    bounded = result.model_copy(deep=True)
+    for check in bounded.requirement_checks:
+        canonical: list[EvidenceRef] = []
+        seen: set[tuple[EvidenceKind, str, str, int | None, int | None]] = set()
+        for ref in check.evidence_refs:
+            candidate = ref
+            if ref.kind is EvidenceKind.ABSENCE_OF_CHANGE:
+                candidate = _canonical_absence_ref(
+                    ref,
+                    requirement_id=check.requirement_id,
+                    changed_files=changed_files,
+                )
+                if candidate is None:
+                    continue
+            key = (
+                candidate.kind,
+                candidate.source_id,
+                candidate.path,
+                candidate.start_line,
+                candidate.end_line,
+            )
+            if key not in seen:
+                seen.add(key)
+                canonical.append(candidate)
+        check.evidence_refs = canonical
+    return bounded
 
 
 def _canonical_inspection_provenance(
@@ -2895,6 +3186,14 @@ def _canonical_inspection_provenance(
                         end_line=ref.end_line,
                     )
                 )
+            elif ref.kind is EvidenceKind.ABSENCE_OF_CHANGE:
+                canonical = _canonical_absence_ref(
+                    ref,
+                    requirement_id=inspection.requirement_id,
+                    changed_files=changed_files,
+                )
+                if canonical is not None:
+                    add_generated(canonical)
             elif ref.kind is EvidenceKind.INSPECTED_FILE:
                 line_range = _observation_range(
                     InspectionObservation(
@@ -2941,7 +3240,12 @@ def _canonical_inspection_provenance(
         preserved = [
             ref
             for ref in inspection.evidence_refs
-            if ref.kind not in {EvidenceKind.INSPECTED_FILE, EvidenceKind.TRUSTED_DIFF}
+            if ref.kind
+            not in {
+                EvidenceKind.INSPECTED_FILE,
+                EvidenceKind.TRUSTED_DIFF,
+                EvidenceKind.ABSENCE_OF_CHANGE,
+            }
         ]
         inspection.evidence_refs = preserved + generated
     return bounded
@@ -3220,7 +3524,21 @@ def _bounded_inspection_prompt(evidence: dict) -> str:
     )
 
 
-def _inspection_correction_prompt(evidence: dict, problems: list[GuardProblem]) -> str:
+def _inspection_correction_prompt(
+    evidence: dict, problems: list[GuardProblem], ledger: list[dict]
+) -> str:
+    available_read_ranges = []
+    seen_ranges: set[tuple[str, int, int]] = set()
+    for item in ledger:
+        path = str(item.get("normalized_path", ""))
+        returned_lines = item.get("returned_lines", [])
+        if not path or not isinstance(returned_lines, list) or len(returned_lines) != 2:
+            continue
+        key = (path, int(returned_lines[0]), int(returned_lines[1]))
+        if key in seen_ranges:
+            continue
+        seen_ranges.add(key)
+        available_read_ranges.append({"path": path, "returned_lines": [key[1], key[2]]})
     return (
         _bounded_inspection_prompt(evidence)
         + "\n\n[Deterministic inspection-artifact correction]\n"
@@ -3230,6 +3548,7 @@ def _inspection_correction_prompt(evidence: dict, problems: list[GuardProblem]) 
                     {"code": item.code.value, "detail": item.detail}
                     for item in problems
                 ],
+                "available_read_ranges": available_read_ranges,
                 "instruction": (
                     "Correct only the inspection artifact. Do not mark a requirement "
                     "VERIFIED unless its classification-specific proof obligations "
@@ -3237,8 +3556,15 @@ def _inspection_correction_prompt(evidence: dict, problems: list[GuardProblem]) 
                     "files with read_repo_file before emitting grounded CODE facts; "
                     "emit the semantic path and complete line range, but never "
                     "invent or copy an opaque read ID. The application binds reads "
-                    "deterministically. For validation requirements cite an exact "
-                    "authoritative EXECUTION evidence_id shown in the evidence."
+                    "deterministically. For every CODE or TEST observation, choose "
+                    "start_line and end_line inside one exact returned_lines range "
+                    "listed above for the same path; never extend a range past its "
+                    "first or last returned line. For validation requirements cite "
+                    "an exact authoritative EXECUTION evidence_id shown in the "
+                    "evidence. For a negative structural requirement, replace "
+                    "irrelevant positive diff evidence with ABSENCE_OF_CHANGE for "
+                    "the exact unchanged file or directory scope; leave source_id "
+                    "empty and omit line ranges so the application can bind it."
                 ),
             },
             sort_keys=True,
@@ -3618,7 +3944,9 @@ def review_execution(
                     ledger=ledger,
                 ),
             )
-        inspection_prompt = _inspection_correction_prompt(evidence, artifact_problems)
+        inspection_prompt = _inspection_correction_prompt(
+            evidence, artifact_problems, ledger
+        )
     else:
         raise ReviewFinalizationError("inspector inspection attempts exhausted")
     resolved = _resolved_evidence(evidence, inspection_report, ledger)
@@ -3680,6 +4008,7 @@ def review_execution(
             "execution review returned an invalid structured verdict"
         ) from exc
     raw_finalizer_artifact = parsed.model_dump(mode="json")
+    parsed = _canonical_finalizer_provenance(parsed, evidence=evidence)
     parsed = _guard_repairability(parsed)
     final_problems = _accept_coverage_problems(
         parsed,

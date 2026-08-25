@@ -5,17 +5,28 @@ from collections import deque
 from pathlib import Path
 
 from acceptance.runner.conformance import (
+    REPLAY_CAVEAT,
     classify_guard_codes,
     evaluate_runs,
     fixture_class,
     main,
+    replay_recorded_run,
     run_live_fixtures,
 )
 from sweforge.guard_codes import GuardCode, GuardProblem
 from sweforge.reviewer import (
+    EvidenceKind,
+    EvidenceRef,
     ExecutionReviewResult,
+    InspectionReport,
+    InspectionStatus,
+    RequirementInspection,
     ReviewAttemptObservation,
     ReviewFinalizationError,
+    ReviewRequirementCheck,
+    ReviewRequirementStatus,
+    SemanticReviewArtifact,
+    SpecialistStageReport,
 )
 
 CLASSIFICATIONS = {
@@ -260,9 +271,7 @@ def test_live_fixture_jobs_run_concurrently_and_preserve_order(monkeypatch):
         time.sleep(0.01)
         return {"fixture": path.name}
 
-    monkeypatch.setattr(
-        "acceptance.runner.conformance.run_fixture", fake_run_fixture
-    )
+    monkeypatch.setattr("acceptance.runner.conformance.run_fixture", fake_run_fixture)
     paths = [Path("second"), Path("first")]
     assert run_live_fixtures(
         paths,
@@ -299,3 +308,94 @@ def test_runs_can_execute_concurrently_and_preserve_sample_order():
     )
     assert [record["run"] for record in report["results"]] == [1, 2]
     assert report["eventual"]["rate"] == 1.0
+
+
+def test_recorded_artifact_replay_is_deterministic_and_provider_free(tmp_path):
+    requirement_id = "plan:step:1"
+    changed_path = "src/example.py"
+    ref = EvidenceRef(
+        ref_id="diff-ref",
+        requirement_id=requirement_id,
+        kind=EvidenceKind.TRUSTED_DIFF,
+        path=changed_path,
+    )
+    inspection = InspectionReport(
+        inspections=[
+            RequirementInspection(
+                requirement_id=requirement_id,
+                status=InspectionStatus.VERIFIED,
+                evidence_refs=[ref],
+            )
+        ]
+    )
+    finalizer = ExecutionReviewResult(
+        verdict="NEEDS_FIXES",
+        summary="repair needed",
+        requirement_checks=[
+            ReviewRequirementCheck(
+                requirement_id=requirement_id,
+                status=ReviewRequirementStatus.SATISFIED,
+                evidence="diff",
+                evidence_refs=[ref],
+            )
+        ],
+    )
+    semantic = SemanticReviewArtifact(
+        implementation=SpecialistStageReport(
+            stage="IMPLEMENTATION", status="SKIPPED", applicable=False
+        ),
+        test_validation=SpecialistStageReport(
+            stage="TEST_VALIDATION", status="SKIPPED", applicable=False
+        ),
+    )
+    recorded = {
+        "run": 1,
+        "first_pass": "OK",
+        "eventual": "OK",
+        "eventual_success": True,
+        "result_verdict": "NEEDS_FIXES",
+        "raw_model_verdict": "NEEDS_FIXES",
+        "guard_veto": False,
+        "guard_codes": [],
+        "observations": [
+            {
+                "stage": "INSPECTION",
+                "attempt": 1,
+                "artifact": inspection.model_dump(mode="json"),
+                "ledger": [],
+                "error_type": None,
+            },
+            {
+                "stage": "FINALIZATION",
+                "attempt": 1,
+                "artifact": {
+                    "finalizer": finalizer.model_dump(mode="json"),
+                    "inspection": inspection.model_dump(mode="json"),
+                    "semantic_review": semantic.model_dump(mode="json"),
+                },
+                "ledger": [],
+                "error_type": None,
+            },
+        ],
+    }
+    contract = [
+        {
+            "requirement_id": requirement_id,
+            "classification": "STRUCTURAL",
+            "text": "Create the requested file.",
+        }
+    ]
+
+    replayed = replay_recorded_run(
+        recorded,
+        fixture_id="RF-7-a34d33a8",
+        expected_verdict="BLOCKED",
+        evidence={"changed_files": [changed_path], "diff": "+example\n"},
+        contract=contract,
+        classifications=CLASSIFICATIONS,
+        worktree=tmp_path,
+    )
+
+    assert replayed["outcome_changed"] is False
+    assert replayed["verdict_changed"] is False
+    assert REPLAY_CAVEAT.startswith("Replay proves what current code does")

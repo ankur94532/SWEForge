@@ -229,6 +229,7 @@ CREATE TABLE IF NOT EXISTS execution_attempts (
     completed_at TEXT,
     retry_count INTEGER NOT NULL DEFAULT 0,
     repair_recovery_count INTEGER NOT NULL DEFAULT 0,
+    review_recovery_count INTEGER NOT NULL DEFAULT 0,
     UNIQUE(thread_id, cycle_id, attempt_number)
 );
 CREATE TABLE IF NOT EXISTS execution_tool_evidence (
@@ -561,6 +562,11 @@ MAX_INITIAL_EXECUTION_RECOVERIES = 3
 
 # Crash recovery is bounded separately from executions started for an attempt.
 MAX_REPAIR_EXECUTION_RECOVERIES = 3
+# Review-infrastructure failures (provider/structured-output) previously
+# retried forever: ReviewFinalizationError escaped to the dispatcher, whose
+# backoff caps its delay at an hour but never its count. Bounded at 3 to match
+# execution, restoring the property that every retry path terminates.
+MAX_REVIEW_RECOVERIES = 3
 
 # Historical case generation is model-dependent, so it is bounded the same way.
 MAX_ISSUE_RESOLUTION_ATTEMPTS = 3
@@ -740,6 +746,7 @@ class ExecutionAttemptRecord:
     completed_at: str | None
     retry_count: int
     repair_recovery_count: int
+    review_recovery_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -1120,6 +1127,11 @@ class SQLiteGitHubStore:
             self.connection.execute(
                 "ALTER TABLE execution_attempts ADD COLUMN "
                 "repair_recovery_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "review_recovery_count" not in attempt_columns:
+            self.connection.execute(
+                "ALTER TABLE execution_attempts ADD COLUMN "
+                "review_recovery_count INTEGER NOT NULL DEFAULT 0"
             )
         repair_columns = {
             row[1]
@@ -2891,6 +2903,7 @@ class SQLiteGitHubStore:
             completed_at=row["completed_at"],
             retry_count=row["retry_count"],
             repair_recovery_count=row["repair_recovery_count"],
+            review_recovery_count=row["review_recovery_count"],
         )
 
     def execution_attempt(self, attempt_id: str) -> ExecutionAttemptRecord | None:
@@ -3747,6 +3760,38 @@ class SQLiteGitHubStore:
                     "UPDATE issue_workflow_state SET phase=?,updated_at=? WHERE thread_id=?",
                     (WorkflowPhase.REPAIR_READY.value, now, attempt["thread_id"]),
                 )
+
+    def record_review_infrastructure_failure(self, attempt_id: str, *, now: str) -> str:
+        """Count one review-infrastructure failure; fail closed at the bound.
+
+        Returns "RETRY" while budget remains, so the caller re-raises and the
+        dispatcher's existing backoff drives the next attempt, or "EXHAUSTED"
+        once the bound is reached, having moved the thread to REVIEW_BLOCKED.
+
+        The counter lives on the attempt row so a hard crash consumes budget
+        rather than resetting it -- the same reason execution retries are
+        committed before each run.
+        """
+        with self.transaction(immediate=True) as db:
+            attempt = db.execute(
+                "SELECT * FROM execution_attempts WHERE attempt_id=?", (attempt_id,)
+            ).fetchone()
+            if attempt is None:
+                raise ValueError("execution attempt is missing")
+            if attempt["review_recovery_count"] >= MAX_REVIEW_RECOVERIES:
+                db.execute(
+                    "UPDATE issue_workflow_state SET phase=?,updated_at=? "
+                    "WHERE thread_id=?",
+                    (WorkflowPhase.REVIEW_BLOCKED.value, now, attempt["thread_id"]),
+                )
+                return "EXHAUSTED"
+            db.execute(
+                "UPDATE execution_attempts "
+                "SET review_recovery_count=review_recovery_count+1 "
+                "WHERE attempt_id=?",
+                (attempt_id,),
+            )
+            return "RETRY"
 
     def recover_orphaned_initial_attempt(
         self, attempt_id: str, *, now: str, max_recoveries: int

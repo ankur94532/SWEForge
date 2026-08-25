@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from harness.github_fake import FakeGitHub
 
 from sweforge.execution import ClarificationRequestProposal
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
@@ -39,54 +40,6 @@ def git(path, *args):
 class TokenProvider:
     def token_for(self, repository, profile):
         return "installation-token"
-
-
-class FakeGitHub:
-    """Deterministic offline GitHub surface for both workflow and publisher."""
-
-    def __init__(self) -> None:
-        self.created: list[dict] = []
-        self.pulls: list[dict] = []
-
-    def repository(self, full_name):
-        return RepositoryRef(1, full_name, "main")
-
-    def issue(self, repo, number):
-        return {"labels": []}
-
-    def comments(self, repo, number):
-        return list(self.created)
-
-    def review_comments_for_pull_request(self, repo, number):
-        return list(self.created)
-
-    def create_comment(self, repo, number, body):
-        item = {
-            "id": len(self.created) + 1,
-            "body": body,
-            "created_at": f"2026-01-01T00:{len(self.created) + 10:02d}:00Z",
-        }
-        self.created.append(item)
-        return item
-
-    def create_review_comment_reply(self, repo, pull_number, comment_id, body):
-        return self.create_comment(repo, pull_number, body)
-
-    def pull_requests(self, repo, *, head, base):
-        return [item for item in self.pulls if item["head"] == head]
-
-    def create_pull_request(self, repo, *, head, base, title, body):
-        number = 40 + len(self.pulls) + 1
-        item = {
-            "number": number,
-            "html_url": f"https://github.com/example/repo/pull/{number}",
-            "head": head,
-        }
-        self.pulls.append(item)
-        return item
-
-    def bodies_with(self, token):
-        return [item for item in self.created if token in item["body"]]
 
 
 class Clock:

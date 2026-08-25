@@ -48,6 +48,9 @@ class ServerConfig:
     clarification_model: str | None = None
     capabilities_config: Path | None = None
     sandbox_provider: str | None = None
+    # Written once the singleton lock is held and polling is wired, so a test
+    # harness can wait on a real signal instead of sleeping and hoping.
+    ready_file: Path | None = None
     unsafe_local_shell: bool = False
     api_url: str = "https://api.github.com"
     api_version: str = DEFAULT_API_VERSION
@@ -344,6 +347,14 @@ class SWEForgeServer:
                 if not store.is_thread_runnable(thread_id, now=now):
                     break
 
+    def _signal_ready(self) -> None:
+        """Announce readiness only after the lock is held and polling ran once."""
+        if self.config.ready_file is None:
+            return
+        target = Path(self.config.ready_file)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
     def run(self) -> None:
         instance_lock = ServerInstanceLock(self.config.db)
         instance_lock.acquire()
@@ -361,6 +372,7 @@ class SWEForgeServer:
                     raise
                 # A transient GitHub outage must not terminate the dispatcher.
                 pass
+            self._signal_ready()
             self._submit(executor, poll_store)
             if self.config.once:
                 while True:
