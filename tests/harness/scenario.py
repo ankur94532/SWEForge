@@ -188,9 +188,37 @@ def campaign_status(results: Iterable[ScenarioResult]) -> dict:
     }
 
 
-def write_campaign_status(path: str | Path, results: Iterable[ScenarioResult]) -> dict:
+class CampaignStatusLoss(RuntimeError):
+    """A write would have dropped scenarios already recorded at this path."""
+
+
+def write_campaign_status(
+    path: str | Path, results: Iterable[ScenarioResult], *, allow_shrink: bool = False
+) -> dict:
+    """Write campaign status, refusing to silently destroy recorded evidence.
+
+    A single-scenario run once overwrote a 14-scenario campaign aggregate with
+    its own one result, and the loss was visible only as an exit condition
+    quietly dropping from 14/26 to 1/26. Evidence is the product here, so a
+    write that would drop scenarios has to be asked for.
+    """
     status = campaign_status(results)
     target = Path(path)
+    if not allow_shrink and target.exists():
+        try:
+            existing = json.loads(target.read_text())
+        except (OSError, json.JSONDecodeError):
+            existing = None
+        if isinstance(existing, dict):
+            had = {item["id"] for item in existing.get("scenarios", [])}
+            writing = {item["id"] for item in status["scenarios"]}
+            dropped = had - writing
+            if dropped:
+                raise CampaignStatusLoss(
+                    f"{target} already records {len(had)} scenario(s); this write "
+                    f"would drop {sorted(dropped)}. Pass allow_shrink=True or "
+                    "write to a run-scoped path instead."
+                )
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(status, indent=2, sort_keys=True) + "\n")
     return status

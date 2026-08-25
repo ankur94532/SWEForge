@@ -26,6 +26,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CAMPAIGN_ROOT = REPO_ROOT / "acceptance" / "reports" / "campaign"
 DEFAULT_STATUS_PATH = DEFAULT_CAMPAIGN_ROOT / "campaign-status.json"
 DEFAULT_RUNS_ROOT = DEFAULT_CAMPAIGN_ROOT / "runs"
+# A single-scenario run must not default to the campaign-wide aggregate: doing
+# so once replaced a 14-scenario campaign with one result.
+DEFAULT_SINGLE_STATUS_PATH = DEFAULT_CAMPAIGN_ROOT / "single-run-status.json"
 MANIFEST_NAME = "run-manifest.json"
 MANIFEST_VERSION = 1
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -381,7 +384,7 @@ def _parser() -> argparse.ArgumentParser:
         dest="repo_full_name",
         help="owner/name target; required and allowlisted for LIVE_GITHUB",
     )
-    run_parser.add_argument("--status", type=Path, default=DEFAULT_STATUS_PATH)
+    run_parser.add_argument("--status", type=Path, default=DEFAULT_SINGLE_STATUS_PATH)
     run_parser.add_argument("--runs-root", type=Path, default=DEFAULT_RUNS_ROOT)
     run_parser.add_argument("--run-id")
 
