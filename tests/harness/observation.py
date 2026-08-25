@@ -206,6 +206,19 @@ class Observation:
     # untyped rather than guessing an interface that does not exist yet.
     probes: Any = None
     faults: Any = None
+    # Bounded failure paths this scenario actually drove to their limit, as
+    # {path_id: {"observed": bool, "actual": int, "expected": int}}. E4 reads
+    # this. A bound is only evidence when the run reached it, so a scenario
+    # records what it saw rather than what the constant says.
+    bounded_paths: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def record_bound(self, path_id: str, *, actual: int, expected: int) -> None:
+        """Record that a bounded path was driven to a measured limit."""
+        self.bounded_paths[path_id] = {
+            "observed": True,
+            "actual": actual,
+            "expected": expected,
+        }
 
     def events_of(self, kind: str) -> list[dict]:
         return [item for item in self.events if item.get("kind") == kind]

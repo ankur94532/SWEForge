@@ -190,7 +190,14 @@ def execute_scenario(
     finally:
         if result is None:
             result = _failure(scenario_id, layer, "scenario produced no result")
-        _harness().write_campaign_status(status_path, [result])
+        # The dedicated single-run file is scratch: each run replaces the
+        # last. Any other target keeps the loss guard, so pointing --status
+        # at the campaign aggregate still cannot silently destroy it.
+        _harness().write_campaign_status(
+            status_path,
+            [result],
+            allow_shrink=status_path == DEFAULT_SINGLE_STATUS_PATH,
+        )
         if manifest_path is not None and manifest is not None:
             _record_manifest(
                 manifest_path,

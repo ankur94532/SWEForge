@@ -184,7 +184,15 @@ def s17_recovery_exhaustion(root_dir) -> Observation:
             (thread_id,),
         ).fetchone()[0]
         assert initials == 1, f"exhaustion produced {initials} INITIAL attempts"
-    return world.observation()
+        observation = world.observation()
+        # E4 needs the bound as observed, not as declared: this is the retry
+        # count the run actually reached before the path was exhausted.
+        observation.record_bound(
+            "S17_EXHAUSTION",
+            actual=final_attempt.retry_count,
+            expected=MAX_INITIAL_EXECUTION_RECOVERIES,
+        )
+    return observation
 
 
 def test_recovery_bound_exists():

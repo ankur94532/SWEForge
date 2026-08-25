@@ -8,7 +8,7 @@ retry_count=4, bound=3" without anyone reading a traceback.
 
 import json
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
@@ -51,6 +51,8 @@ class ScenarioResult:
     ok: bool
     checks: tuple[CheckOutcome, ...] = ()
     error: str | None = None
+    # Bounded failure paths this run drove to their limit; E4 reads these.
+    bounded_paths: dict = field(default_factory=dict)
 
     def failures(self) -> tuple[CheckOutcome, ...]:
         return tuple(item for item in self.checks if not item.ok)
@@ -156,7 +158,11 @@ def run(scenario_id: str, *args, **kwargs) -> ScenarioResult:
     drained = _drained(item.faults, observation)
     checks.append(CheckOutcome("FAULTS-DRAINED", drained.ok, drained.detail))
     return ScenarioResult(
-        scenario_id, item.layer, all(item.ok for item in checks), tuple(checks)
+        scenario_id,
+        item.layer,
+        all(item.ok for item in checks),
+        tuple(checks),
+        bounded_paths=dict(getattr(observation, "bounded_paths", {}) or {}),
     )
 
 
@@ -185,6 +191,13 @@ def campaign_status(results: Iterable[ScenarioResult]) -> dict:
         "total": len(ordered),
         "passed": sum(1 for item in ordered if item.ok),
         "failed": [item.scenario_id for item in ordered if not item.ok],
+        # Merged across scenarios: each bounded path is driven by whichever
+        # scenario exercises it, and E4 needs them in one place.
+        "bounded_paths": {
+            path_id: evidence
+            for item in ordered
+            for path_id, evidence in (item.bounded_paths or {}).items()
+        },
     }
 
 
