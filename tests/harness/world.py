@@ -64,6 +64,7 @@ class World:
         memory_learner=None,
         clarification_classifier=None,
         permissions: dict[str, str] | None = None,
+        client=None,
     ) -> "World":
         root.mkdir(parents=True, exist_ok=True)
         source = root / "source"
@@ -88,13 +89,25 @@ class World:
         repo = RepositoryRef(repo_id, full_name)
         store.upsert_repository(repo.repo_id, repo.full_name, "now")
         world_clock_holder: dict = {}
-        github = FakeGitHub(
-            default_repo_id=repo_id,
-            clock=lambda: world_clock_holder["clock"](),
-            # Approval requires repository write access; scenarios that are not
-            # about authorization get a writer by default.
-            permissions=permissions,
-        )
+        # A LIVE_GITHUB scenario injects a real GitHubClient here; every other
+        # layer gets the fake. The seam is the client alone, so a live body
+        # reuses the same store, engine and invariants as its L1 twin and the
+        # environment is the only thing that differs.
+        if client is not None:
+            if permissions is not None:
+                raise ValueError(
+                    "permissions apply to the fake only; a live client's "
+                    "permissions come from GitHub"
+                )
+            github = client
+        else:
+            github = FakeGitHub(
+                default_repo_id=repo_id,
+                clock=lambda: world_clock_holder["clock"](),
+                # Approval requires repository write access; scenarios that are
+                # not about authorization get a writer by default.
+                permissions=permissions,
+            )
 
         world = cls(
             root=root,
