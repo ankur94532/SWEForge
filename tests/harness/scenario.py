@@ -53,6 +53,8 @@ class ScenarioResult:
     error: str | None = None
     # Bounded failure paths this run drove to their limit; E4 reads these.
     bounded_paths: dict = field(default_factory=dict)
+    # Allowlist decisions made during this run; E8 reads these.
+    primary_audit: list = field(default_factory=list)
 
     def failures(self) -> tuple[CheckOutcome, ...]:
         return tuple(item for item in self.checks if not item.ok)
@@ -225,6 +227,21 @@ def campaign_status(results: Iterable[ScenarioResult]) -> dict:
             path_id: evidence
             for item in ordered
             for path_id, evidence in (item.bounded_paths or {}).items()
+        },
+        # E8 reads what the allowlist decided, per scenario. A mutation of a
+        # PRIMARY repository would appear here as an allowed primary target.
+        "primary_audit": {
+            "checks": [
+                dict(entry, scenario_id=item.scenario_id)
+                for item in ordered
+                for entry in (item.primary_audit or [])
+            ],
+            "primary_mutations": [
+                dict(entry, scenario_id=item.scenario_id)
+                for item in ordered
+                for entry in (item.primary_audit or [])
+                if entry.get("target_is_primary") and entry.get("allowed")
+            ],
         },
     }
 

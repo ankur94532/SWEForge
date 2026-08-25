@@ -71,6 +71,31 @@ class Allowlist:
             )
 
 
+# Every decision this guard makes, in order. E8's evidence is what the
+# allowlist actually decided, not a scenario's claim about what it targeted.
+_AUDIT: list[dict] = []
+
+
+def drain_audit() -> list[dict]:
+    """Take the recorded decisions and reset, so runs never share entries."""
+    entries = list(_AUDIT)
+    _AUDIT.clear()
+    return entries
+
+
 def check_live_target(repo_full_name: str) -> None:
     """Guard every mutating live action. Call before touching GitHub."""
-    Allowlist.from_env().check(repo_full_name)
+    name = (repo_full_name or "").strip()
+    allowlist = Allowlist.from_env()
+    entry = {
+        "repository": name,
+        "target_is_primary": name in allowlist.primary,
+        "allowed": False,
+    }
+    try:
+        allowlist.check(repo_full_name)
+    except Exception:
+        _AUDIT.append(entry)
+        raise
+    entry["allowed"] = True
+    _AUDIT.append(entry)

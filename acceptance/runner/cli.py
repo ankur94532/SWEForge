@@ -15,11 +15,12 @@ import re
 import shutil
 import sys
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from acceptance.runner.allowlist import check_live_target
+from acceptance.runner.allowlist import check_live_target, drain_audit
 from acceptance.runner.contamination import audit_snapshot, snapshot_run
 from acceptance.runner.exit_conditions import SCENARIO_SET as INTEGRATION_SCENARIO_SET
 from acceptance.runner.exit_conditions import evaluate_exit_conditions
@@ -199,6 +200,9 @@ def execute_scenario(
         )
         workspace = Path(manifest["owned_paths"][0])
         result = _harness().run(scenario_id, workspace, layer=layer)
+        # Every allowlist decision this run made, preflight included: the
+        # preflight refusal is exactly the evidence E8 wants for a live target.
+        result = replace(result, primary_audit=drain_audit())
     except Exception as exc:
         result = _failure(scenario_id, layer, exc)
     finally:
@@ -234,12 +238,16 @@ def _result_signature(result: Any) -> tuple[Any, ...]:
     )
 
 
-def _deterministic_layer(registry, scenario_id: str, live_layer):
-    """The offline layer a campaign should run this scenario at.
+def _campaign_layer(registry, scenario_id: str, live_layer, *, integration: bool):
+    """The layer a campaign should run this scenario at.
 
-    A campaign measures deterministic reproducibility, so a scenario that also
-    has a LIVE_GITHUB body must still be run at its deterministic layer.
+    A deterministic campaign measures reproducibility, so a scenario that also
+    has a LIVE_GITHUB body is still run at its deterministic layer. An
+    integration campaign runs the live body where one exists, because E1 counts
+    deterministic evidence as no substitute for a live run.
     """
+    if integration and (scenario_id, live_layer) in registry:
+        return live_layer
     candidates = [
         key[1] for key in registry if key[0] == scenario_id and key[1] is not live_layer
     ]
@@ -260,6 +268,7 @@ def execute_campaign(
     status_path: Path,
     runs_root: Path,
     campaign_id: str | None = None,
+    integration: bool = False,
 ) -> dict[str, Any]:
     """Run scenarios sequentially and retain every repetition's evidence."""
     if repetitions < 1:
@@ -297,7 +306,9 @@ def execute_campaign(
             run_id = f"pass-{repetition}-{scenario_id.lower()}"
             result = execute_scenario(
                 scenario_id,
-                _deterministic_layer(registry, scenario_id, live_layer),
+                _campaign_layer(
+                    registry, scenario_id, live_layer, integration=integration
+                ),
                 repo_full_name=None,
                 status_path=(campaign_runs_root / "per-run" / f"{run_id}-status.json"),
                 runs_root=campaign_runs_root / "scenario-runs",
@@ -486,6 +497,11 @@ def _parser() -> argparse.ArgumentParser:
     campaign_parser.add_argument("scenario_ids", nargs="+")
     campaign_parser.add_argument("--repetitions", type=int, default=2)
     campaign_parser.add_argument("--status", type=Path, default=DEFAULT_STATUS_PATH)
+    campaign_parser.add_argument(
+        "--integration",
+        action="store_true",
+        help="run each scenario at its live layer where one exists",
+    )
     campaign_parser.add_argument("--runs-root", type=Path, default=DEFAULT_RUNS_ROOT)
     campaign_parser.add_argument("--campaign-id")
 
@@ -526,6 +542,7 @@ def main(argv: list[str] | None = None) -> int:
                 status_path=args.status,
                 runs_root=args.runs_root,
                 campaign_id=args.campaign_id,
+                integration=args.integration,
             )
         except Exception as exc:
             print(f"ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
