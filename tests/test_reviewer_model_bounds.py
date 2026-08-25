@@ -2,16 +2,21 @@
 
 An unbounded provider request blocks a worker forever: a stalled connection
 held a conformance batch for 62 minutes on 3 seconds of CPU, producing neither
-a result nor an error. Retry policy belongs to SWEForge's dispatcher backoff,
-not to the provider SDK, so SDK retries stay at zero.
+a result nor an error. The per-request timeout is what prevents that.
+
+Semantic retry still belongs to SWEForge's dispatcher backoff. Transport
+retries do not: with SDK retries at zero, 153 connection blips destroyed 170
+complete reviews in one batch, because a dropped socket on a late call
+discards every call before it.
 """
 
 import inspect
 
 from sweforge import reviewer
+from sweforge.config import MODEL_TRANSIENT_RETRIES
 
 
-def test_bounded_model_sets_timeout_and_disables_sdk_retries(monkeypatch):
+def test_bounded_model_sets_timeout_and_bounds_transport_retries(monkeypatch):
     captured = {}
 
     def fake_init(model, **kwargs):
@@ -22,7 +27,7 @@ def test_bounded_model_sets_timeout_and_disables_sdk_retries(monkeypatch):
     reviewer.bounded_model("provider:some-model")
     assert captured["model"] == "provider:some-model"
     assert captured["timeout"] == reviewer.MODEL_REQUEST_TIMEOUT_SECONDS
-    assert captured["max_retries"] == 0
+    assert captured["max_retries"] == MODEL_TRANSIENT_RETRIES
 
 
 def test_no_create_agent_call_receives_a_bare_model_string():

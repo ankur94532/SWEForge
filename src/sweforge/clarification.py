@@ -6,6 +6,8 @@ from typing import Literal
 from langchain.chat_models import init_chat_model
 from pydantic import BaseModel, Field
 
+from .config import MODEL_TRANSIENT_RETRIES
+
 
 class ClarificationClassification(BaseModel):
     relationship: Literal[
@@ -36,7 +38,7 @@ Source provenance: {provenance}
 def build_clarification_classifier(model: str):
     """Build a no-tools structured classifier; model invocation is bounded."""
     classifier = init_chat_model(
-        model, max_retries=0, timeout=60
+        model, max_retries=MODEL_TRANSIENT_RETRIES, timeout=60
     ).with_structured_output(ClarificationClassification)
 
     def classify(*, clarification, event: dict) -> dict:

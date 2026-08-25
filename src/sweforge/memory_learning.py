@@ -14,6 +14,7 @@ from langchain.chat_models import init_chat_model
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
 
+from .config import MODEL_TRANSIENT_RETRIES
 from .repo_memory import append_repo_memory, read_repo_memory, repo_memory_namespace
 
 SECRET_RE = re.compile(
@@ -145,9 +146,9 @@ def curate_repository_memory(
         f"Cumulative diff:\n{diff[:40_000]}\n\nEvidence catalog (line-numbered):\n"
         + catalog_text[:60_000]
     )
-    curator = init_chat_model(model, max_retries=0, timeout=120).with_structured_output(
-        RepoMemoryCuratorResponse
-    )
+    curator = init_chat_model(
+        model, max_retries=MODEL_TRANSIENT_RETRIES, timeout=120
+    ).with_structured_output(RepoMemoryCuratorResponse)
     response = curator.invoke(prompt)
     if isinstance(response, RepoMemoryCuratorResponse):
         parsed = response

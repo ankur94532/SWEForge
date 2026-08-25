@@ -26,6 +26,7 @@ from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field, ValidationError
 
 from .agent import LiveInputMiddleware
+from .config import MODEL_TRANSIENT_RETRIES
 from .context import RepoAgentContext
 from .execution import normalize_task
 from .github_models import format_source_context
@@ -1222,13 +1223,19 @@ def _reviewer_read_tool(context: ReviewerContext) -> StructuredTool:
 # Every reviewer model path must be bounded. An unbounded request can block a
 # worker indefinitely: a stalled provider connection once held a conformance
 # batch for 62 minutes on 3 seconds of CPU, producing no result and no error.
-# Retry policy belongs to SWEForge's dispatcher backoff, not the provider SDK.
+# Semantic retry belongs to SWEForge's dispatcher backoff; transport-level
+# failures are retried here so one dropped connection cannot discard a review.
 MODEL_REQUEST_TIMEOUT_SECONDS = 120
 
 
 def bounded_model(model: str):
-    """Return a chat model with a hard per-request timeout and no SDK retries."""
-    return init_chat_model(model, max_retries=0, timeout=MODEL_REQUEST_TIMEOUT_SECONDS)
+    """Return a chat model with a hard per-request timeout and bounded
+    transport retries. See config.MODEL_TRANSIENT_RETRIES for why."""
+    return init_chat_model(
+        model,
+        max_retries=MODEL_TRANSIENT_RETRIES,
+        timeout=MODEL_REQUEST_TIMEOUT_SECONDS,
+    )
 
 
 def build_reviewer(context: ReviewerContext, *, model: str):

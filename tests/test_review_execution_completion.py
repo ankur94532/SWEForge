@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from langchain.agents.structured_output import ToolStrategy
 
+from sweforge.config import MODEL_TRANSIENT_RETRIES
 from sweforge.execution import recover_stale
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import SQLiteGitHubStore, WorkflowPhase
@@ -3871,7 +3872,12 @@ def test_split_specialists_make_at_most_one_direct_no_retry_request_each(monkeyp
     assert artifact.implementation.status is SpecialistStageStatus.COMPLETED
     assert artifact.test_validation.status is SpecialistStageStatus.COMPLETED
     assert len(direct.calls) == 2
-    assert all(kwargs == {"max_retries": 0, "timeout": 120} for _, kwargs in init_calls)
+    # Transport retries are invisible at this layer: they never add a
+    # semantic request, which is what provider_requests below asserts.
+    assert all(
+        kwargs == {"max_retries": MODEL_TRANSIENT_RETRIES, "timeout": 120}
+        for _, kwargs in init_calls
+    )
     assert artifact.implementation.provider_requests == 1
     assert artifact.test_validation.provider_requests == 1
     assert artifact.implementation.prompt_chars < 50_000

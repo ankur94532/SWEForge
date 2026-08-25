@@ -14,6 +14,8 @@ from pathlib import Path
 from langchain.chat_models import init_chat_model
 from pydantic import BaseModel, Field
 
+from .config import MODEL_TRANSIENT_RETRIES
+
 MAX_SUMMARY_CHARS = 2_000
 MAX_ISSUE_BODY_CHARS = 6_000
 MAX_DIFF_CHARS = 20_000
@@ -93,9 +95,9 @@ def curate_issue_resolution(
             f"PR={evidence.pr_number} commit={evidence.commit_sha}",
         ]
     )
-    curator = init_chat_model(model, max_retries=0, timeout=120).with_structured_output(
-        IssueResolutionCase
-    )
+    curator = init_chat_model(
+        model, max_retries=MODEL_TRANSIENT_RETRIES, timeout=120
+    ).with_structured_output(IssueResolutionCase)
     response = curator.invoke(prompt)
     if isinstance(response, IssueResolutionCase):
         return response
