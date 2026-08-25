@@ -241,3 +241,31 @@ class LiveThread:
     def approve(self):
         self.say("@agent approve")
         return self.world.engine.approve(event_key=self.last_event_key)
+
+
+def open_additional_issue(live: LiveThread, body: str) -> str:
+    """Open a second real issue in the same world and return its thread id.
+
+    Concurrency scenarios need two threads in one repository, sharing one
+    store so their isolation is observable.
+    """
+    marker = unique_marker("extra")
+    issue, _repo = create_issue(
+        live.client,
+        live.full_name,
+        title=f"[acceptance] {marker}",
+        body=f"{body}\n\nmarker: {marker}",
+    )
+    number = int(issue["number"])
+    store = live.world.store
+
+    def thread_for_issue():
+        row = store.connection.execute(
+            "SELECT thread_id FROM issue_threads WHERE repo_id=? AND issue_number=?",
+            (live.repo.repo_id, number),
+        ).fetchone()
+        return row["thread_id"] if row else None
+
+    thread_id = poll_until(live.poller, live.full_name, thread_for_issue)
+    live.world.thread_ids.add(thread_id)
+    return thread_id

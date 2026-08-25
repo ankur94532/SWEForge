@@ -204,8 +204,11 @@ def s14_singleton_server(root_dir) -> Observation:
 
 @pytest.mark.parametrize("scenario_id", ["S10", "S11", "S12", "S13", "S14"])
 def test_scenario_passes(scenario_id, tmp_path):
-    # S14 is the singleton-server scenario and is registered for L1_PROCESS;
-    # resolve each id at the layer it was actually registered for.
-    (layer,) = layers_for(scenario_id)
+    # S14 is the singleton-server scenario and is registered for L1_PROCESS,
+    # and several of these also have a LIVE_GITHUB body. Resolve each id at its
+    # deterministic layer, which is the one this module registers.
+    (layer,) = [
+        item for item in layers_for(scenario_id) if item is not Layer.LIVE_GITHUB
+    ]
     result = run(scenario_id, tmp_path / scenario_id.lower(), layer=layer)
     assert result.ok, "\n" + result.report()
