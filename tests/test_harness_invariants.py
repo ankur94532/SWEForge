@@ -817,3 +817,35 @@ def test_lock_order_fails_on_inversion():
         ),
     )
     assert not r.ok and "while holding" in r.detail
+
+
+def test_no_memory_written_passes_when_the_curator_wrote_nothing(seeded):
+    """Absence is the claim here, so zero rows is the evidence."""
+    result = check("INV-NO-MEMORY-WRITTEN", sobs(seeded))
+    assert result.ok and result.substantive, "an absence claim is not vacuous at zero"
+
+
+def test_no_memory_written_fails_when_a_candidate_was_accepted(seeded):
+    _candidate(seeded)
+    result = check("INV-NO-MEMORY-WRITTEN", sobs(seeded))
+    assert not result.ok and "were accepted" in result.detail
+
+
+def test_no_memory_written_is_substantive_where_the_universal_check_is_not(seeded):
+    """The reason this invariant exists: INV-NO-FALSE-MEMORY ranges over the
+    accepted candidates, so on an empty set it asserts nothing."""
+    universal = check("INV-NO-FALSE-MEMORY", sobs(seeded))
+    absence = check("INV-NO-MEMORY-WRITTEN", sobs(seeded))
+    assert universal.ok and not universal.substantive
+    assert absence.ok and absence.substantive
+
+
+def test_no_resolution_written_passes_when_no_row_exists(seeded):
+    result = check("INV-NO-RESOLUTION-WRITTEN", sobs(seeded))
+    assert result.ok and result.substantive
+
+
+def test_no_resolution_written_fails_when_a_row_was_written(seeded):
+    _resolution(seeded)
+    result = check("INV-NO-RESOLUTION-WRITTEN", sobs(seeded))
+    assert not result.ok and "were written" in result.detail

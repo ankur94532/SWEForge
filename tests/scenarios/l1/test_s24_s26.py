@@ -40,7 +40,7 @@ def _to_accept(world: World, thread_id: str) -> None:
 @scenario(
     "S24",
     layer=Layer.L1,
-    invariants=["INV-ONE-INITIAL", "INV-ATTEMPT-TERMINAL", "INV-NO-FALSE-MEMORY"],
+    invariants=["INV-ONE-INITIAL", "INV-ATTEMPT-TERMINAL", "INV-NO-MEMORY-WRITTEN"],
     description="A failing repo-memory curator writes no memory and isolates itself.",
 )
 def s24_repo_memory_curator_failure(root_dir) -> Observation:
@@ -74,7 +74,7 @@ def s24_repo_memory_curator_failure(root_dir) -> Observation:
 @scenario(
     "S25",
     layer=Layer.L1,
-    invariants=["INV-ATTEMPT-TERMINAL", "INV-NO-FALSE-RESOLUTION"],
+    invariants=["INV-ATTEMPT-TERMINAL", "INV-NO-RESOLUTION-WRITTEN"],
     description="A failing resolution curator writes no false resolution row.",
 )
 def s25_resolution_curator_failure(root_dir) -> Observation:

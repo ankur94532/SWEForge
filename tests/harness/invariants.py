@@ -673,6 +673,40 @@ def inv_no_false_memory(observation: Observation) -> InvariantResult:
     )
 
 
+@register("INV-NO-MEMORY-WRITTEN", "A failing curator accepts no memory candidate")
+def inv_no_memory_written(observation: Observation) -> InvariantResult:
+    """Absence is the claim, so zero is the evidence, not the lack of it.
+
+    INV-NO-FALSE-MEMORY says "every accepted candidate cites lines", which is
+    trivially true when nothing was accepted. A scenario whose point is that a
+    failing curator wrote nothing needs this instead.
+    """
+    store = _require_store(observation, "INV-NO-MEMORY-WRITTEN")
+    rows = _rows(
+        store,
+        "SELECT candidate_id FROM repo_memory_candidates WHERE status='ACCEPTED'",
+    )
+    if rows:
+        return _fail(
+            f"{len(rows)} memory candidate(s) were accepted: "
+            f"{[row[0] for row in rows[:5]]}"
+        )
+    return _ok("no memory candidate was accepted")
+
+
+@register("INV-NO-RESOLUTION-WRITTEN", "A failing curator writes no resolution row")
+def inv_no_resolution_written(observation: Observation) -> InvariantResult:
+    """Absence is the claim; see INV-NO-MEMORY-WRITTEN."""
+    store = _require_store(observation, "INV-NO-RESOLUTION-WRITTEN")
+    rows = _rows(store, "SELECT resolution_id FROM issue_resolution_memory")
+    if rows:
+        return _fail(
+            f"{len(rows)} resolution row(s) were written: "
+            f"{[row[0] for row in rows[:5]]}"
+        )
+    return _ok("no resolution row was written")
+
+
 @register("INV-LEARNING-ISOLATED", "Curator failure never invalidates a publication")
 def inv_learning_isolated(observation: Observation) -> InvariantResult:
     store = _require_store(observation, "INV-LEARNING-ISOLATED")

@@ -42,7 +42,7 @@ def _tampering_runner(**kwargs):
 @scenario(
     "S22",
     layer=Layer.L1,
-    invariants=["INV-ONE-INITIAL", "INV-ATTEMPT-TERMINAL", "INV-NO-FALSE-MEMORY"],
+    invariants=["INV-ONE-INITIAL", "INV-ATTEMPT-TERMINAL", "INV-NO-MEMORY-WRITTEN"],
     description="Protected namespaces stay denied and their stores unchanged.",
 )
 def s22_memory_and_skills_write_denial(root_dir) -> Observation:
