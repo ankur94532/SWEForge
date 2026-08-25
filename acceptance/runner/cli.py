@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from acceptance.runner.allowlist import check_live_target
+from acceptance.runner.exit_conditions import evaluate_exit_conditions
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CAMPAIGN_ROOT = REPO_ROOT / "acceptance" / "reports" / "campaign"
@@ -261,19 +262,33 @@ def execute_campaign(
     harness = _harness()
     final_results = repeated_results[-1]
     status = harness.write_campaign_status(status_path, final_results)
+    repetition_statuses = []
+    for repetition, results in enumerate(repeated_results, start=1):
+        run_status = harness.campaign_status(results)
+        for item in run_status["scenarios"]:
+            # This runner never performs a harness-level retry. SWEForge's own
+            # retry behavior remains inside the scenario and is not counted here.
+            item["harness_retries"] = 0
+            item["outcome"] = "PASS" if item["ok"] else "FAIL"
+        repetition_statuses.append({"index": repetition, "status": run_status})
+    final_by_id = {
+        item["id"]: item for item in repetition_statuses[-1]["status"]["scenarios"]
+    }
+    for item in status["scenarios"]:
+        item["harness_retries"] = final_by_id[item["id"]]["harness_retries"]
+        item["outcome"] = final_by_id[item["id"]]["outcome"]
     status.update(
         {
             "schema_version": 2,
             "campaign_id": identity,
             "generated_at": _now(),
             "requested_scenarios": requested,
-            "repetitions": [
-                {
-                    "index": repetition,
-                    "status": harness.campaign_status(results),
-                }
-                for repetition, results in enumerate(repeated_results, start=1)
-            ],
+            "repetitions": repetition_statuses,
+            "execution_integrity": {
+                "observed_ids": requested,
+                "skipped": [],
+                "substitutions": [],
+            },
             "reproducibility": {
                 "required_runs": repetitions,
                 "identical": reproducible,
@@ -383,6 +398,14 @@ def _parser() -> argparse.ArgumentParser:
         "reap", help="clean explicitly owned paths left by crashed runs"
     )
     reap_parser.add_argument("--runs-root", type=Path, default=DEFAULT_RUNS_ROOT)
+
+    exit_parser = commands.add_parser(
+        "check-exit", help="evaluate the eight campaign exit conditions"
+    )
+    exit_parser.add_argument(
+        "status", type=Path, nargs="?", default=DEFAULT_STATUS_PATH
+    )
+    exit_parser.add_argument("--output", type=Path)
     return parser
 
 
@@ -427,6 +450,24 @@ def main(argv: list[str] | None = None) -> int:
         reproducible = status["reproducibility"]["identical"]
         print(f"REPRODUCIBILITY  {'IDENTICAL' if reproducible else 'DIFFERENT'}")
         return 0 if not status["failed"] and reproducible else 1
+
+    if args.command == "check-exit":
+        try:
+            status = json.loads(args.status.read_text())
+            report = evaluate_exit_conditions(status)
+        except Exception as exc:
+            print(f"ERROR {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        if args.output is not None:
+            _atomic_json(args.output, report)
+        for condition in report["conditions"]:
+            print(
+                f"{condition['condition_id']}  {condition['state']:<15} "
+                f"{condition['detail']}"
+            )
+            print(f"  evidence: {json.dumps(condition['evidence'], sort_keys=True)}")
+        print(f"CAMPAIGN EXIT  {'READY' if report['ready'] else 'NOT READY'}")
+        return 0
 
     reaped, errors = reap_runs(args.runs_root)
     for run_id in reaped:

@@ -19,9 +19,25 @@ Scope = Literal["thread", "cycle", "repo", "campaign"]
 
 @dataclass(frozen=True, slots=True)
 class InvariantResult:
+    """The outcome of one invariant.
+
+    `substantive` separates "held over something" from "held over nothing".
+    A universally quantified check is trivially true on an empty set, so a
+    campaign that reported those as plain PASS would present the absence of
+    evidence as evidence. Absence assertions ("no permit was created") are
+    substantive at zero, because zero is the claim.
+    """
+
     ok: bool
     detail: str = ""
     evidence: dict | None = None
+    substantive: bool = True
+
+    @property
+    def status(self) -> str:
+        if not self.ok:
+            return "FAIL"
+        return "PASS" if self.substantive else "VACUOUS"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,8 +73,9 @@ def check(invariant_id: str, observation: Observation) -> InvariantResult:
     return REGISTRY[invariant_id].check(observation)
 
 
-def _ok(detail: str, **evidence) -> InvariantResult:
-    return InvariantResult(True, detail, evidence or None)
+def _ok(detail: str, *, observed: int | None = None, **evidence) -> InvariantResult:
+    """Pass. `observed=0` marks a universal check that ranged over nothing."""
+    return InvariantResult(True, detail, evidence or None, observed != 0)
 
 
 def _fail(detail: str, **evidence) -> InvariantResult:
@@ -90,7 +107,11 @@ def inv_one_root(observation: Observation) -> InvariantResult:
     extra = {tid: n for tid, n in by_thread.items() if n > 1}
     if extra:
         return _fail(f"threads with multiple roots: {extra}", counts=by_thread)
-    return _ok(f"{len(roots)} root event(s), one per thread", counts=by_thread)
+    return _ok(
+        f"{len(roots)} root event(s), one per thread",
+        observed=len(roots),
+        counts=by_thread,
+    )
 
 
 @register("INV-PLAN-CANONICAL", "One canonical plan per thread and cycle")
@@ -103,7 +124,7 @@ def inv_plan_canonical(observation: Observation) -> InvariantResult:
     duplicated = {k: v for k, v in seen.items() if len(set(v)) > 1}
     if duplicated:
         return _fail(f"multiple plans for a cycle: {duplicated}", plans=seen)
-    return _ok(f"{len(seen)} cycle(s), one plan each", plans=seen)
+    return _ok(f"{len(seen)} cycle(s), one plan each", observed=len(seen), plans=seen)
 
 
 # -- permits ---------------------------------------------------------------
@@ -135,7 +156,9 @@ def inv_permit_bound(observation: Observation) -> InvariantResult:
                 f"permit binds version {data.get('plan_version')}, "
                 f"plan is {plan.get('plan_version')}"
             )
-    return _ok(f"{len(permits)} permit(s) bound to their exact plan")
+    return _ok(
+        f"{len(permits)} permit(s) bound to their exact plan", observed=len(permits)
+    )
 
 
 @register("INV-PERMIT-NONE", "No ExecutionPermit was created")
@@ -186,7 +209,9 @@ def inv_one_initial(observation: Observation) -> InvariantResult:
     extra = {k: sorted(v) for k, v in per_cycle.items() if len(v) > 1}
     if extra:
         return _fail(f"cycles with multiple INITIAL attempts: {extra}")
-    return _ok(f"{len(per_cycle)} cycle(s), one INITIAL attempt each")
+    return _ok(
+        f"{len(per_cycle)} cycle(s), one INITIAL attempt each", observed=len(per_cycle)
+    )
 
 
 @register("INV-NO-HOT-RETRY", "No further attempt after a terminal execution failure")
@@ -277,7 +302,10 @@ def inv_plan_versioned(observation: Observation) -> InvariantResult:
             return _fail(f"repeated plan version in {key}: {versions}")
         if versions != sorted(versions):
             return _fail(f"plan versions not monotonic in {key}: {versions}")
-    return _ok(f"{len(per_cycle)} cycle(s) with monotonic plan versions")
+    return _ok(
+        f"{len(per_cycle)} cycle(s) with monotonic plan versions",
+        observed=len(per_cycle),
+    )
 
 
 # -- attempts --------------------------------------------------------------
@@ -297,7 +325,7 @@ def inv_attempt_terminal(observation: Observation) -> InvariantResult:
     dangling = sorted(a for a in started - finished if a)
     if dangling:
         return _fail(f"attempts left non-terminal: {dangling}")
-    return _ok(f"{len(started)} attempt(s), all terminal")
+    return _ok(f"{len(started)} attempt(s), all terminal", observed=len(started))
 
 
 # -- review ----------------------------------------------------------------
@@ -312,7 +340,10 @@ def inv_review_ledger_fresh(observation: Observation) -> InvariantResult:
     seqs = [i.get("seq") for i in attempts]
     if len(seqs) != len(set(seqs)):
         return _fail(f"review attempts share a sequence number: {seqs}")
-    return _ok(f"{len(attempts)} review attempt(s), each recorded separately")
+    return _ok(
+        f"{len(attempts)} review attempt(s), each recorded separately",
+        observed=len(attempts),
+    )
 
 
 @register(
@@ -354,7 +385,7 @@ def inv_provenance(observation: Observation) -> InvariantResult:
     mixed = {k: sorted(v) for k, v in roots.items() if len(v) > 1}
     if mixed:
         return _fail(f"cycles citing multiple roots: {mixed}")
-    return _ok(f"{len(roots)} cycle(s), each citing one root")
+    return _ok(f"{len(roots)} cycle(s), each citing one root", observed=len(roots))
 
 
 @register("INV-DEFERRED-PRESERVED", "A residual follow-up keeps its own deferred_id")
@@ -368,7 +399,9 @@ def inv_deferred_preserved(observation: Observation) -> InvariantResult:
         return _fail(f"deferred input without a deferred_id: {ids}")
     if len(ids) != len(set(ids)):
         return _fail(f"deferred ids reused: {ids}")
-    return _ok(f"{len(ids)} deferred input(s), each with a distinct id")
+    return _ok(
+        f"{len(ids)} deferred input(s), each with a distinct id", observed=len(ids)
+    )
 
 
 @register("INV-NO-INJECTION", "No live input is delivered during execution or review")
@@ -482,7 +515,9 @@ def inv_evidence_contiguous(observation: Observation) -> InvariantResult:
             return _fail(f"duplicate evidence sequence in {key}: {seq}")
         if seq != list(range(seq[0], seq[0] + len(seq))):
             return _fail(f"evidence sequence has a gap in {key}: {seq}")
-    return _ok(f"{len(per_cycle)} cycle(s) with contiguous evidence")
+    return _ok(
+        f"{len(per_cycle)} cycle(s) with contiguous evidence", observed=len(per_cycle)
+    )
 
 
 @register("INV-EVIDENCE-TRUSTED", "Every review evidence id resolves to a stored row")
@@ -504,7 +539,10 @@ def inv_evidence_trusted(observation: Observation) -> InvariantResult:
                 dangling.append(f"{review_id}:{source}")
     if dangling:
         return _fail(f"review cites unknown execution evidence: {dangling[:5]}")
-    return _ok(f"all cited execution evidence resolves ({len(known)} row(s))")
+    return _ok(
+        f"all cited execution evidence resolves ({len(known)} row(s))",
+        observed=len(known),
+    )
 
 
 @register(
@@ -531,7 +569,10 @@ def inv_review_grounded(observation: Observation) -> InvariantResult:
                     f"accepted review {review_id} has an ungrounded requirement: "
                     f"{check_item.get('requirement_id')}"
                 )
-    return _ok(f"{len(accepted)} accepted review(s), every requirement grounded")
+    return _ok(
+        f"{len(accepted)} accepted review(s), every requirement grounded",
+        observed=len(accepted),
+    )
 
 
 # -- publication -----------------------------------------------------------
@@ -552,7 +593,7 @@ def inv_pub_mapping(observation: Observation) -> InvariantResult:
     multi = {k: sorted(v) for k, v in by_thread.items() if len(v) > 1}
     if multi:
         return _fail(f"threads mapped to multiple pull requests: {multi}")
-    return _ok(f"{len(rows)} mapping(s), each exact and unique")
+    return _ok(f"{len(rows)} mapping(s), each exact and unique", observed=len(rows))
 
 
 @register("INV-PUB-AUTHORIZED", "Every publication cites its own cycle's ACCEPT review")
@@ -578,7 +619,10 @@ def inv_pub_authorized(observation: Observation) -> InvariantResult:
                 f"publication {publication_id} ({status}) has no ACCEPT review "
                 f"for cycle {(thread_id, cycle_id)}"
             )
-    return _ok(f"{len(publications)} publication(s), each authorized by its own cycle")
+    return _ok(
+        f"{len(publications)} publication(s), each authorized by its own cycle",
+        observed=len(publications),
+    )
 
 
 # -- learning --------------------------------------------------------------
@@ -605,7 +649,7 @@ def inv_no_false_resolution(observation: Observation) -> InvariantResult:
     ]
     if orphans:
         return _fail(f"resolution rows without a finalized publication: {orphans[:5]}")
-    return _ok(f"{len(rows)} resolution row(s), all finalized")
+    return _ok(f"{len(rows)} resolution row(s), all finalized", observed=len(rows))
 
 
 @register("INV-NO-FALSE-MEMORY", "No memory candidate accepted without cited evidence")
@@ -623,7 +667,10 @@ def inv_no_false_memory(observation: Observation) -> InvariantResult:
     ]
     if ungrounded:
         return _fail(f"accepted memory without cited lines: {ungrounded[:5]}")
-    return _ok(f"{len(rows)} accepted candidate(s), each citing repository lines")
+    return _ok(
+        f"{len(rows)} accepted candidate(s), each citing repository lines",
+        observed=len(rows),
+    )
 
 
 @register("INV-LEARNING-ISOLATED", "Curator failure never invalidates a publication")
@@ -677,7 +724,10 @@ def inv_worktree_confined(observation: Observation) -> InvariantResult:
             changed.append(f"{path} (modified)")
     if changed:
         return _fail(f"paths outside the worktree were touched: {changed}")
-    return _ok(f"{len(observation.outside_markers)} outside path(s) unchanged")
+    return _ok(
+        f"{len(observation.outside_markers)} outside path(s) unchanged",
+        observed=len(observation.outside_markers),
+    )
 
 
 @register("INV-LOCK-ORDER", "Thread lock is never taken while holding a repo git lock")
@@ -692,4 +742,4 @@ def inv_lock_order(observation: Observation) -> InvariantResult:
                 f"(held: {held})"
             )
         held.append(kind)
-    return _ok(f"{len(held)} lock acquisition(s) in a legal order")
+    return _ok(f"{len(held)} lock acquisition(s) in a legal order", observed=len(held))

@@ -1,0 +1,623 @@
+"""Machine-check the eight acceptance-campaign exit conditions.
+
+Missing evidence is deliberately distinct from evidence of failure.  An empty
+or partial campaign can never become successful merely because a field was not
+recorded.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from enum import StrEnum
+from typing import Any
+
+SCENARIO_IDS = tuple(f"S{number}" for number in range(1, 27))
+SCENARIO_SET = frozenset(SCENARIO_IDS)
+LIVE_GITHUB_IDS = frozenset(
+    {"S1", "S2", "S4", "S8", "S9", "S10", "S11", "S15", "S16", "S18", "S19", "S20"}
+)
+BOUNDED_PATHS = (
+    "S8_TIMEOUT",
+    "S17_EXHAUSTION",
+    "S26_BACKOFF",
+    "EXECUTION_RETRY_X3",
+)
+MODEL_COMPONENTS = (
+    "reviewer-inspection",
+    "reviewer-specialists",
+    "reviewer-challenge",
+    "reviewer-finalize",
+    "planner",
+    "clarification-classifier",
+    "curators",
+)
+
+
+class ExitState(StrEnum):
+    MET = "MET"
+    UNMET = "UNMET"
+    CANNOT_EVALUATE = "CANNOT_EVALUATE"
+
+
+@dataclass(frozen=True, slots=True)
+class ExitConditionResult:
+    condition_id: str
+    description: str
+    state: ExitState
+    detail: str
+    evidence: dict[str, Any]
+
+    def payload(self) -> dict[str, Any]:
+        result = asdict(self)
+        result["state"] = self.state.value
+        return result
+
+
+def _result(
+    condition_id: str,
+    description: str,
+    state: ExitState,
+    detail: str,
+    **evidence: Any,
+) -> ExitConditionResult:
+    return ExitConditionResult(condition_id, description, state, detail, evidence)
+
+
+def _scenario_records(value: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        return None
+    return value
+
+
+def _record_ids(records: list[dict[str, Any]]) -> list[str]:
+    return [str(item.get("id", "")) for item in records]
+
+
+def _condition_1(status: dict[str, Any]) -> ExitConditionResult:
+    description = "All 26 scenarios pass independently under their own ids."
+    records = _scenario_records(status.get("scenarios"))
+    if not records:
+        return _result(
+            "E1",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "no scenario result records were supplied",
+            observed=0,
+            required=26,
+        )
+    ids = _record_ids(records)
+    duplicates = sorted({item for item in ids if ids.count(item) > 1})
+    unexpected = sorted(set(ids) - SCENARIO_SET)
+    failed = sorted(
+        str(item.get("id")) for item in records if item.get("ok") is not True
+    )
+    if duplicates or unexpected or failed:
+        return _result(
+            "E1",
+            description,
+            ExitState.UNMET,
+            "recorded scenario results are not 26 independent passes",
+            observed=len(records),
+            duplicates=duplicates,
+            unexpected=unexpected,
+            failed=failed,
+        )
+    missing = sorted(SCENARIO_SET - set(ids))
+    if missing:
+        return _result(
+            "E1",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            f"results exist for {len(set(ids))} of 26 scenarios",
+            observed=len(set(ids)),
+            required=26,
+            missing=missing,
+        )
+    return _result(
+        "E1",
+        description,
+        ExitState.MET,
+        "26 unique scenario records all report PASS",
+        observed=26,
+        passed=26,
+    )
+
+
+def _condition_2(status: dict[str, Any]) -> ExitConditionResult:
+    description = "No scenario is skipped or substituted by another result."
+    audit = status.get("execution_integrity")
+    if not isinstance(audit, dict):
+        return _result(
+            "E2",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "execution_integrity evidence was not recorded",
+            required_fields=["observed_ids", "skipped", "substitutions"],
+        )
+    observed = audit.get("observed_ids")
+    skipped = audit.get("skipped")
+    substitutions = audit.get("substitutions")
+    if not all(isinstance(item, list) for item in (observed, skipped, substitutions)):
+        return _result(
+            "E2",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "execution_integrity evidence is incomplete",
+            recorded_fields=sorted(audit),
+        )
+    duplicates = sorted({item for item in observed if observed.count(item) > 1})
+    unexpected = sorted(set(observed) - SCENARIO_SET)
+    if skipped or substitutions or duplicates or unexpected:
+        return _result(
+            "E2",
+            description,
+            ExitState.UNMET,
+            "skip, substitution, duplicate, or unexpected-id evidence was recorded",
+            skipped=skipped,
+            substitutions=substitutions,
+            duplicates=duplicates,
+            unexpected=unexpected,
+        )
+    missing = sorted(SCENARIO_SET - set(observed))
+    if missing:
+        return _result(
+            "E2",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "integrity audit does not cover all 26 scenarios",
+            observed=len(set(observed)),
+            missing=missing,
+        )
+    return _result(
+        "E2",
+        description,
+        ExitState.MET,
+        "integrity audit covers 26 scenarios with no skip or substitution",
+        observed=26,
+        skipped=[],
+        substitutions=[],
+    )
+
+
+def _condition_3(status: dict[str, Any]) -> ExitConditionResult:
+    description = "Every deterministic scenario has three consecutive clean runs."
+    repetitions = status.get("repetitions")
+    reproducibility = status.get("reproducibility")
+    if not isinstance(repetitions, list) or not isinstance(reproducibility, dict):
+        return _result(
+            "E3",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "repetition or reproducibility evidence was not recorded",
+        )
+    if len(repetitions) < 3:
+        return _result(
+            "E3",
+            description,
+            ExitState.UNMET,
+            f"only {len(repetitions)} consecutive run(s) were recorded",
+            observed_runs=len(repetitions),
+            required_runs=3,
+        )
+    recent = repetitions[-3:]
+    observed_sets = []
+    failures = []
+    for repetition in recent:
+        run_status = repetition.get("status") if isinstance(repetition, dict) else None
+        records = _scenario_records(
+            run_status.get("scenarios") if isinstance(run_status, dict) else None
+        )
+        if records is None:
+            return _result(
+                "E3",
+                description,
+                ExitState.CANNOT_EVALUATE,
+                "one of the last three runs has no scenario records",
+            )
+        ids = set(_record_ids(records))
+        observed_sets.append(ids)
+        failures.extend(
+            str(item.get("id")) for item in records if item.get("ok") is not True
+        )
+    if failures:
+        return _result(
+            "E3",
+            description,
+            ExitState.UNMET,
+            "a scenario failed in the last three runs",
+            failed=sorted(set(failures)),
+        )
+    missing = sorted(SCENARIO_SET - set.intersection(*observed_sets))
+    if missing:
+        return _result(
+            "E3",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "three runs exist but do not cover every deterministic scenario",
+            missing=missing,
+        )
+    per_scenario = reproducibility.get("scenarios")
+    if not isinstance(per_scenario, dict):
+        return _result(
+            "E3",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "per-scenario identity comparison was not recorded",
+        )
+    different = sorted(
+        scenario_id
+        for scenario_id in SCENARIO_IDS
+        if not isinstance(per_scenario.get(scenario_id), dict)
+        or per_scenario[scenario_id].get("identical") is not True
+    )
+    if different:
+        return _result(
+            "E3",
+            description,
+            ExitState.UNMET,
+            "one or more scenario results differed between repetitions",
+            different=different,
+        )
+    return _result(
+        "E3",
+        description,
+        ExitState.MET,
+        "the last three runs contain identical clean results for all 26 scenarios",
+        runs=3,
+        scenarios=26,
+    )
+
+
+def _condition_4(status: dict[str, Any]) -> ExitConditionResult:
+    description = "Every bounded failure path is observed at its exact bound."
+    paths = status.get("bounded_paths")
+    if not isinstance(paths, dict):
+        return _result(
+            "E4",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "bounded_paths evidence was not recorded",
+            required=list(BOUNDED_PATHS),
+        )
+    missing = [item for item in BOUNDED_PATHS if not isinstance(paths.get(item), dict)]
+    if missing:
+        return _result(
+            "E4",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "one or more bounded paths have no observation",
+            missing=missing,
+        )
+    invalid = {}
+    incomplete = []
+    for path_id in BOUNDED_PATHS:
+        evidence = paths[path_id]
+        if (
+            evidence.get("observed") is not True
+            or "actual" not in evidence
+            or "expected" not in evidence
+        ):
+            incomplete.append(path_id)
+        elif evidence["actual"] != evidence["expected"]:
+            invalid[path_id] = {
+                "actual": evidence["actual"],
+                "expected": evidence["expected"],
+            }
+    if incomplete:
+        return _result(
+            "E4",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "recorded bounded-path evidence is not observable or complete",
+            incomplete=incomplete,
+        )
+    if invalid:
+        return _result(
+            "E4",
+            description,
+            ExitState.UNMET,
+            "one or more failure paths did not hit the declared bound exactly",
+            mismatches=invalid,
+        )
+    return _result(
+        "E4",
+        description,
+        ExitState.MET,
+        "all four bounded paths were observed at their exact bound",
+        paths={
+            item: {"actual": paths[item]["actual"], "expected": paths[item]["expected"]}
+            for item in BOUNDED_PATHS
+        },
+    )
+
+
+def _condition_5(status: dict[str, Any]) -> ExitConditionResult:
+    description = "All seven model-dependent components meet conformance thresholds."
+    components = status.get("model_components")
+    if not isinstance(components, dict):
+        return _result(
+            "E5",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "model_components certification evidence was not recorded",
+            required=list(MODEL_COMPONENTS),
+        )
+    missing = []
+    for component_id in MODEL_COMPONENTS:
+        if not isinstance(components.get(component_id), dict):
+            missing.append(component_id)
+    if missing:
+        return _result(
+            "E5",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "certification does not cover all seven components",
+            missing=missing,
+        )
+    required_fields = {
+        "first_pass_rate",
+        "first_pass_threshold",
+        "eventual_rate",
+        "eventual_threshold",
+        "class_a_count",
+        "unclassified_count",
+    }
+    metric_records = {
+        component_id: components[component_id]
+        for component_id in MODEL_COMPONENTS
+        if component_id != "curators"
+    }
+    curators = components["curators"]
+    curator_tracks = ("repo-memory", "resolution")
+    if not all(isinstance(curators.get(track), dict) for track in curator_tracks):
+        return _result(
+            "E5",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "curator certification must report repo-memory and resolution separately",
+            required_curator_tracks=list(curator_tracks),
+        )
+    for track in curator_tracks:
+        metric_records[f"curators/{track}"] = curators[track]
+
+    incomplete = []
+    for component_id, metrics in metric_records.items():
+        if not required_fields <= set(metrics):
+            incomplete.append(component_id)
+    if incomplete:
+        return _result(
+            "E5",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "one or more component records omit required metrics",
+            incomplete=incomplete,
+            required_fields=sorted(required_fields),
+        )
+    failed = []
+    for component_id, item in metric_records.items():
+        try:
+            passed = (
+                float(item["first_pass_rate"]) >= float(item["first_pass_threshold"])
+                and float(item["eventual_rate"]) >= float(item["eventual_threshold"])
+                and int(item["class_a_count"]) == 0
+                and int(item["unclassified_count"]) == 0
+            )
+        except (TypeError, ValueError):
+            return _result(
+                "E5",
+                description,
+                ExitState.CANNOT_EVALUATE,
+                f"component {component_id} contains non-numeric metrics",
+                component=component_id,
+            )
+        if not passed:
+            failed.append(component_id)
+    if failed:
+        return _result(
+            "E5",
+            description,
+            ExitState.UNMET,
+            "one or more model-dependent components missed a threshold",
+            failed=failed,
+        )
+    return _result(
+        "E5",
+        description,
+        ExitState.MET,
+        "all seven components meet thresholds, including both curator tracks",
+        components=list(MODEL_COMPONENTS),
+        curator_tracks=list(curator_tracks),
+    )
+
+
+def _condition_6(status: dict[str, Any]) -> ExitConditionResult:
+    description = "The full campaign has zero contamination-detector violations."
+    contamination = status.get("contamination")
+    if not isinstance(contamination, dict):
+        return _result(
+            "E6",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "campaign-wide contamination evidence was not recorded",
+        )
+    checks = contamination.get("checks")
+    violations = contamination.get("violations")
+    observed_ids = contamination.get("observed_ids")
+    if not isinstance(checks, int) or checks <= 0 or not isinstance(violations, list):
+        return _result(
+            "E6",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "contamination evidence has no positive observation count",
+            checks=checks,
+        )
+    if violations:
+        return _result(
+            "E6",
+            description,
+            ExitState.UNMET,
+            "contamination-detector violations were recorded",
+            checks=checks,
+            violations=violations,
+        )
+    if not isinstance(observed_ids, list) or set(observed_ids) != SCENARIO_SET:
+        return _result(
+            "E6",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "zero recorded violations does not cover all 26 scenarios",
+            checks=checks,
+            observed_ids=observed_ids,
+        )
+    return _result(
+        "E6",
+        description,
+        ExitState.MET,
+        "positive detector evidence covers 26 scenarios with zero violations",
+        checks=checks,
+        violations=0,
+    )
+
+
+def _condition_7(status: dict[str, Any]) -> ExitConditionResult:
+    description = "The final run contains no PASS-WITH-RETRY result."
+    repetitions = status.get("repetitions")
+    if not isinstance(repetitions, list) or not repetitions:
+        return _result(
+            "E7",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "no final run was recorded",
+        )
+    final = repetitions[-1]
+    final_status = final.get("status") if isinstance(final, dict) else None
+    records = _scenario_records(
+        final_status.get("scenarios") if isinstance(final_status, dict) else None
+    )
+    if not records:
+        return _result(
+            "E7",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "the final run has no scenario result records",
+        )
+    missing = sorted(SCENARIO_SET - set(_record_ids(records)))
+    if missing:
+        return _result(
+            "E7",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "the recorded final run is not the complete 26-scenario run",
+            missing=missing,
+        )
+    if any("harness_retries" not in item for item in records):
+        return _result(
+            "E7",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "harness retry counts were not recorded for every final result",
+        )
+    retried = sorted(
+        str(item.get("id"))
+        for item in records
+        if item.get("outcome") == "PASS_WITH_RETRY"
+        or not isinstance(item.get("harness_retries"), int)
+        or item["harness_retries"] != 0
+    )
+    if retried:
+        return _result(
+            "E7",
+            description,
+            ExitState.UNMET,
+            "one or more final results used a harness retry",
+            retried=retried,
+        )
+    return _result(
+        "E7",
+        description,
+        ExitState.MET,
+        "all 26 final results explicitly record zero harness retries",
+        scenarios=26,
+        harness_retries=0,
+    )
+
+
+def _condition_8(status: dict[str, Any]) -> ExitConditionResult:
+    description = "PRIMARY is untouched, verified by the allowlist audit log."
+    audit = status.get("primary_audit")
+    if not isinstance(audit, dict):
+        return _result(
+            "E8",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "PRIMARY allowlist audit evidence was not recorded",
+            required_live_github=sorted(LIVE_GITHUB_IDS),
+        )
+    checks = audit.get("checks")
+    mutations = audit.get("primary_mutations")
+    if not isinstance(checks, list) or not checks or not isinstance(mutations, list):
+        return _result(
+            "E8",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "allowlist audit log is missing checks or mutation evidence",
+        )
+    if mutations:
+        return _result(
+            "E8",
+            description,
+            ExitState.UNMET,
+            "the audit log records a PRIMARY mutation",
+            primary_mutations=mutations,
+        )
+    audited = {
+        str(item.get("scenario_id"))
+        for item in checks
+        if isinstance(item, dict)
+        and item.get("allowed") is True
+        and item.get("target_is_primary") is False
+    }
+    missing = sorted(LIVE_GITHUB_IDS - audited)
+    if missing:
+        return _result(
+            "E8",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "allowlist audit does not cover every LIVE-GITHUB scenario",
+            audited=sorted(audited),
+            missing=missing,
+        )
+    return _result(
+        "E8",
+        description,
+        ExitState.MET,
+        "all 12 LIVE-GITHUB scenarios have non-PRIMARY allowlist audit entries",
+        audited=sorted(audited),
+        primary_mutations=0,
+    )
+
+
+def evaluate_exit_conditions(status: dict[str, Any]) -> dict[str, Any]:
+    """Return a machine-readable report without treating missing data as success."""
+    if not isinstance(status, dict):
+        raise TypeError("campaign status must be a JSON object")
+    conditions = [
+        _condition_1(status),
+        _condition_2(status),
+        _condition_3(status),
+        _condition_4(status),
+        _condition_5(status),
+        _condition_6(status),
+        _condition_7(status),
+        _condition_8(status),
+    ]
+    counts = {
+        state.value: sum(item.state is state for item in conditions)
+        for state in ExitState
+    }
+    return {
+        "schema_version": 1,
+        "ready": all(item.state is ExitState.MET for item in conditions),
+        "summary": counts,
+        "conditions": [item.payload() for item in conditions],
+    }

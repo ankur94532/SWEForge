@@ -30,11 +30,18 @@ class CheckOutcome:
     invariant_id: str
     ok: bool
     detail: str = ""
+    substantive: bool = True
+
+    @property
+    def status(self) -> str:
+        """VACUOUS keeps a check that ranged over nothing from reading as
+        evidence; it still holds, so it does not fail the scenario."""
+        if not self.ok:
+            return "FAIL"
+        return "PASS" if self.substantive else "VACUOUS"
 
     def line(self) -> str:
-        return (
-            f"  {self.invariant_id:<32} {'PASS' if self.ok else 'FAIL'}  {self.detail}"
-        )
+        return f"  {self.invariant_id:<32} {self.status:<7} {self.detail}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +150,9 @@ def run(scenario_id: str, *args, **kwargs) -> ScenarioResult:
             # returning empty.
             checks.append(CheckOutcome(invariant_id, False, f"unevaluable: {exc}"))
             continue
-        checks.append(CheckOutcome(invariant_id, result.ok, result.detail))
+        checks.append(
+            CheckOutcome(invariant_id, result.ok, result.detail, result.substantive)
+        )
     drained = _drained(item.faults, observation)
     checks.append(CheckOutcome("FAULTS-DRAINED", drained.ok, drained.detail))
     return ScenarioResult(
@@ -162,7 +171,12 @@ def campaign_status(results: Iterable[ScenarioResult]) -> dict:
                 "ok": item.ok,
                 "error": item.error,
                 "checks": [
-                    {"invariant": c.invariant_id, "ok": c.ok, "detail": c.detail}
+                    {
+                        "invariant": c.invariant_id,
+                        "ok": c.ok,
+                        "status": c.status,
+                        "detail": c.detail,
+                    }
                     for c in item.checks
                 ],
             }

@@ -18,6 +18,11 @@ def test_campaign_runs_registered_layer_twice_and_retains_evidence(tmp_path):
     assert status["total"] == status["passed"] == 1
     assert status["failed"] == []
     assert status["requested_scenarios"] == ["S14"]
+    assert status["execution_integrity"] == {
+        "observed_ids": ["S14"],
+        "skipped": [],
+        "substitutions": [],
+    }
     assert len(status["repetitions"]) == 2
     for repetition in status["repetitions"]:
         (result,) = repetition["status"]["scenarios"]
@@ -25,6 +30,8 @@ def test_campaign_runs_registered_layer_twice_and_retains_evidence(tmp_path):
         assert result["layer"] == "L1_PROCESS"
         assert result["checks"], "per-invariant evidence was discarded"
         assert all(check["ok"] for check in result["checks"])
+        assert result["harness_retries"] == 0
+        assert result["outcome"] == "PASS"
     assert status["reproducibility"] == {
         "required_runs": 2,
         "identical": True,
