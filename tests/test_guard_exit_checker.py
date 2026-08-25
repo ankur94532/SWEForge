@@ -8,6 +8,8 @@ from acceptance.runner.exit_conditions import (
     evaluate_exit_conditions,
 )
 
+DETERMINISTIC_IDS = (*SCENARIO_IDS, "S27", "S28")
+
 
 def _states(report):
     return {item["condition_id"]: item["state"] for item in report["conditions"]}
@@ -17,8 +19,18 @@ def _scenario_records(*, retries=False):
     return [
         {
             "id": scenario_id,
+            "layer": (
+                "LIVE_GITHUB" if scenario_id in LIVE_GITHUB_IDS else "LIVE_PROCESS"
+            ),
             "ok": True,
-            "checks": [{"invariant": "CONTROL", "ok": True, "detail": "observed"}],
+            "checks": [
+                {
+                    "invariant": "CONTROL",
+                    "ok": True,
+                    "status": "PASS",
+                    "detail": "observed",
+                }
+            ],
             "harness_retries": 1 if retries and scenario_id == "S1" else 0,
             "outcome": "PASS_WITH_RETRY" if retries and scenario_id == "S1" else "PASS",
         }
@@ -26,18 +38,42 @@ def _scenario_records(*, retries=False):
     ]
 
 
+def _deterministic_records(*, retries=False):
+    records = _scenario_records(retries=retries)
+    records.extend(
+        {
+            "id": scenario_id,
+            "layer": "L1",
+            "ok": True,
+            "checks": [
+                {
+                    "invariant": "CONTROL",
+                    "ok": True,
+                    "status": "PASS",
+                    "detail": "observed",
+                }
+            ],
+            "harness_retries": 0,
+            "outcome": "PASS",
+        }
+        for scenario_id in ("S27", "S28")
+    )
+    return records
+
+
 def _complete_status():
     records = _scenario_records()
     return {
         "scenarios": records,
         "requested_scenarios": list(SCENARIO_IDS),
+        "deterministic_scenarios": list(DETERMINISTIC_IDS),
         "execution_integrity": {
             "observed_ids": list(SCENARIO_IDS),
             "skipped": [],
             "substitutions": [],
         },
         "repetitions": [
-            {"index": number, "status": {"scenarios": _scenario_records()}}
+            {"index": number, "status": {"scenarios": _deterministic_records()}}
             for number in range(1, 4)
         ],
         "reproducibility": {
@@ -45,7 +81,7 @@ def _complete_status():
             "identical": True,
             "scenarios": {
                 scenario_id: {"identical": True, "runs": 3}
-                for scenario_id in SCENARIO_IDS
+                for scenario_id in DETERMINISTIC_IDS
             },
         },
         "bounded_paths": {
@@ -114,6 +150,44 @@ def test_aggregate_curator_metric_cannot_cover_two_independent_tracks():
     assert _states(report)["E5"] == "CANNOT_EVALUATE"
 
 
+def test_deterministic_l1_results_do_not_substitute_for_live_github_evidence():
+    status = _complete_status()
+    for record in status["scenarios"]:
+        record["layer"] = "L1"
+    for repetition in status["repetitions"]:
+        for record in repetition["status"]["scenarios"]:
+            record["layer"] = "L1"
+
+    report = evaluate_exit_conditions(status)
+    states = _states(report)
+    assert states["E3"] == "MET"
+    assert states["E1"] == states["E2"] == states["E7"] == "CANNOT_EVALUATE"
+    for condition_id in ("E1", "E2", "E7"):
+        condition = next(
+            item
+            for item in report["conditions"]
+            if item["condition_id"] == condition_id
+        )
+        assert condition["evidence"]["missing"] == sorted(LIVE_GITHUB_IDS)
+
+
+def test_vacuous_invariant_cannot_satisfy_deterministic_repetition_evidence():
+    status = _complete_status()
+    status["repetitions"][1]["status"]["scenarios"][0]["checks"][0]["status"] = (
+        "VACUOUS"
+    )
+
+    condition = next(
+        item
+        for item in evaluate_exit_conditions(status)["conditions"]
+        if item["condition_id"] == "E3"
+    )
+    assert condition["state"] == "CANNOT_EVALUATE"
+    assert condition["evidence"]["vacuous"] == [
+        {"scenario_id": "S1", "invariant": "CONTROL"}
+    ]
+
+
 def test_partial_two_run_campaign_is_precise_about_unknown_and_unmet():
     status = {
         "scenarios": [{"id": "S14", "ok": True, "checks": [{"ok": True}]}],
@@ -140,7 +214,9 @@ def test_explicit_negative_evidence_is_unmet_not_unknown():
     status["bounded_paths"]["S8_TIMEOUT"]["actual"] = 4
     status["model_components"]["planner"]["first_pass_rate"] = 0.5
     status["contamination"]["violations"] = [{"scenario_id": "S11"}]
-    status["repetitions"][-1]["status"]["scenarios"] = _scenario_records(retries=True)
+    status["repetitions"][-1]["status"]["scenarios"] = _deterministic_records(
+        retries=True
+    )
     status["primary_audit"]["primary_mutations"] = [{"repo": "PRIMARY"}]
 
     states = _states(evaluate_exit_conditions(status))

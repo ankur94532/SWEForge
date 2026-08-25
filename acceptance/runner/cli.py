@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from acceptance.runner.allowlist import check_live_target
+from acceptance.runner.contamination import audit_snapshot, snapshot_run
+from acceptance.runner.exit_conditions import SCENARIO_SET as INTEGRATION_SCENARIO_SET
 from acceptance.runner.exit_conditions import evaluate_exit_conditions
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -99,6 +101,11 @@ def _validate_run_id(run_id: str) -> str:
             "letters, digits, '.', '_' or '-'"
         )
     return run_id
+
+
+def _scenario_sort_key(scenario_id: str) -> tuple[int, str]:
+    match = re.fullmatch(r"S(\d+)", scenario_id)
+    return (int(match.group(1)), scenario_id) if match else (sys.maxsize, scenario_id)
 
 
 def _create_manifest(
@@ -243,8 +250,13 @@ def execute_campaign(
         raise KeyError(f"unknown campaign scenarios: {', '.join(unknown)}")
 
     identity = _validate_run_id(campaign_id or _new_run_id("campaign"))
+    deterministic_scenarios = sorted(registry, key=_scenario_sort_key)
     campaign_runs_root = runs_root.expanduser().resolve() / identity
     repeated_results: list[list[Any]] = []
+    contamination_snapshots = []
+    contamination_checks = 0
+    contamination_violations: list[dict[str, Any]] = []
+    contamination_observed: set[str] = set()
     for repetition in range(1, repetitions + 1):
         current = []
         for scenario_id in requested:
@@ -258,6 +270,33 @@ def execute_campaign(
                 run_id=run_id,
             )
             current.append(result)
+            workspace = campaign_runs_root / "scenario-runs" / run_id / "workspace"
+            try:
+                captured = snapshot_run(scenario_id, repetition, workspace)
+            except Exception as exc:
+                contamination_violations.append(
+                    {
+                        "scenario_id": scenario_id,
+                        "repetition": repetition,
+                        "kind": "unevaluable",
+                        "detail": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            else:
+                contamination_snapshots.append(captured)
+                contamination_checks += captured.checks
+                contamination_violations.extend(captured.violations)
+                contamination_observed.add(scenario_id)
+
+            # Recheck every earlier run after each scenario. A scenario that
+            # writes into a prior workspace is a campaign isolation failure,
+            # even if both scenarios pass their own invariants.
+            for captured in contamination_snapshots:
+                checks, violations = audit_snapshot(
+                    captured, after_scenario_id=scenario_id
+                )
+                contamination_checks += checks
+                contamination_violations.extend(violations)
         repeated_results.append(current)
 
     per_scenario = {}
@@ -289,10 +328,11 @@ def execute_campaign(
         item["outcome"] = final_by_id[item["id"]]["outcome"]
     status.update(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "campaign_id": identity,
             "generated_at": _now(),
             "requested_scenarios": requested,
+            "deterministic_scenarios": deterministic_scenarios,
             "repetitions": repetition_statuses,
             "execution_integrity": {
                 "observed_ids": requested,
@@ -303,6 +343,17 @@ def execute_campaign(
                 "required_runs": repetitions,
                 "identical": reproducible,
                 "scenarios": per_scenario,
+            },
+            "contamination": {
+                "checks": contamination_checks,
+                "violations": contamination_violations,
+                "observed_ids": sorted(
+                    contamination_observed & INTEGRATION_SCENARIO_SET
+                ),
+                "auxiliary_observed_ids": sorted(
+                    contamination_observed - INTEGRATION_SCENARIO_SET
+                ),
+                "snapshots": [item.payload() for item in contamination_snapshots],
             },
         }
     )
@@ -453,13 +504,21 @@ def main(argv: list[str] | None = None) -> int:
                 if result["error"]:
                     print(f"  scenario body raised: {result['error']}")
                 for check in result["checks"]:
-                    check_verdict = "PASS" if check["ok"] else "FAIL"
+                    check_verdict = check.get(
+                        "status", "PASS" if check["ok"] else "FAIL"
+                    )
                     print(
                         f"  {check['invariant']:<32} {check_verdict}  {check['detail']}"
                     )
         reproducible = status["reproducibility"]["identical"]
         print(f"REPRODUCIBILITY  {'IDENTICAL' if reproducible else 'DIFFERENT'}")
-        return 0 if not status["failed"] and reproducible else 1
+        vacuous = any(
+            check.get("status") == "VACUOUS"
+            for repetition in status["repetitions"]
+            for scenario in repetition["status"]["scenarios"]
+            for check in scenario["checks"]
+        )
+        return 0 if not status["failed"] and reproducible and not vacuous else 1
 
     if args.command == "check-exit":
         try:

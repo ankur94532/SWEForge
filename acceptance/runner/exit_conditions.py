@@ -73,6 +73,19 @@ def _record_ids(records: list[dict[str, Any]]) -> list[str]:
     return [str(item.get("id", "")) for item in records]
 
 
+def _missing_integration_results(records: list[dict[str, Any]]) -> list[str]:
+    """LIVE-GITHUB ids need live evidence; deterministic L1 is not a substitute."""
+    by_id = {str(item.get("id", "")): item for item in records}
+    missing = []
+    for scenario_id in SCENARIO_IDS:
+        record = by_id.get(scenario_id)
+        if record is None or (
+            scenario_id in LIVE_GITHUB_IDS and record.get("layer") != "LIVE_GITHUB"
+        ):
+            missing.append(scenario_id)
+    return sorted(missing)
+
+
 def _condition_1(status: dict[str, Any]) -> ExitConditionResult:
     description = "All 26 scenarios pass independently under their own ids."
     records = _scenario_records(status.get("scenarios"))
@@ -87,9 +100,19 @@ def _condition_1(status: dict[str, Any]) -> ExitConditionResult:
         )
     ids = _record_ids(records)
     duplicates = sorted({item for item in ids if ids.count(item) > 1})
-    unexpected = sorted(set(ids) - SCENARIO_SET)
+    declared = status.get("deterministic_scenarios")
+    allowed = (
+        set(declared)
+        if isinstance(declared, list)
+        and declared
+        and all(isinstance(item, str) for item in declared)
+        else set(SCENARIO_SET)
+    )
+    unexpected = sorted(set(ids) - allowed)
     failed = sorted(
-        str(item.get("id")) for item in records if item.get("ok") is not True
+        str(item.get("id"))
+        for item in records
+        if item.get("id") in SCENARIO_SET and item.get("ok") is not True
     )
     if duplicates or unexpected or failed:
         return _result(
@@ -97,19 +120,19 @@ def _condition_1(status: dict[str, Any]) -> ExitConditionResult:
             description,
             ExitState.UNMET,
             "recorded scenario results are not 26 independent passes",
-            observed=len(records),
+            observed=len(set(ids) & SCENARIO_SET),
             duplicates=duplicates,
             unexpected=unexpected,
             failed=failed,
         )
-    missing = sorted(SCENARIO_SET - set(ids))
+    missing = _missing_integration_results(records)
     if missing:
         return _result(
             "E1",
             description,
             ExitState.CANNOT_EVALUATE,
-            f"results exist for {len(set(ids))} of 26 scenarios",
-            observed=len(set(ids)),
+            f"integration evidence exists for {26 - len(missing)} of 26 scenarios",
+            observed=26 - len(missing),
             required=26,
             missing=missing,
         )
@@ -146,7 +169,15 @@ def _condition_2(status: dict[str, Any]) -> ExitConditionResult:
             recorded_fields=sorted(audit),
         )
     duplicates = sorted({item for item in observed if observed.count(item) > 1})
-    unexpected = sorted(set(observed) - SCENARIO_SET)
+    declared = status.get("deterministic_scenarios")
+    allowed = (
+        set(declared)
+        if isinstance(declared, list)
+        and declared
+        and all(isinstance(item, str) for item in declared)
+        else set(SCENARIO_SET)
+    )
+    unexpected = sorted(set(observed) - allowed)
     if skipped or substitutions or duplicates or unexpected:
         return _result(
             "E2",
@@ -159,13 +190,16 @@ def _condition_2(status: dict[str, Any]) -> ExitConditionResult:
             unexpected=unexpected,
         )
     missing = sorted(SCENARIO_SET - set(observed))
+    records = _scenario_records(status.get("scenarios"))
+    if records is not None:
+        missing = sorted(set(missing) | set(_missing_integration_results(records)))
     if missing:
         return _result(
             "E2",
             description,
             ExitState.CANNOT_EVALUATE,
             "integrity audit does not cover all 26 scenarios",
-            observed=len(set(observed)),
+            observed=26 - len(missing),
             missing=missing,
         )
     return _result(
@@ -199,9 +233,26 @@ def _condition_3(status: dict[str, Any]) -> ExitConditionResult:
             observed_runs=len(repetitions),
             required_runs=3,
         )
+    deterministic_ids = status.get("deterministic_scenarios")
+    if (
+        not isinstance(deterministic_ids, list)
+        or not deterministic_ids
+        or not all(isinstance(item, str) and item for item in deterministic_ids)
+        or len(deterministic_ids) != len(set(deterministic_ids))
+        or not SCENARIO_SET.issubset(deterministic_ids)
+    ):
+        return _result(
+            "E3",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "the deterministic scenario registry snapshot was not recorded",
+            deterministic_scenarios=deterministic_ids,
+        )
+    deterministic_set = set(deterministic_ids)
     recent = repetitions[-3:]
     observed_sets = []
     failures = []
+    vacuous = []
     for repetition in recent:
         run_status = repetition.get("status") if isinstance(repetition, dict) else None
         records = _scenario_records(
@@ -219,6 +270,24 @@ def _condition_3(status: dict[str, Any]) -> ExitConditionResult:
         failures.extend(
             str(item.get("id")) for item in records if item.get("ok") is not True
         )
+        for item in records:
+            checks = item.get("checks")
+            if not isinstance(checks, list) or not checks:
+                return _result(
+                    "E3",
+                    description,
+                    ExitState.CANNOT_EVALUATE,
+                    "one of the last three runs has no per-invariant evidence",
+                    scenario_id=item.get("id"),
+                )
+            vacuous.extend(
+                {
+                    "scenario_id": str(item.get("id")),
+                    "invariant": str(check.get("invariant", "")),
+                }
+                for check in checks
+                if isinstance(check, dict) and check.get("status") == "VACUOUS"
+            )
     if failures:
         return _result(
             "E3",
@@ -227,7 +296,20 @@ def _condition_3(status: dict[str, Any]) -> ExitConditionResult:
             "a scenario failed in the last three runs",
             failed=sorted(set(failures)),
         )
-    missing = sorted(SCENARIO_SET - set.intersection(*observed_sets))
+    if vacuous:
+        unique = [
+            dict(item) for item in {tuple(sorted(item.items())) for item in vacuous}
+        ]
+        return _result(
+            "E3",
+            description,
+            ExitState.CANNOT_EVALUATE,
+            "one or more scenario invariants were vacuous in the last three runs",
+            vacuous=sorted(
+                unique, key=lambda item: (item["scenario_id"], item["invariant"])
+            ),
+        )
+    missing = sorted(deterministic_set - set.intersection(*observed_sets))
     if missing:
         return _result(
             "E3",
@@ -246,7 +328,7 @@ def _condition_3(status: dict[str, Any]) -> ExitConditionResult:
         )
     different = sorted(
         scenario_id
-        for scenario_id in SCENARIO_IDS
+        for scenario_id in deterministic_ids
         if not isinstance(per_scenario.get(scenario_id), dict)
         or per_scenario[scenario_id].get("identical") is not True
     )
@@ -262,9 +344,10 @@ def _condition_3(status: dict[str, Any]) -> ExitConditionResult:
         "E3",
         description,
         ExitState.MET,
-        "the last three runs contain identical clean results for all 26 scenarios",
+        "the last three runs contain identical clean results for every "
+        "registered deterministic scenario",
         runs=3,
-        scenarios=26,
+        scenarios=len(deterministic_ids),
     )
 
 
@@ -501,7 +584,7 @@ def _condition_7(status: dict[str, Any]) -> ExitConditionResult:
             ExitState.CANNOT_EVALUATE,
             "the final run has no scenario result records",
         )
-    missing = sorted(SCENARIO_SET - set(_record_ids(records)))
+    missing = _missing_integration_results(records)
     if missing:
         return _result(
             "E7",
