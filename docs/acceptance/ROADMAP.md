@@ -628,6 +628,29 @@ K8  S1's deterministic L1 scenario PASSes with its full invariant set, and
 Until K1–K8 all hold: no live S1, no S2, no new GitHub issue, no mutation of
 #16.
 
+### K7 model scope (decided 2026-08-25)
+
+`openai:gpt-5.6-luna` is the certification model and the production
+candidate. `openai:gpt-5.6-sol` is cost-constrained and is reduced to a
+single 1×8 generalization check, run only if luna certifies clean.
+
+The cross-model check is not ceremony. It is what proved the guards were
+not overfit to one model's evidence *style*: for RF-016 luna enumerated
+all five files under `src/main/java` while sol named the directory. Both
+were semantically complete; only sol's form satisfied the guard, and that
+asymmetry is how the Class A defect in `_absence_scope_covers_target` was
+found. Certifying on a single model would have concealed it.
+
+So if the sol check is dropped entirely, K7 certifies "the guards hold for
+luna", not "the guards are model-general", and the certification record
+must say so rather than imply the stronger claim.
+
+Replaying the stored sol 20×8 artifacts is NOT a substitute. They predate
+the ABSENCE_OF_CHANGE schema, so current guards reject them for missing
+evidence the model was never asked to emit — the 118 spurious
+IA-MISSING-ABSENCE-OF-CHANGE changes already observed. Replay cannot
+predict how a model answers a changed prompt.
+
 ## Sequencing summary
 
 ```
