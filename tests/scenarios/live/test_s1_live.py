@@ -12,7 +12,6 @@ from pathlib import Path
 import pytest
 from harness.live import (
     LiveCredentialsUnavailable,
-    clone_source,
     comment,
     create_issue,
     live_client,
@@ -67,6 +66,8 @@ def s1_live_happy_path(root_dir) -> Observation:
     )
     number = int(issue["number"])
 
+    # The world's source is the real repository, so the thread workspace the
+    # workflow creates already points at the real code.
     world = World.build(
         root_dir,
         repo_id=repo.repo_id,
@@ -74,10 +75,8 @@ def s1_live_happy_path(root_dir) -> Observation:
         client=client,
         planner=ScriptedPlanner(plans=[PLAN]),
         reviewer=ScriptedReviewer(verdicts=["ACCEPT"]),
+        source_clone_url=(f"https://x-access-token:{token}@github.com/{full_name}.git"),
     )
-    # Execution must operate on the real repository's code, not the synthetic
-    # one World.build seeds for offline scenarios.
-    clone_source(full_name, Path(root_dir) / "live-source", token)
 
     with world.activate():
         poller = GitHubPoller(client, world.store)
@@ -91,16 +90,22 @@ def s1_live_happy_path(root_dir) -> Observation:
             return row["thread_id"] if row else None
 
         thread_id = poll_until(poller, full_name, thread_for_issue)
-        world.thread_ids.add(thread_id)
+        # Polling is repository-wide, so a shared sandbox legitimately yields
+        # threads from earlier acceptance issues. Declare what polling actually
+        # discovered: INV-THREAD-ISOLATION then still catches an event naming a
+        # thread this world never saw, while the single-plan, single-permit and
+        # single-INITIAL invariants remain scoped to this run's own cycle.
+        for row in world.store.connection.execute(
+            "SELECT thread_id FROM issue_threads WHERE repo_id=?", (repo.repo_id,)
+        ):
+            world.thread_ids.add(row["thread_id"])
+        assert thread_id in world.thread_ids
         world.github_facts = RestGitHubFacts(client, repo, number, repo.default_branch)
 
         world.drive(
             thread_id,
             until=WorkflowPhase.WAITING_FOR_PLAN_APPROVAL,
             max_ticks=10,
-            execute_kwargs={
-                "repo_paths": {full_name: str(Path(root_dir) / "live-source")}
-            },
         )
 
         comment(client, full_name, number, "@agent approve")
@@ -125,7 +130,6 @@ def s1_live_happy_path(root_dir) -> Observation:
                 "lock_root": world.root / "locks",
                 "runner": _writing_runner,
                 "checkpointer": object(),
-                "repo_paths": {full_name: str(Path(root_dir) / "live-source")},
             },
         )
         review = world.store.execution_review_for_attempt(

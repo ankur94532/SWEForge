@@ -69,16 +69,26 @@ class World:
         clarification_classifier=None,
         permissions: dict[str, str] | None = None,
         client=None,
+        source_clone_url: str | None = None,
     ) -> "World":
         root.mkdir(parents=True, exist_ok=True)
         source = root / "source"
-        source.mkdir()
-        _git("init", "-q", "-b", "main", cwd=source)
-        _git("config", "user.email", "harness@example.com", cwd=source)
-        _git("config", "user.name", "Harness", cwd=source)
-        (source / "README.md").write_text("base\n")
-        _git("add", "README.md", cwd=source)
-        _git("commit", "-qm", "base", cwd=source)
+        if source_clone_url is not None:
+            # A live body clones the real repository as its source, so the
+            # thread workspace the workflow creates already points at the real
+            # code. Cloning elsewhere and redirecting execution later produces
+            # "repository mapping conflicts with thread workspace".
+            _git("clone", "--quiet", source_clone_url, str(source), cwd=root)
+            _git("config", "user.email", "harness@example.com", cwd=source)
+            _git("config", "user.name", "Harness", cwd=source)
+        else:
+            source.mkdir()
+            _git("init", "-q", "-b", "main", cwd=source)
+            _git("config", "user.email", "harness@example.com", cwd=source)
+            _git("config", "user.name", "Harness", cwd=source)
+            (source / "README.md").write_text("base\n")
+            _git("add", "README.md", cwd=source)
+            _git("commit", "-qm", "base", cwd=source)
 
         origin = root / "origin.git"
         if with_origin:
