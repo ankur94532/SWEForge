@@ -1,0 +1,317 @@
+"""Command-line runner for repository-local acceptance scenarios.
+
+Run with ``python -m acceptance.runner.cli``.  This module deliberately is not
+installed with SWEForge: acceptance tooling must never ship in the production
+wheel.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import json
+import os
+import re
+import shutil
+import sys
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from acceptance.runner.allowlist import check_live_target
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_STATUS_PATH = REPO_ROOT / "acceptance" / "reports" / "campaign-status.json"
+DEFAULT_RUNS_ROOT = REPO_ROOT / "acceptance" / "reports" / "runs"
+MANIFEST_NAME = "run-manifest.json"
+MANIFEST_VERSION = 1
+RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _harness():
+    """Import the test-only runner after making its package root importable."""
+    tests_root = str(REPO_ROOT / "tests")
+    if tests_root not in sys.path:
+        sys.path.insert(0, tests_root)
+    from harness import scenario as harness_scenario
+
+    return harness_scenario
+
+
+def discover_scenarios() -> dict[str, Any]:
+    """Import every L1 scenario module and return the populated registry."""
+    scenario_root = REPO_ROOT / "tests" / "scenarios" / "l1"
+    modules = sorted(
+        path for path in scenario_root.glob("*.py") if path.name != "__init__.py"
+    )
+    if not modules:
+        raise RuntimeError(f"no scenario modules found under {scenario_root}")
+    _harness()
+    for path in modules:
+        importlib.import_module(f"scenarios.l1.{path.stem}")
+    registry = _harness().SCENARIOS
+    if not registry:
+        raise RuntimeError(
+            f"scenario modules under {scenario_root} registered no scenarios"
+        )
+    return registry
+
+
+def _layer(value: str):
+    normalized = value.strip().upper().replace("-", "_")
+    try:
+        return _harness().Layer(normalized)
+    except ValueError as exc:
+        choices = ", ".join(
+            item.value.lower().replace("_", "-") for item in _harness().Layer
+        )
+        raise argparse.ArgumentTypeError(
+            f"unknown layer {value!r}; choose one of: {choices}"
+        ) from exc
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+
+
+def _new_run_id(scenario_id: str) -> str:
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"{scenario_id.lower()}-{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def _validate_run_id(run_id: str) -> str:
+    if not RUN_ID_RE.fullmatch(run_id):
+        raise ValueError(
+            "run id must start with an alphanumeric character and contain only "
+            "letters, digits, '.', '_' or '-'"
+        )
+    return run_id
+
+
+def _create_manifest(
+    runs_root: Path, run_id: str, scenario_id: str, layer: Any
+) -> tuple[Path, dict[str, Any]]:
+    root = runs_root.expanduser().resolve()
+    run_dir = root / _validate_run_id(run_id)
+    run_dir.mkdir(parents=True, exist_ok=False)
+    workspace = run_dir / "workspace"
+    workspace.mkdir()
+    manifest = {
+        "version": MANIFEST_VERSION,
+        "run_id": run_id,
+        "scenario_id": scenario_id,
+        "layer": str(layer),
+        "state": "RUNNING",
+        "owner_pid": os.getpid(),
+        "created_at": _now(),
+        "run_dir": str(run_dir),
+        "owned_paths": [str(workspace)],
+    }
+    manifest_path = run_dir / MANIFEST_NAME
+    _atomic_json(manifest_path, manifest)
+    return manifest_path, manifest
+
+
+def _record_manifest(
+    path: Path, manifest: dict[str, Any], state: str, **fields: Any
+) -> None:
+    manifest.update(fields)
+    manifest["state"] = state
+    manifest["updated_at"] = _now()
+    _atomic_json(path, manifest)
+
+
+def _failure(scenario_id: str, layer: Any, error: Exception | str):
+    if isinstance(error, str):
+        message = error
+    else:
+        message = f"{type(error).__name__}: {error}"
+    return _harness().ScenarioResult(scenario_id, layer, False, (), message)
+
+
+def execute_scenario(
+    scenario_id: str,
+    layer: Any,
+    *,
+    repo_full_name: str | None,
+    status_path: Path,
+    runs_root: Path,
+    run_id: str | None = None,
+) -> Any:
+    """Execute one registered scenario and always emit campaign status.
+
+    A registered body is an implementation of one particular layer.  Refusing
+    a layer mismatch prevents a deterministic L1 body from being reported as a
+    live integration run.
+    """
+    scenario_id = scenario_id.strip().upper()
+    manifest_path: Path | None = None
+    manifest: dict[str, Any] | None = None
+    result = None
+    try:
+        registry = discover_scenarios()
+        registered = registry.get(scenario_id)
+        if registered is None:
+            raise KeyError(f"unknown scenario: {scenario_id}")
+        if registered.layer is not layer:
+            raise ValueError(
+                f"{scenario_id} is registered for {registered.layer}, not {layer}; "
+                "a layer-specific body must exist before that layer can be run"
+            )
+
+        # The body is the first operation that can perform a live mutation.
+        # Preflight immediately before creating any run state or invoking it.
+        if layer is _harness().Layer.LIVE_GITHUB:
+            check_live_target(repo_full_name or "")
+
+        manifest_path, manifest = _create_manifest(
+            runs_root,
+            run_id or _new_run_id(scenario_id),
+            scenario_id,
+            layer,
+        )
+        workspace = Path(manifest["owned_paths"][0])
+        result = _harness().run(scenario_id, workspace)
+    except Exception as exc:
+        result = _failure(scenario_id, layer, exc)
+    finally:
+        if result is None:
+            result = _failure(scenario_id, layer, "scenario produced no result")
+        _harness().write_campaign_status(status_path, [result])
+        if manifest_path is not None and manifest is not None:
+            _record_manifest(
+                manifest_path,
+                manifest,
+                "COMPLETED" if result.ok else "FAILED",
+                result_ok=result.ok,
+                campaign_status=str(status_path.expanduser().resolve()),
+            )
+    return result
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _owned_path(value: Any, *, run_dir: Path) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError("owned_paths entries must be non-empty strings")
+    path = Path(value).expanduser().resolve()
+    try:
+        path.relative_to(run_dir)
+    except ValueError as exc:
+        raise ValueError(f"refusing owned path outside run directory: {path}") from exc
+    if path == run_dir:
+        raise ValueError("refusing to reap the run directory itself")
+    return path
+
+
+def reap_runs(runs_root: Path) -> tuple[list[str], list[str]]:
+    """Reap explicitly owned local paths for crashed runs.
+
+    Completed/failed runs are evidence and are retained.  A RUNNING manifest is
+    reaped only when its recorded owner PID no longer exists.  Malformed or
+    out-of-root ownership fails closed and is reported without deleting data.
+    """
+    root = runs_root.expanduser().resolve()
+    if not root.exists():
+        return [], []
+    reaped: list[str] = []
+    errors: list[str] = []
+    for manifest_path in sorted(root.glob(f"*/{MANIFEST_NAME}")):
+        try:
+            run_dir = manifest_path.parent.resolve()
+            run_dir.relative_to(root)
+            manifest = json.loads(manifest_path.read_text())
+            if manifest.get("version") != MANIFEST_VERSION:
+                raise ValueError("unsupported or missing manifest version")
+            if Path(str(manifest.get("run_dir", ""))).resolve() != run_dir:
+                raise ValueError("manifest run_dir does not match its directory")
+            if manifest.get("state") != "RUNNING":
+                continue
+            owner_pid = manifest.get("owner_pid")
+            if not isinstance(owner_pid, int):
+                raise ValueError("manifest owner_pid is not an integer")
+            if _pid_alive(owner_pid):
+                continue
+            owned = manifest.get("owned_paths")
+            if not isinstance(owned, list) or not owned:
+                raise ValueError("RUNNING manifest has no observable owned_paths")
+            paths = [_owned_path(item, run_dir=run_dir) for item in owned]
+            for path in sorted(paths, key=lambda item: len(item.parts), reverse=True):
+                if path.is_symlink() or path.is_file():
+                    path.unlink(missing_ok=True)
+                elif path.is_dir():
+                    shutil.rmtree(path)
+            _record_manifest(manifest_path, manifest, "REAPED", reaped_at=_now())
+            reaped.append(str(manifest.get("run_id", run_dir.name)))
+        except Exception as exc:
+            errors.append(f"{manifest_path}: {type(exc).__name__}: {exc}")
+    return reaped, errors
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run SWEForge acceptance scenarios")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = commands.add_parser("run", help="run one registered scenario")
+    run_parser.add_argument("scenario_id")
+    run_parser.add_argument("--layer", required=True, type=_layer)
+    run_parser.add_argument(
+        "--repo",
+        dest="repo_full_name",
+        help="owner/name target; required and allowlisted for LIVE_GITHUB",
+    )
+    run_parser.add_argument("--status", type=Path, default=DEFAULT_STATUS_PATH)
+    run_parser.add_argument("--runs-root", type=Path, default=DEFAULT_RUNS_ROOT)
+    run_parser.add_argument("--run-id")
+
+    reap_parser = commands.add_parser(
+        "reap", help="clean explicitly owned paths left by crashed runs"
+    )
+    reap_parser.add_argument("--runs-root", type=Path, default=DEFAULT_RUNS_ROOT)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.command == "run":
+        result = execute_scenario(
+            args.scenario_id,
+            args.layer,
+            repo_full_name=args.repo_full_name,
+            status_path=args.status,
+            runs_root=args.runs_root,
+            run_id=args.run_id,
+        )
+        print(result.report())
+        return 0 if result.ok else 1
+
+    reaped, errors = reap_runs(args.runs_root)
+    for run_id in reaped:
+        print(f"REAPED {run_id}")
+    for error in errors:
+        print(f"ERROR {error}", file=sys.stderr)
+    if not reaped and not errors:
+        print("No crashed runs to reap.")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
