@@ -3051,9 +3051,17 @@ def _inspection_authority_problems(
         # Not every requirement carries text here; without it there is no
         # absence claim to detect and the ordinary demand applies.
         requirement_text = requirement.get("text") or ""
-        if _negative_change_targets(requirement_text) is not None and not (
-            _asserts_an_outcome(requirement_text)
-        ):
+        # A requirement naming explicit unchanged targets keeps its absence
+        # obligation even when it also asserts an outcome; only a bare outcome
+        # claim is exempt. Note this does NOT cover "existing tests
+        # (testOne, testTwo) continue to pass unchanged": those names are not
+        # files, so no targets are extracted. Catching an execution that
+        # reformats such tests is the reviewer's job, not this guard's -- the
+        # prompt already states that whitespace-only reformatting contradicts
+        # an unchanged requirement, and the model ignores it in 6 runs of 20.
+        absence_targets = _negative_change_targets(requirement_text)
+        exempt = _asserts_an_outcome(requirement_text) and not absence_targets
+        if absence_targets is not None and not exempt:
             if not _has_required_absence_refs(refs, requirement_text, changed_files):
                 problems.append(
                     _guard_problem(

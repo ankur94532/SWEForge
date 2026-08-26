@@ -93,9 +93,26 @@ Five false accepts became guard vetoes, and the guards went from doing no
 protective work on this fixture to catching five bad approvals. False accepts
 fell from 11 to 6.
 
-**Six remain.** That residual 30% false-accept rate is the highest-value open
-issue in the campaign -- higher than first-pass, higher than E5 -- because it
-is a correctness failure rather than a form one.
+**Six remain, and they are model behaviour, not a guard gap.**
+
+The defect the reviewer must catch is that the execution reindented the whole
+existing test file, and RF-14's plan:validation:2 requires those tests to
+"continue to pass unchanged". The reviewer prompt already states that any
+textual change to named code, whitespace-only reformatting included,
+contradicts such a requirement. The model has that instruction and ignores it
+in 6 runs of 20.
+
+An earlier intermediate state showed zero false accepts, which looked better
+and was not. The guard was rejecting those artifacts because absence evidence
+is impossible to supply for a file that did change, so the review produced no
+verdict at all. That is fail-closed by accident rather than protection by
+design, and it cost 8 runs their result. Restoring those runs is what raised
+first-pass and also surfaced the six.
+
+Closing this needs prompt work on the reviewer plus a batch to verify, which
+is the one remaining item that cannot be done from stored artifacts. It is
+still the highest-value open issue in the campaign -- higher than first-pass,
+higher than E5 -- because it is a correctness failure rather than a form one.
 
 ## Not done, and why
 
