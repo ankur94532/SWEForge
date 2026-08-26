@@ -579,7 +579,13 @@ _NEGATIVE_CHANGE_REQUIREMENT_RE = re.compile(
     # first-pass 0.794 -> 0.756. The model does emit ABSENCE_OF_CHANGE for
     # those, so the failure is coverage, not missing evidence, and widening
     # the detector was the wrong lever.
-    r"\bno\b[^\n]{0,60}\b(?:modified|changed|touched|edited)\b",
+    # Surgical: the gap outside parentheses stays tight, but a parenthesised
+    # file list may sit in the middle -- "no production code files (A.java,
+    # B.java, C.java, D.java, E.java) modified". Widening the general gap
+    # instead measured worse (0.794 -> 0.756) by catching requirements that
+    # are not absence claims.
+    r"\bno\b[^\n(]{0,60}(?:\([^)]{0,300}\))?[^\n(]{0,20}"
+    r"\b(?:modified|changed|touched|edits?|edited)\b",
     re.IGNORECASE,
 )
 _REPOSITORY_SCOPE_RE = re.compile(r"/?(?:src|app|lib|tests?)(?:/[A-Za-z0-9_.-]+)+")
@@ -716,6 +722,21 @@ def _has_required_absence_refs(
     targets = _negative_change_targets(requirement_text)
     if targets is None:
         return True
+    if changed_files:
+        # A file the diff shows changed cannot be the target of a "did not
+        # change" claim. Requirement prose names both sides -- "changes only
+        # in PricingCalculatorTest.java, no edits to src/main/java" -- and
+        # without a separator the extractor cannot tell them apart, so it
+        # picked up the file that did change and then demanded absence
+        # evidence no honest inspector could produce.
+        changed_names = {PurePosixPath(path).name for path in changed_files}
+        targets = tuple(
+            target
+            for target in targets
+            if target not in changed_files and target not in changed_names
+        )
+        if not targets:
+            targets = ()
     scopes = [
         scope
         for ref in refs

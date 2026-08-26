@@ -83,3 +83,47 @@ def test_a_pure_absence_claim_is_still_routed_to_absence_evidence():
             text
         )
         assert routed, f"pure absence claim lost its absence route: {text}"
+
+
+def test_a_changed_file_is_not_an_absence_target():
+    """Requirement prose names both sides of a diff claim.
+
+    "changes only in the test file (PricingCalculatorTest.java), no edits to
+    src/main/java" has no separator, so extraction picks up the file that DID
+    change and then demands absence evidence no honest inspector could
+    produce. A file the diff shows changed cannot be an absence target.
+    """
+    from sweforge.reviewer import EvidenceKind, _has_required_absence_refs
+
+    class Ref:
+        def __init__(self, path):
+            self.kind = EvidenceKind.ABSENCE_OF_CHANGE
+            self.path = path
+
+    text = (
+        "Diff shows changes only in the test file (PricingCalculatorTest.java), "
+        "no edits to src/main/java"
+    )
+    changed = {"src/test/java/com/sweforge/pricing/PricingCalculatorTest.java"}
+    assert _has_required_absence_refs([Ref("src/main/java")], text, changed)
+
+
+def test_an_unchanged_named_target_still_requires_coverage():
+    """Positive control: dropping changed files must not drop real targets.
+
+    With no absence evidence at all, an unchanged named target is still
+    uncovered. Without this the exclusion could silently satisfy everything.
+    """
+    from sweforge.reviewer import _has_required_absence_refs
+
+    text = "Leave DiscountPolicy.java untouched."
+    changed = {"src/test/java/Other.java"}
+    assert not _has_required_absence_refs([], text, changed)
+
+
+def test_the_exclusion_does_not_empty_a_wholly_unchanged_claim():
+    """A claim naming only unchanged files keeps its targets."""
+    from sweforge.reviewer import _negative_change_targets
+
+    targets = _negative_change_targets("Leave DiscountPolicy.java untouched.")
+    assert targets == ("DiscountPolicy.java",)
