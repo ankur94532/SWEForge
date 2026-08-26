@@ -109,10 +109,23 @@ verdict at all. That is fail-closed by accident rather than protection by
 design, and it cost 8 runs their result. Restoring those runs is what raised
 first-pass and also surfaced the six.
 
-Closing this needs prompt work on the reviewer plus a batch to verify, which
-is the one remaining item that cannot be done from stored artifacts. It is
-still the highest-value open issue in the campaign -- higher than first-pass,
-higher than E5 -- because it is a correctness failure rather than a form one.
+**RESOLVED.** The inspector instruction stated the rule but never said what
+to do about it. It now says to compare against the diff BEFORE assigning a
+status, to record CONTRADICTED rather than VERIFIED on any textual change
+including reindentation, and that a passing suite is not evidence the suite
+was left unchanged -- the exact confusion observed, since "existing tests
+continue to pass unchanged" makes two claims and the model checked only one.
+
+Verified live on RF-14-41504759 over 20 runs, the fixture that exhibited it:
+
+    before: ACCEPT 11, NEEDS_FIXES 8, no result 1, first-pass 0.350
+    after:  NEEDS_FIXES 20,                        first-pass 0.900
+
+False accepts fell from 11 to 0, and it did not overcorrect: every verdict is
+NEEDS_FIXES, the correct answer for this fixture, rather than a blanket
+rejection of anything carrying a diff. A prompt change invalidates replay, so
+this was measured by a live batch over the one affected fixture -- an eighth
+of the cost of a full 20x8 for the same answer.
 
 ## Not done, and why
 
