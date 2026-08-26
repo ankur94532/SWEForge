@@ -571,7 +571,10 @@ _STRUCTURAL_REQUIREMENT_RE = re.compile(
 _NEGATIVE_CHANGE_REQUIREMENT_RE = re.compile(
     r"\bdo not modify\b|\bmust remain unchanged\b|\bstays? unchanged\b|"
     r"\bno (?:changes?|modifications?)\b|\bnot be modified\b|\buntouched\b|"
-    r"\bkeep\b[^\n]{0,100}\bunchanged\b|\bcontinue\b[^\n]{0,100}\bunchanged\b",
+    r"\bkeep\b[^\n]{0,100}\bunchanged\b|\bcontinue\b[^\n]{0,100}\bunchanged\b|"
+    # "no production source files modified" states an absence with words
+    # between the negation and the verb, which the fixed phrases above miss.
+    r"\bno\b[^\n]{0,60}\b(?:modified|changed|touched|edited)\b",
     re.IGNORECASE,
 )
 _REPOSITORY_SCOPE_RE = re.compile(r"/?(?:src|app|lib|tests?)(?:/[A-Za-z0-9_.-]+)+")
@@ -2966,7 +2969,26 @@ def _inspection_authority_problems(
                     )
                 )
     if classification == ReviewRequirementClassification.BEHAVIORAL.value:
-        if not any(item.kind == "CODE" for item in requirement_observations):
+        # A behavioural requirement whose content is an absence -- "leave these
+        # files untouched", "no production source modified" -- cannot be proved
+        # by citing lines. Nothing to point at is the claim, and the diff is the
+        # evidence, so demanding a direct code observation asks for something
+        # the inspector has no route to produce. STRUCTURAL already recognises
+        # this shape; BEHAVIORAL required it unconditionally, which rejected
+        # correct absence evidence and drove most of a conformance shortfall.
+        # Not every requirement carries text here; without it there is no
+        # absence claim to detect and the ordinary demand applies.
+        requirement_text = requirement.get("text") or ""
+        if _negative_change_targets(requirement_text) is not None:
+            if not _has_required_absence_refs(refs, requirement_text, changed_files):
+                problems.append(
+                    _guard_problem(
+                        GuardCode.IA_MISSING_ABSENCE_OF_CHANGE,
+                        "missing relevant absence-of-change evidence for "
+                        f"{requirement_id}",
+                    )
+                )
+        elif not any(item.kind == "CODE" for item in requirement_observations):
             problems.append(
                 _guard_problem(
                     GuardCode.IA_MISSING_DIRECT_CODE_OBSERVATION,
