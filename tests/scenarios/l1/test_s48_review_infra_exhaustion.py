@@ -1,4 +1,4 @@
-"""S27: review infrastructure exhausts its budget without inventing success.
+"""S48: review infrastructure exhausts its budget without inventing success.
 
 S26 proves that a *transient* review failure recovers on the same attempt and
 the same permit. It deliberately stops after one failure, so it never reaches
@@ -30,7 +30,7 @@ def _writing_runner(**kwargs):
 
 
 @scenario(
-    "S27",
+    "S48",
     layer=Layer.L1,
     invariants=[
         "INV-ONE-INITIAL",
@@ -40,7 +40,7 @@ def _writing_runner(**kwargs):
     ],
     description="Review infrastructure stops at its bound and publishes nothing.",
 )
-def s27_review_infrastructure_exhaustion(root_dir) -> Observation:
+def s48_review_infrastructure_exhaustion(root_dir) -> Observation:
     calls = {"n": 0}
 
     def always_failing_reviewer(**kwargs):
@@ -115,13 +115,13 @@ def test_review_recovery_bound_is_positive():
 
 
 def test_scenario_passes(tmp_path):
-    result = run("S27", tmp_path / "s27", layer=Layer.L1)
+    result = run("S48", tmp_path / "s48", layer=Layer.L1)
     assert result.ok, "\n" + result.report()
 
 
 def test_the_scenario_records_the_bound_it_reached(tmp_path):
     """E4 evidence must come from the run, not from the constant."""
-    result = run("S27", tmp_path / "s27-bound", layer=Layer.L1)
+    result = run("S48", tmp_path / "s48-bound", layer=Layer.L1)
     evidence = result.bounded_paths["S26_BACKOFF"]
     assert evidence == {
         "observed": True,

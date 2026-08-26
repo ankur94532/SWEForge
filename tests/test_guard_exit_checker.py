@@ -8,7 +8,7 @@ from acceptance.runner.exit_conditions import (
     evaluate_exit_conditions,
 )
 
-DETERMINISTIC_IDS = (*SCENARIO_IDS, "S27", "S28")
+DETERMINISTIC_IDS = (*SCENARIO_IDS, "S48", "S49")
 
 
 def _states(report):
@@ -56,7 +56,7 @@ def _deterministic_records(*, retries=False):
             "harness_retries": 0,
             "outcome": "PASS",
         }
-        for scenario_id in ("S27", "S28")
+        for scenario_id in ("S48", "S49")
     )
     return records
 

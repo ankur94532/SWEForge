@@ -1,4 +1,4 @@
-"""S28: repair execution recovery reaches its bound and fails closed.
+"""S49: repair execution recovery reaches its bound and fails closed.
 
 The existing store tests prove the counter arithmetic in isolation.  This
 scenario supplies campaign evidence from the public workflow: a hard crash
@@ -40,12 +40,12 @@ def _execute_kwargs() -> dict:
 
 
 @scenario(
-    "S28",
+    "S49",
     layer=Layer.L1,
     invariants=["INV-ONE-INITIAL", "INV-RETRY-BOUNDED", "INV-NO-PUBLICATION"],
     description="Crashed repair execution stops at its recovery bound.",
 )
-def s28_repair_execution_recovery_bound(root_dir) -> Observation:
+def s49_repair_execution_recovery_bound(root_dir) -> Observation:
     world = World.build(
         root_dir,
         planner=ScriptedPlanner(plans=[PLAN]),
@@ -145,13 +145,13 @@ def test_repair_execution_recovery_bound_is_positive():
 
 
 def test_scenario_passes_without_vacuous_checks(tmp_path):
-    result = run("S28", tmp_path / "s28", layer=Layer.L1)
+    result = run("S49", tmp_path / "s49", layer=Layer.L1)
     assert result.ok, "\n" + result.report()
     assert all(check.status == "PASS" for check in result.checks), result.report()
 
 
 def test_scenario_records_the_persisted_bound_it_reached(tmp_path):
-    result = run("S28", tmp_path / "s28-bound", layer=Layer.L1)
+    result = run("S49", tmp_path / "s49-bound", layer=Layer.L1)
     assert result.bounded_paths["EXECUTION_RETRY_X3"] == {
         "observed": True,
         "actual": MAX_REPAIR_EXECUTION_RECOVERIES,

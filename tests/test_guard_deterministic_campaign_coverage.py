@@ -44,7 +44,7 @@ def test_three_runs_missing_a_declared_support_scenario_cannot_pass():
     declared = [f"S{number}" for number in range(1, 29)]
     result = _condition(_status(declared[:-1], declared=declared))
     assert result["state"] == "CANNOT_EVALUATE"
-    assert result["evidence"]["missing"] == ["S28"]
+    assert result["evidence"]["missing"] == [declared[-1]]
 
 
 def test_three_identical_runs_over_the_declared_registry_meet_e3():

@@ -761,10 +761,27 @@ class WorkflowEngine:
         existing = self.store.permit(permit.permit_id)
         if existing:
             return existing
-        return self.store.authorize_current_plan(
+        authorized = self.store.authorize_current_plan(
             permit=permit,
             authorized_at=timestamp,
         )
+        # AUTO is the authorization path with no human and no approval event,
+        # so the event log is the only record that it happened. Without this
+        # an auto-authorized execution is invisible to the audit log and to
+        # every permit invariant, which read PERMIT_CREATED rather than the
+        # store. Emitted after the durable write, as the USER path is.
+        emit(
+            EventKind.PERMIT_CREATED,
+            thread_id=state.thread_id,
+            cycle_id=state.cycle_id,
+            repo_id=state.repo_id,
+            permit_id=permit.permit_id,
+            permit_source=str(PermitSource.AUTO),
+            plan_id=plan.plan_id,
+            plan_version=plan.version,
+            root_event_key=plan.root_event_key,
+        )
+        return authorized
 
     def execute_authorized(
         self,
