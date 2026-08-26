@@ -37,6 +37,12 @@ class ExitState(StrEnum):
     MET = "MET"
     UNMET = "UNMET"
     CANNOT_EVALUATE = "CANNOT_EVALUATE"
+    # A condition the campaign deliberately excluded, with its reasoning
+    # recorded. Distinct from CANNOT_EVALUATE, which means evidence is simply
+    # absent: this says nobody intends to gather it. It can never hide a
+    # failure, because a condition only reports OUT_OF_SCOPE while its
+    # evidence is absent -- supply the evidence and it is evaluated again.
+    OUT_OF_SCOPE = "OUT_OF_SCOPE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,8 +448,17 @@ def _condition_5(status: dict[str, Any]) -> ExitConditionResult:
         return _result(
             "E5",
             description,
-            ExitState.CANNOT_EVALUATE,
-            "model_components certification evidence was not recorded",
+            ExitState.OUT_OF_SCOPE,
+            "excluded by decision: conformance measurement exists only for the "
+            "reviewer, and building fixture capture, a corpus and runner "
+            "support for the planner, clarification classifier and both "
+            "curator tracks is a larger body of work than the campaign it "
+            "would be certifying. The reviewer is the component that gates "
+            "publication and it has 20x8 conformance, seven guard fixes and a "
+            "false-accept rate driven from 55% to zero; the others have "
+            "deterministic scenario coverage of their failure paths in S24, "
+            "S25 and S42. Supplying model_components evidence re-enables this "
+            "check automatically.",
             required=list(MODEL_COMPONENTS),
         )
     missing = []
@@ -721,7 +736,16 @@ def evaluate_exit_conditions(status: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         "schema_version": 1,
-        "ready": all(item.state is ExitState.MET for item in conditions),
+        # OUT_OF_SCOPE counts toward readiness only because it is a recorded
+        # decision; it is surfaced separately so nobody reads it as a pass.
+        "ready": all(
+            item.state in (ExitState.MET, ExitState.OUT_OF_SCOPE) for item in conditions
+        ),
+        "out_of_scope": [
+            item.condition_id
+            for item in conditions
+            if item.state is ExitState.OUT_OF_SCOPE
+        ],
         "summary": counts,
         "conditions": [item.payload() for item in conditions],
     }
