@@ -326,9 +326,30 @@ def _condition_3(status: dict[str, Any]) -> ExitConditionResult:
             ExitState.CANNOT_EVALUATE,
             "per-scenario identity comparison was not recorded",
         )
-    different = sorted(
+    # Compare only scenarios that actually RAN deterministically. A scenario
+    # with a deterministic body may still have been run at LIVE_GITHUB in an
+    # integration campaign, and a live run against a shared repository is not
+    # reproducible by construction: the sandbox accumulates issues, so an
+    # isolation invariant reports "within 6 threads" then "within 8" while the
+    # outcome stays PASS. Comparing those made E1 and E3 mutually exclusive --
+    # E1 requires live layers, E3 forbade anything that varies -- which is a
+    # scoping error, not a reproducibility failure. E3's own description is
+    # "every deterministic scenario".
+    ran_deterministically = {
+        str(item.get("id"))
+        for repetition in recent
+        for item in _scenario_records((repetition.get("status") or {}).get("scenarios"))
+        or []
+        if item.get("layer") != "LIVE_GITHUB"
+    }
+    compared = [
         scenario_id
         for scenario_id in deterministic_ids
+        if scenario_id in ran_deterministically
+    ]
+    different = sorted(
+        scenario_id
+        for scenario_id in compared
         if not isinstance(per_scenario.get(scenario_id), dict)
         or per_scenario[scenario_id].get("identical") is not True
     )

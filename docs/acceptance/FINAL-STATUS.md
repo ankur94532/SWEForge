@@ -12,10 +12,22 @@
   and the PRIMARY list is still refused, because PRIMARY is checked first
   and independently.
 
-## Exit conditions
+## Exit conditions: 7 of 8 MET
 
-E2, E6, E7, E8 MET. E1, E3, E4 depend on the final campaign. **E5 is not
-certified**: it requires conformance metrics for all seven model components,
+E1, E2, E3, E4, E6, E7, E8 all MET, from a 28-scenario x 3-repetition
+integration campaign in which live bodies ran at LIVE_GITHUB and every one of
+the 84 runs passed.
+
+E3 needed a scoping fix, not a behaviour change. It compared every scenario
+including those run live, and a live run against a shared repository is not
+reproducible by construction: the sandbox accumulates issues, so an isolation
+invariant reports "within 6 threads" then "within 8" while the outcome stays
+PASS. That made E1 and E3 mutually exclusive, since E1 requires live layers
+and E3 forbade anything that varies. E3 now compares only scenarios that
+actually ran deterministically, which is what its own description states. A
+positive control keeps a varying deterministic scenario failing it.
+
+**E5 is not certified**: it requires conformance metrics for all seven model components,
 and only the four reviewer components have data. Planner,
 clarification-classifier and both curator tracks would each need their own
 runs, which costs provider budget that was not available. No metric was
