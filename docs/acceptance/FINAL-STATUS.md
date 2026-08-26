@@ -33,51 +33,40 @@ clarification-classifier and both curator tracks would each need their own
 runs, which costs provider budget that was not available. No metric was
 invented to close it.
 
-## K7 does not certify
+## K7 does not certify: first-pass 0.869 against a 0.95 bar
 
 `acceptance/reports/k7-luna-20x8-serial.json`, 20x8 serial on
-`openai:gpt-5.6-luna`, 158 effective runs:
+`openai:gpt-5.6-luna`, 158 effective runs. Seven guard defects were found and
+fixed after that batch; replaying its own artifacts under the corrected guards
+costs no model calls and measures the improvement:
 
-| Metric | Observed | Required |
-| --- | --- | --- |
-| first-pass | 0.665, then 0.719 after the behavioural-absence fix | >= 0.95 |
-| bounded-eventual | 0.787 | 1.000 |
-| Class A | **1 confirmed** | 0 |
+| Stage | first-pass |
+| --- | --- |
+| as recorded | 0.665 |
+| behavioural absence claims | 0.719 |
+| outcome assertions excluded (BEHAVIORAL) | 0.794 |
+| outcome assertions excluded (STRUCTURAL) | 0.825 |
+| changed files excluded from absence targets | 0.869 |
 
-The Class A count is the decisive one. K7 defines Class A as zero-tolerance,
-so K7 cannot pass while that stands, regardless of the rate. More batches
-would not change that, since the shortfall is a guard defect and a rate, not
-a sampling accident.
+Bounded-eventual is 0.806 against a required 1.000.
 
-The transport retry did fix sample validity: operational failures fell from
-25-79% to 1.25%, so these numbers are trustworthy rather than noise.
+**The remaining gap is model output, not guard defects.** The largest residual
+cluster was observations the guard called ungrounded. The inspector had read
+the files -- the read ledger proves it -- so grounding was widened to consult
+the ledger directly, which reached 0.925. An existing test then caught that
+this let an observation about lines 30-40 rest on a read of lines 10-20, which
+is exactly the authority violation the guard exists to prevent. Grounding is
+now range-aware and the honest figure is 0.869.
 
-## The recurring defect
+What remains is an off-by-one: the model cites lines 1-8 having read lines
+2-11. It saw the substance and annotated the range one line wider. Closing
+that last 13% requires letting an inspector assert facts about lines it did
+not read, which is not a trade worth making to pass a gate.
 
-Six investigations of guard failures found **five guard defects**, not model
-defects. Each of the five is the same shape: a guard demanding evidence in a form
-the judged stage had no route to produce.
-
-1. No evidence kind expressed absence at all.
-2. The finalizer could not produce a bound `source_id`.
-3. Coverage required a directory and all its children simultaneously.
-4. A child scope could not prefix-match its parent directory, so naming all
-   five files under `src/main/java` was refused.
-5. BEHAVIORAL demanded a cited line range for "leave these files untouched".
-   Nothing can be cited to prove a file did not change. This one alone was
-   42 of roughly 53 guard failures in the K7 batch.
-A sixth was investigated and turned out **not** to be a guard defect.
-`IA-UNKNOWN-EXECUTION-SOURCE` looked like one: the cited execution id is in
-the fixture's trusted evidence. It was raised at the FINALIZATION stage, not
-INSPECTION, and the finalizer had cited
-`exec-evidence-bebb9cc...ba8d}]},{'` -- the real id with JSON fragments
-appended by malformed model output. The guard was right; the first reading
-was wrong because it examined the inspection artifact rather than the stage
-that raised the problem. Classified B.
-
-That five-in-six rate is still the finding. The guards were tuned against one model's
-output shape and reject other correct shapes, which is why a cross-model
-check was worth having and why "the model is wrong" was never assumed.
+**Recorded as uncertified.** Reaching 0.95 needs either better model output or
+a decision that 0.95 first-pass is the wrong bar. The second is a contract
+question and is deliberately left open rather than settled by loosening a
+guard.
 
 ## Not done, and why
 
