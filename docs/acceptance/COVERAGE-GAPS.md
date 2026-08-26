@@ -210,3 +210,38 @@ WAITING_FOR_PLAN_APPROVAL.
 
 `GitHubClient.collaborator_permission` was added for this, backed by
 `GET /repos/{owner}/{repo}/collaborators/{username}/permission`.
+
+
+## Decided: repo memory needs no mandatory human approval (2026-08-26)
+
+The branch `codex/memory-learning` (single commit `16ea1ea`, 21 Aug) carried a
+different design for repository memory: a model proposed candidates and a human
+called `approve_candidate` or `reject_candidate` before any of them became
+repository memory.
+
+It was not merged, and the branch was deleted. It is not lost -- `16ea1ea`
+remains on `origin/codex/memory-learning`, and the design can be recovered from
+there if the decision is ever revisited.
+
+**What replaced it.** The implementation on the main line grounds memory in
+evidence instead of in approval: every candidate must cite a path, a line range
+and a content hash, each verified against the worktree, with path-escape,
+inverted-range, range-past-end, task-specific-fact and secret checks. S40
+exercises that corpus payload by payload.
+
+**Why that is enough.** Evidence grounding is mechanical and does not tire,
+where an approval gate does -- this campaign found two approval gates that were
+waved through, F4 accepting any commenter and the AUTO path minting permits
+with no audit event at all. A human retains an explicit review and edit path
+through `repo_memory_cli`: `show`, `replace` and `append`.
+
+**The residual limit, stated plainly.** Grounding proves provenance, not truth.
+A memory can cite real lines and still be misleading. Nothing catches a
+well-grounded but wrong repo fact, and repository memory feeds future planning.
+This is accepted deliberately rather than overlooked; the mitigation is that a
+human can inspect and rewrite memory at any time.
+
+Note this concerns repository *facts* only. Issue-resolution memory -- the
+root-cause records of past issues surfaced to the planner -- is a separate
+subsystem, and is already presented as fallible clues to verify rather than as
+repository truth.
