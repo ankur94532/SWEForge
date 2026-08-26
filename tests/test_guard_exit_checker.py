@@ -130,16 +130,31 @@ def _curator_metrics():
 
 
 def test_empty_status_cannot_satisfy_any_exit_condition():
+    """E5 is excluded by recorded decision, so an empty status leaves seven
+    conditions unevaluable and one out of scope -- and is still not ready."""
     report = evaluate_exit_conditions({})
     assert report["ready"] is False
-    assert report["summary"] == {"MET": 0, "UNMET": 0, "CANNOT_EVALUATE": 8}
-    assert set(_states(report).values()) == {"CANNOT_EVALUATE"}
+    assert report["summary"] == {
+        "MET": 0,
+        "UNMET": 0,
+        "CANNOT_EVALUATE": 7,
+        "OUT_OF_SCOPE": 1,
+    }
+    assert set(_states(report).values()) == {"CANNOT_EVALUATE", "OUT_OF_SCOPE"}
+    assert _states(report)["E5"] == "OUT_OF_SCOPE"
 
 
 def test_complete_positive_evidence_satisfies_all_eight_conditions():
+    """Complete evidence includes model_components, which takes E5 back out of
+    exclusion and evaluates it: the exclusion cannot mask a real result."""
     report = evaluate_exit_conditions(_complete_status())
     assert report["ready"] is True
-    assert report["summary"] == {"MET": 8, "UNMET": 0, "CANNOT_EVALUATE": 0}
+    assert report["summary"] == {
+        "MET": 8,
+        "UNMET": 0,
+        "CANNOT_EVALUATE": 0,
+        "OUT_OF_SCOPE": 0,
+    }
     assert set(_states(report).values()) == {"MET"}
 
 
@@ -204,7 +219,11 @@ def test_partial_two_run_campaign_is_precise_about_unknown_and_unmet():
     report = evaluate_exit_conditions(status)
     states = _states(report)
     assert states["E3"] == "UNMET"
-    assert all(states[item] == "CANNOT_EVALUATE" for item in states if item != "E3")
+    # E5 is out of scope by recorded decision; everything else is unevaluable.
+    assert states["E5"] == "OUT_OF_SCOPE"
+    assert all(
+        states[item] == "CANNOT_EVALUATE" for item in states if item not in ("E3", "E5")
+    )
 
 
 def test_explicit_negative_evidence_is_unmet_not_unknown():
