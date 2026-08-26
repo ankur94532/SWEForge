@@ -2993,11 +2993,25 @@ def _inspection_authority_problems(
     classification = requirement["classification"]
     for observation in requirement_observations:
         if observation.kind in {"CODE", "TEST"}:
-            grounded = observation.path.lstrip("/") in changed_files or any(
-                ref.kind is EvidenceKind.INSPECTED_FILE
-                and ref.source_id in ledger_by_id
-                and ref.path == observation.path
-                for ref in refs
+            # The read ledger is the trusted record of what the inspector
+            # actually read, so an observation whose path appears there is
+            # grounded in fact. Requiring the model to ALSO cite an
+            # INSPECTED_FILE ref demanded a redundant citation of something
+            # the guard can verify itself, and rejected observations on files
+            # the ledger proves were read.
+            observed_path = observation.path.lstrip("/")
+            grounded = (
+                observed_path in changed_files
+                or any(
+                    str(item.get("normalized_path", "")).lstrip("/") == observed_path
+                    for item in ledger_by_id.values()
+                )
+                or any(
+                    ref.kind is EvidenceKind.INSPECTED_FILE
+                    and ref.source_id in ledger_by_id
+                    and ref.path == observation.path
+                    for ref in refs
+                )
             )
             if not grounded:
                 problems.append(
