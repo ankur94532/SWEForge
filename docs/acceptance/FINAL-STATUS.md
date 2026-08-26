@@ -30,19 +30,20 @@ invented to close it.
 | --- | --- | --- |
 | first-pass | 0.665, then 0.719 after the behavioural-absence fix | >= 0.95 |
 | bounded-eventual | 0.787 | 1.000 |
-| Class A | **2 confirmed** | 0 |
+| Class A | **1 confirmed** | 0 |
 
 The Class A count is the decisive one. K7 defines Class A as zero-tolerance,
-so K7 cannot pass while those stand, regardless of the rate. More batches
-would not change that.
+so K7 cannot pass while that stands, regardless of the rate. More batches
+would not change that, since the shortfall is a guard defect and a rate, not
+a sampling accident.
 
 The transport retry did fix sample validity: operational failures fell from
 25-79% to 1.25%, so these numbers are trustworthy rather than noise.
 
 ## The recurring defect
 
-Six investigations of guard failures found **six guard defects**, not model
-defects. Every one is the same shape: a guard demanding evidence in a form
+Six investigations of guard failures found **five guard defects**, not model
+defects. Each of the five is the same shape: a guard demanding evidence in a form
 the judged stage had no route to produce.
 
 1. No evidence kind expressed absence at all.
@@ -53,11 +54,16 @@ the judged stage had no route to produce.
 5. BEHAVIORAL demanded a cited line range for "leave these files untouched".
    Nothing can be cited to prove a file did not change. This one alone was
    42 of roughly 53 guard failures in the K7 batch.
-6. `IA-UNKNOWN-EXECUTION-SOURCE` fired on an execution id that **is** in the
-   fixture's trusted evidence. Recorded Class A; **mechanism unconfirmed**,
-   and it needs a reproduction before anyone attempts a fix.
+A sixth was investigated and turned out **not** to be a guard defect.
+`IA-UNKNOWN-EXECUTION-SOURCE` looked like one: the cited execution id is in
+the fixture's trusted evidence. It was raised at the FINALIZATION stage, not
+INSPECTION, and the finalizer had cited
+`exec-evidence-bebb9cc...ba8d}]},{'` -- the real id with JSON fragments
+appended by malformed model output. The guard was right; the first reading
+was wrong because it examined the inspection artifact rather than the stage
+that raised the problem. Classified B.
 
-That rate is itself the finding. The guards were tuned against one model's
+That five-in-six rate is still the finding. The guards were tuned against one model's
 output shape and reject other correct shapes, which is why a cross-model
 check was worth having and why "the model is wrong" was never assumed.
 
