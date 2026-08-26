@@ -49,3 +49,37 @@ def test_the_behavioural_branch_routes_absence_claims_to_absence_evidence():
     assert 'elif not any(item.kind == "CODE"' in window, (
         "the code-observation demand is no longer the fallback branch"
     )
+
+
+OUTCOME_CASES = [
+    "Existing tests (a, b, c) still pass unmodified.",
+    "Existing tests (a, b, c) continue to pass unchanged.",
+    "mvn test (full suite) passes with no regressions",
+]
+
+
+def test_an_outcome_assertion_is_not_routed_to_absence_evidence():
+    """A requirement about the suite still passing is proved by the run.
+
+    These trip the negation patterns because "unchanged" and "unmodified"
+    describe the subject, not the claim. Routing them to ABSENCE_OF_CHANGE
+    demanded the wrong artifact and introduced 26 failures while fixing 42.
+    """
+    from sweforge.reviewer import _asserts_an_outcome, _negative_change_targets
+
+    for text in OUTCOME_CASES:
+        routed = _negative_change_targets(text) is not None and not _asserts_an_outcome(
+            text
+        )
+        assert not routed, f"outcome assertion routed to absence evidence: {text}"
+
+
+def test_a_pure_absence_claim_is_still_routed_to_absence_evidence():
+    """Positive control: excluding outcomes must not disable the absence route."""
+    from sweforge.reviewer import _asserts_an_outcome, _negative_change_targets
+
+    for text in (UNTOUCHED, DIFF_ONLY):
+        routed = _negative_change_targets(text) is not None and not _asserts_an_outcome(
+            text
+        )
+        assert routed, f"pure absence claim lost its absence route: {text}"

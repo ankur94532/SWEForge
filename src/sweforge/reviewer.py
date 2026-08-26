@@ -603,6 +603,19 @@ def _requirement_classification(
     return ReviewRequirementClassification.BEHAVIORAL
 
 
+# A requirement that asserts an outcome -- "existing tests continue to pass
+# unchanged" -- is proved by the run, not by the diff. The negation words in it
+# modify the subject rather than stating the claim, so routing it to
+# absence-of-change evidence demands the wrong artifact entirely.
+_OUTCOME_ASSERTION_RE = re.compile(
+    r"\b(?:passe?s?|passing|succeeds?|green|no regressions?)\b", re.IGNORECASE
+)
+
+
+def _asserts_an_outcome(text: str) -> bool:
+    return bool(_OUTCOME_ASSERTION_RE.search(text))
+
+
 def _negative_change_targets(text: str) -> tuple[str, ...] | None:
     """Return explicit unchanged scopes, or None for a non-negative requirement."""
     if not _NEGATIVE_CHANGE_REQUIREMENT_RE.search(text):
@@ -2979,7 +2992,9 @@ def _inspection_authority_problems(
         # Not every requirement carries text here; without it there is no
         # absence claim to detect and the ordinary demand applies.
         requirement_text = requirement.get("text") or ""
-        if _negative_change_targets(requirement_text) is not None:
+        if _negative_change_targets(requirement_text) is not None and not (
+            _asserts_an_outcome(requirement_text)
+        ):
             if not _has_required_absence_refs(refs, requirement_text, changed_files):
                 problems.append(
                     _guard_problem(
