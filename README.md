@@ -117,12 +117,21 @@ IssueThread execution is gated by an application-owned workflow state machine.
 In INTERACTIVE mode, an actionable root enters planning, SWEForge posts a
 versioned plan to the original issue, and only the exact command
 `@agent approve` creates a permit for that exact plan version. Other leading
-`@agent` comments revise the plan. The planner uses a structurally read-only
+`@agent` comments revise the plan.
+
+Approval is authorized, not merely parsed. The commenter must have `admin`,
+`maintain` or `write` permission on the repository; `triage` and `read` are
+refused, because both can comment and neither can change the repository, and
+approval is what lets the agent write to it. The check fails closed: an
+unreachable API or a missing author is refused rather than assumed, and a
+refused approval creates no permit. The planner uses a structurally read-only
 filesystem backend: it cannot execute a shell or mutate the worktree.
 
 An issue labeled `AUTO` follows the same plan-and-post sequence, then the
-application re-checks the label and creates an AUTO permit. AUTO skips the
-human wait; it does not skip planning or observability. Removing the label
+application re-checks the label and creates an AUTO permit, emitting the same
+`PERMIT_CREATED` event the human path does. AUTO skips the human wait; it does
+not skip planning or observability, and because no human is involved the audit
+record is the only evidence that the authorization happened. Removing the label
 before permit creation returns the workflow to interactive approval.
 
 Comments must start with `@agent` to be actionable. While planning or
@@ -522,3 +531,41 @@ models independently. Worker failures are persisted with bounded exponential
 backoff, so restarting the process does not create a retry storm. GitHub
 credentials use the same App or legacy-token environment variables as the
 one-shot poll/workflow commands; secrets are never printed.
+
+## Acceptance suite
+
+Most of this repository is the evidence that it works. `tests/` and
+`acceptance/` hold three layers, and the split matters because each answers a
+question the others cannot.
+
+**Deterministic scenarios.** 47 named scenarios under `tests/scenarios/`, run
+with scripted model doubles so they are fast, free and cannot flake on model
+output. A scenario declares which named invariants it requires, and a failure
+names the invariant rather than surfacing a traceback. An invariant that cannot
+observe its subject raises instead of passing, and one that holds only over an
+empty set reports `VACUOUS` rather than `PASS`, so absence of evidence is never
+recorded as evidence.
+
+**Frozen-fixture conformance.** `acceptance/fixtures/review/v1` holds review
+artifacts captured from real executions. `acceptance/runner/conformance.py`
+replays them against the live reviewer to measure how often it produces a
+correct verdict, separating a guard that rejected valid evidence from a model
+that emitted none. Because the fixtures are frozen, a guard change can be
+re-measured with no model calls at all.
+
+**Live GitHub.** Twelve scenarios also run against a real repository, where
+events arrive by polling rather than by direct insertion. Live targets are
+fail-closed: a run is refused unless its repository is named in
+`SWEFORGE_ACCEPTANCE_REPOS`, and any repository in `SWEFORGE_PRIMARY_REPOS` is
+refused first and independently, so an allowlist mistake cannot expose it.
+
+```bash
+uv run pytest -q -n auto                          # every layer offline
+uv run python -m acceptance.runner.cli run S1 --layer L1
+uv run python -m acceptance.runner.cli campaign S1 S2 --repetitions 3
+uv run python -m acceptance.runner.cli check-exit  # campaign exit conditions
+```
+
+`docs/acceptance/` carries the design (`PLAN.md`, `ROADMAP.md`), the gap
+analysis and the decisions taken against it (`COVERAGE-GAPS.md`), and the
+outcome including what was not certified and why (`FINAL-STATUS.md`).
