@@ -20,7 +20,6 @@ from test_repair_retry_bound import _seed_repair_attempt
 
 from sweforge.github_store import (
     ExecutionReviewRecord,
-    SQLiteGitHubStore,
     WorkflowPhase,
 )
 
