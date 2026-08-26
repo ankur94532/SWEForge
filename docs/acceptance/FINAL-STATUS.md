@@ -68,6 +68,35 @@ a decision that 0.95 first-pass is the wrong bar. The second is a contract
 question and is deliberately left open rather than settled by loosening a
 guard.
 
+## The finding that matters most for production
+
+first-pass measures whether guards accept the artifact's *form*.
+bounded-eventual measures something different: whether the run produced the
+expected *verdict*. They are separate axes and should not be read as one.
+
+On RF-14-41504759, a STABLE fixture whose expected verdict is NEEDS_FIXES,
+the reviewer as recorded returned:
+
+    ACCEPT 11, NEEDS_FIXES 8, no result 1
+
+A reviewer that approves work needing fixes is far more dangerous than one
+that rejects valid evidence, and this was invisible while attention was on
+the first-pass rate.
+
+The seven guard fixes improved it substantially. Replaying the same artifacts
+under the corrected guards:
+
+    ACCEPT 6, NEEDS_FIXES 8, BLOCKED 5, no result 1
+    guard vetoes: 0 before, 5 after
+
+Five false accepts became guard vetoes, and the guards went from doing no
+protective work on this fixture to catching five bad approvals. False accepts
+fell from 11 to 6.
+
+**Six remain.** That residual 30% false-accept rate is the highest-value open
+issue in the campaign -- higher than first-pass, higher than E5 -- because it
+is a correctness failure rather than a form one.
+
 ## Not done, and why
 
 - **E5** — needs provider budget for three uncovered components.
