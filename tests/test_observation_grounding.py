@@ -9,7 +9,6 @@ reference.
 """
 
 from sweforge.reviewer import (
-    EvidenceKind,
     InspectionObservation,
     InspectionStatus,
     RequirementInspection,
@@ -58,7 +57,13 @@ def _problems(*, ledger, changed):
 
 
 def test_a_read_in_the_ledger_grounds_the_observation():
-    ledger = {"read:1": {"read_id": "read:1", "normalized_path": PATH}}
+    ledger = {
+        "read:1": {
+            "read_id": "read:1",
+            "normalized_path": PATH,
+            "returned_lines": [2, 11],
+        }
+    }
     assert "IA-UNGROUNDED-OBSERVATION" not in _problems(ledger=ledger, changed=set())
 
 
@@ -71,10 +76,33 @@ def test_an_unread_unchanged_file_is_still_ungrounded():
     file the inspector never read. That is the authority violation it exists
     to prevent, and consulting the ledger must not disable it."""
     ledger = {
-        "read:1": {"read_id": "read:1", "normalized_path": "src/other/Thing.java"}
+        "read:1": {
+            "read_id": "read:1",
+            "normalized_path": "src/other/Thing.java",
+            "returned_lines": [2, 11],
+        }
     }
     assert "IA-UNGROUNDED-OBSERVATION" in _problems(ledger=ledger, changed=set())
 
 
 def test_an_empty_ledger_and_empty_diff_is_ungrounded():
     assert "IA-UNGROUNDED-OBSERVATION" in _problems(ledger={}, changed=set())
+
+
+def test_a_read_outside_the_cited_lines_does_not_ground_it():
+    """Positive control on the range: an observation about lines 2-11 cannot
+    rest on a read of lines 40-50. Grounding on the path alone would let an
+    inspector assert facts about lines it never saw."""
+    ledger = {
+        "read:1": {
+            "read_id": "read:1",
+            "normalized_path": PATH,
+            "returned_lines": [40, 50],
+        }
+    }
+    assert "IA-UNGROUNDED-OBSERVATION" in _problems(ledger=ledger, changed=set())
+
+
+def test_a_read_with_no_recorded_range_grounds_nothing():
+    ledger = {"read:1": {"read_id": "read:1", "normalized_path": PATH}}
+    assert "IA-UNGROUNDED-OBSERVATION" in _problems(ledger=ledger, changed=set())

@@ -2960,6 +2960,24 @@ def _reference_problems(
     return problems
 
 
+def _read_covers_range(read: dict, observation) -> bool:
+    """Does this ledger read actually span the lines the observation cites?
+
+    Grounding on the path alone would let an observation about lines 30-40
+    rest on a read of lines 10-20, which is the authority violation the guard
+    exists to prevent. A read with no recorded range grounds nothing.
+    """
+    returned = read.get("returned_lines") or []
+    if len(returned) != 2:
+        return False
+    first, last = returned
+    start = getattr(observation, "start_line", None)
+    end = getattr(observation, "end_line", None)
+    if start is None or end is None:
+        return False
+    return first <= start and end <= last
+
+
 def _inspection_authority_problems(
     inspection: RequirementInspection,
     *,
@@ -3004,6 +3022,7 @@ def _inspection_authority_problems(
                 observed_path in changed_files
                 or any(
                     str(item.get("normalized_path", "")).lstrip("/") == observed_path
+                    and _read_covers_range(item, observation)
                     for item in ledger_by_id.values()
                 )
                 or any(
