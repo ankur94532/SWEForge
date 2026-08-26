@@ -574,6 +574,11 @@ _NEGATIVE_CHANGE_REQUIREMENT_RE = re.compile(
     r"\bkeep\b[^\n]{0,100}\bunchanged\b|\bcontinue\b[^\n]{0,100}\bunchanged\b|"
     # "no production source files modified" states an absence with words
     # between the negation and the verb, which the fixed phrases above miss.
+    # Deliberately narrow. Widening this to span a parenthesised file list
+    # routed more requirements to the absence check and measured WORSE:
+    # first-pass 0.794 -> 0.756. The model does emit ABSENCE_OF_CHANGE for
+    # those, so the failure is coverage, not missing evidence, and widening
+    # the detector was the wrong lever.
     r"\bno\b[^\n]{0,60}\b(?:modified|changed|touched|edited)\b",
     re.IGNORECASE,
 )
@@ -3027,8 +3032,14 @@ def _inspection_authority_problems(
                 )
             )
     elif classification == ReviewRequirementClassification.STRUCTURAL.value:
-        if _negative_change_targets(requirement["text"]) is not None and not (
-            _has_required_absence_refs(refs, requirement["text"], changed_files)
+        structural_text = requirement.get("text") or ""
+        if (
+            _negative_change_targets(structural_text) is not None
+            # "confirm all tests pass alongside the existing" asserts an
+            # outcome; the run proves it, not the diff. Same reasoning as the
+            # behavioural branch above.
+            and not _asserts_an_outcome(structural_text)
+            and not _has_required_absence_refs(refs, structural_text, changed_files)
         ):
             problems.append(
                 _guard_problem(
