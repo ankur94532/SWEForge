@@ -238,6 +238,28 @@ def _result_signature(result: Any) -> tuple[Any, ...]:
     )
 
 
+def _designated_live_repository() -> str:
+    """The repository live scenarios act on, from the environment.
+
+    Read here rather than passed in so a campaign cannot name a target the
+    allowlist never sanctioned; check_live_target still refuses it either way.
+    """
+    designated = os.environ.get("SWEFORGE_ACCEPTANCE_REPO", "").strip()
+    if designated:
+        return designated
+    names = [
+        item.strip()
+        for item in os.environ.get("SWEFORGE_ACCEPTANCE_REPOS", "").split(",")
+        if item.strip()
+    ]
+    if len(names) == 1:
+        return names[0]
+    raise RuntimeError(
+        "a live campaign needs SWEFORGE_ACCEPTANCE_REPO to name its target; "
+        f"the allowlist holds {names or 'nothing'}"
+    )
+
+
 def _campaign_layer(registry, scenario_id: str, live_layer, *, integration: bool):
     """The layer a campaign should run this scenario at.
 
@@ -304,12 +326,19 @@ def execute_campaign(
         current = []
         for scenario_id in requested:
             run_id = f"pass-{repetition}-{scenario_id.lower()}"
+            scenario_layer = _campaign_layer(
+                registry, scenario_id, live_layer, integration=integration
+            )
             result = execute_scenario(
                 scenario_id,
-                _campaign_layer(
-                    registry, scenario_id, live_layer, integration=integration
+                scenario_layer,
+                # A live scenario must state its target: the preflight refuses
+                # an unnamed repository rather than picking one.
+                repo_full_name=(
+                    _designated_live_repository()
+                    if scenario_layer is live_layer
+                    else None
                 ),
-                repo_full_name=None,
                 status_path=(campaign_runs_root / "per-run" / f"{run_id}-status.json"),
                 runs_root=campaign_runs_root / "scenario-runs",
                 run_id=run_id,
