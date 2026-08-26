@@ -455,9 +455,13 @@ def _condition_5(status: dict[str, Any]) -> ExitConditionResult:
             "curator tracks is a larger body of work than the campaign it "
             "would be certifying. The reviewer is the component that gates "
             "publication and it has 20x8 conformance, seven guard fixes and a "
-            "false-accept rate driven from 55% to zero; the others have "
-            "deterministic scenario coverage of their failure paths in S24, "
-            "S25 and S42. Supplying model_components evidence re-enables this "
+            "false-accept rate driven from 55% to zero. The other components "
+            "have deterministic coverage of their FAILURE PATHS in S24, S25 "
+            "and S42, which is not conformance: their output quality is "
+            "unmeasured, and six of seven reviewer investigations found guard "
+            "defects rather than model defects, so there is no basis for "
+            "assuming their guards are cleaner. This is a named gap, not a "
+            "closed one. Supplying model_components evidence re-enables this "
             "check automatically.",
             required=list(MODEL_COMPONENTS),
         )
