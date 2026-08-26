@@ -160,3 +160,22 @@ bounded-eventual at 1.000 was never within reach.
 The lesson matches the earlier one and is worth stating once more: throughput
 assumptions about this proxy have now been wrong twice, in opposite directions.
 Measure it before believing it.
+
+
+## Fixture provenance is now local only (2026-08-26)
+
+The eight frozen review fixtures were captured from real issues in
+`ankur94532/sweforge-test-pricing` and its siblings; `RF-016-inspector-authority`
+came from issue #16, "Acceptance S1 successful publication lifecycle". Those
+repositories, and the two acceptance sandboxes, have been deleted.
+
+Nothing is broken by that. Each fixture is self-contained -- `worktree.tar.zst`,
+`evidence.json`, `contract.json`, `provenance.json` -- so every test, replay and
+conformance run keeps working exactly as before.
+
+What is gone is the ability to trace a fixture back to the live issue it came
+from, or to re-capture it. The eight `provenance.json` records still name their
+issue numbers, attempt ids and plan ids, but those now refer to state that no
+longer exists anywhere. If the corpus is ever disputed, it can be inspected but
+not re-derived. Documents that still say "do not mutate issue #16" describe a
+constraint that no longer has a subject.
