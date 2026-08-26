@@ -90,7 +90,8 @@
     "rationale": "RF-14-52e49d5a claimed Item.java lines 1-6 when the authoritative ledger returned only lines 1-5; the guard correctly rejected the ungrounded range."
   },
   "IA-UNKNOWN-EXECUTION-SOURCE": {
-    "class": "UNKNOWN",
+    "class": "A",
+    "evidence": "RF-016 run 20 cited exec-evidence-bebb9ccffab526f8f0f945dbeca0ba8d for plan:validation:1, which IS in the fixture execution_observations, and every EXECUTION source_id cited anywhere in that run is in the trusted set -- yet the guard fired. Recorded A because the model cited valid evidence and was refused. MECHANISM UNCONFIRMED: the guard receives the full evidence dict, so why its trusted set differed is not yet explained. Needs a reproduction before any fix.",
     "rationale": "The guard may reject a valid model citation because application evidence identity is misbound; resolve from fixture evidence."
   },
   "IA-UNTRUSTED-DIFF-PATH": {
