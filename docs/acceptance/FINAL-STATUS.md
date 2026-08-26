@@ -135,3 +135,28 @@ of the cost of a full 20x8 for the same answer.
   Explicitly out of scope rather than forgotten.
 - **J5 / PRIMARY acceptance set** — runs only after the exit condition holds.
   It does not hold.
+
+
+## The parallelised verification batch was stopped, and why
+
+A full 20x8 was launched across two proxies, one Codex account each, after a
+concurrent smoke test on both came back clean. It was stopped at 3h25m, roughly
+a third complete, having served 256 requests on one proxy and 390 on the other.
+
+**The parallelisation was probably counterproductive.** One proxy previously
+held both Codex accounts and could round-robin between them, so a single serial
+stream drew on two accounts' capacity. Splitting them gave each proxy one
+account, halving what each stream could draw. Individual requests stretched to
+44 seconds, which looks like queueing. Two streams at half rate is not faster
+than one stream at full rate, and the smoke test could not have caught it: one
+run at a time never reaches a rate limit.
+
+It was stopped because it was confirming numbers already measured by other
+means, not because it was failing. Replay across all eight fixtures gives
+first-pass 0.869, and RF-14 was verified live at NEEDS_FIXES 20/20 after the
+prompt fix. Neither number changes the outcome: K7 does not certify, and
+bounded-eventual at 1.000 was never within reach.
+
+The lesson matches the earlier one and is worth stating once more: throughput
+assumptions about this proxy have now been wrong twice, in opposite directions.
+Measure it before believing it.
