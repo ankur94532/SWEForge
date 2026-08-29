@@ -8,6 +8,7 @@ from .repo_memory import repo_skills_namespace
 
 SKILLS_VIRTUAL_PATH = "/skills/"
 MAX_SKILL_FILE_BYTES = 200_000
+SKILL_LIST_PAGE_SIZE = 100
 
 
 def _skill_key(path: str) -> str:
@@ -45,7 +46,19 @@ def remove_repo_skill(store: BaseStore, repo_id: int, relative_path: str) -> Non
 
 def list_repo_skills(store: BaseStore, repo_id: int) -> list[str]:
     namespace = repo_skills_namespace(repo_id)
-    return sorted(str(item.key) for item in store.search(namespace))
+    keys: list[str] = []
+    offset = 0
+    while True:
+        page = store.search(
+            namespace,
+            limit=SKILL_LIST_PAGE_SIZE,
+            offset=offset,
+        )
+        keys.extend(str(item.key) for item in page)
+        if len(page) < SKILL_LIST_PAGE_SIZE:
+            break
+        offset += len(page)
+    return sorted(keys)
 
 
 def show_repo_skill(store: BaseStore, repo_id: int, relative_path: str) -> str | None:

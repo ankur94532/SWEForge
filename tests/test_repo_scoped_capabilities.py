@@ -77,6 +77,15 @@ def test_memory_and_skill_discovery_are_repo_scoped():
     assert list_repo_skills(memory.store, 101) != list_repo_skills(memory.store, 202)
 
 
+def test_skill_discovery_is_not_limited_to_store_default_page_size():
+    memory = SQLiteMemoryStore(":memory:")
+    expected = [f"/skill-{index:02d}/SKILL.md" for index in range(12)]
+    for relative_path in expected:
+        put_repo_skill(memory.store, 101, relative_path, f"# {relative_path}\n")
+
+    assert list_repo_skills(memory.store, 101) == expected
+
+
 def test_memory_learning_validates_provenance_and_deduplicates(tmp_path: Path):
     path = tmp_path / "README.md"
     path.write_text("Run uv run pytest\n")
