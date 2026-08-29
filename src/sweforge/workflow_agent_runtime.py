@@ -18,6 +18,18 @@ class WorkflowProtocolError(RuntimeError):
     """The model stopped without using the required lifecycle gateway."""
 
 
+def _phase_advanced(authority: WorkflowAuthority, before: Any) -> bool:
+    active = authority.runtime.active_task(before.workflow_cycle_id)
+    if active is None or active.task_run_id != before.task_run_id:
+        return True
+    phase = (
+        active.waiting_from_phase
+        if active.phase == TaskPhase.WAITING_FOR_INPUT
+        else active.phase
+    )
+    return phase != before.phase
+
+
 def approval_resume_for_interrupt(
     pending: tuple[dict[str, Any], ...],
     *,
@@ -68,23 +80,25 @@ def invoke_workflow_phase(
         else {"messages": [{"role": "user", "content": prompt}]}
     )
     for attempt in range(MAX_PROTOCOL_NUDGES + 1):
-        result = agent.invoke(
-            state,
-            config=config,
-            durability="sync",
-            context=context,
-        )
+        try:
+            result = agent.invoke(
+                state,
+                config=config,
+                durability="sync",
+                context=context,
+            )
+        except Exception:
+            # A lifecycle gateway commits its transition before the agent sees
+            # the tool result. The next model turn therefore runs under stale
+            # phase authority and may fail closed. Once durable state proves
+            # the exact task advanced, that post-gateway error must not turn a
+            # successful transition into a dispatcher failure.
+            if _phase_advanced(authority, before):
+                return {}
+            raise
         if result.get("__interrupt__"):
             return result
-        active = authority.runtime.active_task(before.workflow_cycle_id)
-        if active is None or active.task_run_id != before.task_run_id:
-            return result
-        phase = (
-            active.waiting_from_phase
-            if active.phase == TaskPhase.WAITING_FOR_INPUT
-            else active.phase
-        )
-        if phase != before.phase:
+        if _phase_advanced(authority, before):
             return result
         if attempt == MAX_PROTOCOL_NUDGES:
             raise WorkflowProtocolError(
