@@ -1177,7 +1177,11 @@ class SQLiteGitHubStore:
         self.path = Path(path).expanduser()
         if str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.path)
+        # LangGraph executes lifecycle tools on worker threads. The durable
+        # workflow runtime is constructed on the dispatcher worker, so its
+        # repository store must remain usable when a gateway tool calls back
+        # from LangGraph's tool executor.
+        self.connection = sqlite3.connect(self.path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(SCHEMA)

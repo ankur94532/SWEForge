@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -148,6 +149,20 @@ class FakeDriver:
             self.events.append((task.task_id, verdict.value))
 
 
+class ThreadedPlanningDriver(FakeDriver):
+    def drive(self, *, cycle, task, prompt, resume=None):
+        del cycle, prompt, resume
+        assert task.phase == TaskPhase.PLANNING
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(
+                self.runtime.submit_posted_plan,
+                task_run_id=task.task_run_id,
+                plan_text=f"Plan for {task.task_id} from a lifecycle tool thread",
+                posted_comment_id=101,
+                posted_at="2026-01-01T00:10:00Z",
+            ).result()
+
+
 def _git_repo(path):
     path.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True)
@@ -272,7 +287,6 @@ def test_server_drives_custom_diamond_serially_and_publishes_once(tmp_path):
         "PENDING",
     ]
     store.close()
-
     for index, expected_wait in enumerate(("B", "C", "D"), start=1):
         approval = _event(
             SourceKind.ISSUE_COMMENT,
@@ -326,6 +340,33 @@ def test_server_drives_custom_diamond_serially_and_publishes_once(tmp_path):
         ("D", "PLANNED"),
     ]
     assert {workflow_id for workflow_id, _digest in FakeDriver.specs} == {"diamond"}
+    store.close()
+
+
+def test_server_accepts_lifecycle_gateway_from_langgraph_tool_thread(tmp_path):
+    server = _server(tmp_path)
+    server.driver_factory = lambda runtime, cycle_id, worktree, spec: (
+        ThreadedPlanningDriver(runtime, cycle_id, worktree, spec)
+    )
+    root = _event(
+        SourceKind.ISSUE,
+        "root",
+        "@agent plan from a tool thread",
+        "2026-01-01T00:00:00Z",
+    )
+    _record(server.config.db, "issues", root)
+
+    server._worker_entry("github:41:issue:9")
+
+    store = SQLiteGitHubStore(server.config.db)
+    task = store.connection.execute(
+        "SELECT status, phase FROM workflow_task_runs_v1"
+    ).fetchone()
+    assert (task["status"], task["phase"]) == (
+        "WAITING_FOR_APPROVAL",
+        "WAITING_FOR_APPROVAL",
+    )
+    assert store.dispatcher_failure("github:41:issue:9") is None
     store.close()
 
 
