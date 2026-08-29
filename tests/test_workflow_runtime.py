@@ -1,5 +1,7 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from threading import Barrier
 
 import pytest
 
@@ -158,6 +160,29 @@ def test_diamond_runs_strictly_serial_in_declaration_order(runtime):
     assert finished.status == WorkflowCycleStatus.AWAITING_PUBLICATION
     assert finished.active_task_id is None
     assert engine.publication_is_eligible(cycle.workflow_cycle_id)
+
+
+def test_shared_workflow_connection_serializes_parallel_tool_reads(runtime):
+    """Parallel agent tools must not corrupt reads on the shared SQLite handle."""
+    _, engine, cycle = runtime
+    selected = engine.select_active_task(cycle.workflow_cycle_id)
+    assert selected.task_id == "A"
+    workers = 16
+    start = Barrier(workers)
+
+    def read_active_cycle() -> None:
+        start.wait()
+        for _ in range(500):
+            current = engine.cycle(cycle.workflow_cycle_id)
+            active = engine.active_task(cycle.workflow_cycle_id)
+            assert current.status == WorkflowCycleStatus.ACTIVE
+            assert current.active_task_id == "A"
+            assert active is not None and active.task_id == "A"
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(read_active_cycle) for _ in range(workers)]
+        for future in futures:
+            future.result()
 
 
 def test_waiting_for_approval_retains_owner_and_does_not_start_ready_peer(runtime):

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from threading import RLock
 
 from .events import EventKind, emit
 from .github_models import (
@@ -23,6 +24,87 @@ from .github_models import (
     is_exact_agent_approval,
     starts_with_agent_invocation,
 )
+
+
+class _SerializedSQLiteCursor(sqlite3.Cursor):
+    """Serialize every operation on a shared cross-thread connection."""
+
+    @property
+    def _lock(self) -> RLock:
+        return self.connection._serialize_lock  # type: ignore[attr-defined]
+
+    def execute(self, *args, **kwargs):
+        with self._lock:
+            return super().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._lock:
+            return super().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self._lock:
+            return super().executescript(*args, **kwargs)
+
+    def fetchone(self):
+        with self._lock:
+            return super().fetchone()
+
+    def fetchmany(self, *args, **kwargs):
+        with self._lock:
+            return super().fetchmany(*args, **kwargs)
+
+    def fetchall(self):
+        with self._lock:
+            return super().fetchall()
+
+    def __next__(self):
+        with self._lock:
+            return super().__next__()
+
+    def close(self) -> None:
+        with self._lock:
+            super().close()
+
+
+class _SerializedSQLiteConnection(sqlite3.Connection):
+    """A sqlite connection safe for LangGraph's parallel tool workers."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._serialize_lock = RLock()
+
+    def serialized(self) -> RLock:
+        """Hold the connection across a multi-statement transaction."""
+        return self._serialize_lock
+
+    def cursor(self, factory=None):
+        with self._serialize_lock:
+            return super().cursor(factory or _SerializedSQLiteCursor)
+
+    def execute(self, *args, **kwargs):
+        with self._serialize_lock:
+            return self.cursor().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        with self._serialize_lock:
+            return self.cursor().executemany(*args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        with self._serialize_lock:
+            return self.cursor().executescript(*args, **kwargs)
+
+    def commit(self) -> None:
+        with self._serialize_lock:
+            super().commit()
+
+    def rollback(self) -> None:
+        with self._serialize_lock:
+            super().rollback()
+
+    def close(self) -> None:
+        with self._serialize_lock:
+            super().close()
+
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -1212,7 +1294,11 @@ class SQLiteGitHubStore:
         # workflow runtime is constructed on the dispatcher worker, so its
         # repository store must remain usable when a gateway tool calls back
         # from LangGraph's tool executor.
-        self.connection = sqlite3.connect(self.path, check_same_thread=False)
+        self.connection = sqlite3.connect(
+            self.path,
+            check_same_thread=False,
+            factory=_SerializedSQLiteConnection,
+        )
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(SCHEMA)
@@ -2073,13 +2159,14 @@ class SQLiteGitHubStore:
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
-        try:
-            self.connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
-            yield self.connection
-            self.connection.commit()
-        except Exception:
-            self.connection.rollback()
-            raise
+        with self.connection.serialized():
+            try:
+                self.connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+                yield self.connection
+                self.connection.commit()
+            except Exception:
+                self.connection.rollback()
+                raise
 
     def upsert_repository(self, repo_id: int, full_name: str, observed_at: str) -> None:
         with self.transaction() as db:
