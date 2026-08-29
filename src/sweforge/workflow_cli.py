@@ -132,7 +132,9 @@ def main(argv: list[str] | None = None) -> int:
         store = SQLiteGitHubStore(args.db)
         checkpoints = SQLiteCheckpointer(args.checkpoints)
         memory = SQLiteMemoryStore(args.memory_db)
-        result = WorkflowEngine(store=store, client=client).advance(
+        result = WorkflowEngine(
+            store=store, client=client, allow_legacy_auto_approval=False
+        ).advance(
             thread_id=args.thread_id,
             model=planning_model,
             review_model=review_model,

@@ -42,6 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resolution-model")
     parser.add_argument("--clarification-model")
     parser.add_argument("--capabilities-config", type=Path)
+    parser.add_argument(
+        "--workflow-spec",
+        type=Path,
+        help=(
+            "trusted operator-owned YAML workflow specification; never loaded "
+            "from a target repository"
+        ),
+    )
     parser.add_argument("--ready-file", type=Path)
     parser.add_argument("--sandbox-provider")
     parser.add_argument("--unsafe-local-shell", action="store_true")
@@ -105,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
             resolution_model=args.resolution_model,
             clarification_model=args.clarification_model,
             capabilities_config=args.capabilities_config,
+            workflow_spec=args.workflow_spec,
             sandbox_provider=args.sandbox_provider,
             ready_file=args.ready_file,
             unsafe_local_shell=args.unsafe_local_shell,

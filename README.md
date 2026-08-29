@@ -50,8 +50,8 @@ the persisted IssueThread/SourceEvent, never from model text or repository
 configuration. Memory and skills use separate namespaces derived from the
 stable GitHub repository ID. MCP discovery is filtered by a trusted
 `RepoCapabilityRegistry`, and every MCP call is re-authorized by an interceptor.
-The default task subagent inherits the same runtime context and filesystem
-permissions. Strict GitHub execution requires a configured provider-neutral
+The bounded investigator inherits the same runtime context and stricter
+read-only filesystem permissions. Strict GitHub execution requires a configured provider-neutral
 sandbox backend and fails closed when none is available. Repository A therefore
 cannot discover or access repository B's memory, skills, MCP tools, workspace,
 or credentials in strict mode.
@@ -111,28 +111,96 @@ the two authentication modes are never combined.
 The boundary is: GitHub → poller → durable `SourceEvent`/`IssueThread`;
 execution comes later.
 
-## Durable planning workflow
+## One-agent declarative workflow
 
-IssueThread execution is gated by an application-owned workflow state machine.
-In INTERACTIVE mode, an actionable root enters planning, SWEForge posts a
-versioned plan to the original issue, and only the exact command
-`@agent approve` creates a permit for that exact plan version. Other leading
-`@agent` comments revise the plan.
+The durable GitHub architecture has one workflow-owning root Deep Agent and an
+application-owned generic task lifecycle. The model chooses how to work within
+the current phase; SQLite transactions decide which task and phase are legally
+reachable. LangGraph checkpoints remain authoritative for conversation,
+model/tool continuation, summarization, and native interrupts. They are not a
+second workflow state machine.
 
-Approval is authorized, not merely parsed. The commenter must have `admin`,
-`maintain` or `write` permission on the repository; `triage` and `read` are
-refused, because both can comment and neither can change the repository, and
-approval is what lets the agent write to it. The check fails closed: an
-unreachable API or a missing author is refused rather than assumed, and a
-refused approval creates no permit. The planner uses a structurally read-only
-filesystem backend: it cannot execute a shell or mutate the worktree.
+Every task follows `PENDING -> PLANNING -> WAITING_FOR_APPROVAL -> EXECUTING ->
+VALIDATING -> DONE`. `NEEDS_FIXES` returns the same task to execution;
+scope-changing validation invalidates its permit and returns it to planning.
+Execution alone never satisfies a dependency. Only `DONE`, after an `ACCEPT`
+validation with evidence, does.
 
-An issue labeled `AUTO` follows the same plan-and-post sequence, then the
-application re-checks the label and creates an AUTO permit, emitting the same
-`PERMIT_CREATED` event the human path does. AUTO skips the human wait; it does
-not skip planning or observability, and because no human is involved the audit
-record is the only evidence that the authorization happened. Removing the label
-before permit creation returns the workflow to interactive approval.
+The root can delegate research to one explicitly configured read-only
+investigator. That worker inherits repository, worktree, workflow, cycle,
+active-task, phase, MCP, filesystem, and skill boundaries. It never receives
+lifecycle, mutation, permit, or scheduling gateways. This explicit worker
+overrides Deep Agents' unrestricted automatically-added worker, so delegation
+cannot bypass approval.
+
+### Trusted workflow specifications
+
+Pass `--workflow-spec /operator/path/workflow.yaml` to `sweforge-serve`. The
+path is explicit operator configuration and is never discovered in a target
+repository. Specifications are schema-versioned, canonicalized, hashed, and
+rejected before execution for malformed or duplicate IDs, missing
+dependencies, cycles, unknown tools, missing phase skills, or malformed values.
+If omitted, SWEForge uses a built-in one-task `implementation` workflow.
+
+```yaml
+version: 1
+workflow_id: release-change
+tasks:
+  - id: api
+    depends_on: []
+    planning:
+      skill: api-planning
+      tools: [read_file, glob, grep]
+    execution:
+      skill: api-execution
+      tools: [read_file, write_file, edit_file, execute]
+    validation:
+      skill: api-validation
+      tools: [read_file, glob, grep, run_validation]
+  - id: docs
+    depends_on: [api]
+    planning:
+      skill: docs-planning
+      tools: [read_file, glob, grep]
+    execution:
+      skill: docs-execution
+      tools: [read_file, write_file, edit_file, execute]
+    validation:
+      skill: docs-validation
+      tools: [read_file, glob, grep, run_validation]
+```
+
+Task declaration order is the deterministic tie-breaker. Exactly one
+`active_task_id` is persisted. A task retains ownership while waiting for
+approval or input, executing, validating, repairing, or replanning; no eligible
+peer starts. When it reaches `DONE`, ownership is released and the first
+declaration-order pending task whose dependencies are all `DONE` is selected.
+All tasks share the IssueThread worktree and cumulative branch. One final
+commit/push/PR publication is authorized only after every task is `DONE`, no
+task is active, and every final plan/permit/validation identity still matches.
+
+### Plan and phase authorization
+
+The root agent must call `submit_plan`; plan-like prose is not phase
+completion. SWEForge first publishes or reconciles the versioned plan comment,
+binds its digest to the thread/cycle/workflow/task run, and then creates a
+native LangGraph approval interrupt. Publication failure leaves execution
+impossible. Only exact `@agent approve` on the correct conversation after the
+visible plan, from a user whose `admin`, `maintain`, or `write` permission can
+be proven, resumes that occurrence and creates a current-plan permit. Feedback
+replans the same task, supersedes the old plan, and requires new approval.
+
+Planning is structurally read-only. Before each model call middleware re-reads
+the authoritative task, filters the registered union of tools to the phase
+allowlist, selects the configured phase model, and discloses only the active
+phase skill. Every tool call is checked again immediately before execution;
+mutating calls also revalidate the exact permit. Waiting phases run neither
+root nor delegated model work.
+
+The strict GitHub server and workflow CLI do not honor the legacy `AUTO` label
+as an approval bypass. Existing AUTO waits are downgraded to interactive. A
+named compatibility switch remains only for old standalone test harnesses and
+is disabled by production entry points.
 
 Comments must start with `@agent` to be actionable. While planning or
 executing, persisted leading-invocation comments are injected before the next
@@ -250,16 +318,18 @@ uv run sweforge-github-execution --db ~/.sweforge/state.db skip EVENT_KEY
 
 ### Execution review and repair
 
-Workflow execution is split into provider-neutral model roles:
+The single root agent can select provider-neutral models by phase:
 
 - `planning_model`: use a high-quality model for planning and replanning.
 - `execution_model`: a lower-cost model may perform the approved implementation.
-- `review_model`: use a high-quality model to inspect the cumulative workspace.
+- `review_model`: use a high-quality model during `VALIDATING`.
 
-The durable flow is `plan -> execute -> review -> repair/review loop -> ACCEPT -> publish`.
-Providers remain interchangeable. Reviewers are structurally read-only, and
-publication is unavailable until the latest successful attempt has an exact
-`ACCEPT` review.
+Model selection does not construct separate planner/executor/reviewer workflow
+owners. The durable flow is `plan -> approve -> execute -> validate ->
+repair/validate loop -> ACCEPT`; after all tasks accept, SWEForge publishes
+once. Validation is structurally read-only, and publication is unavailable
+until every task's latest successful attempt has exact matching `ACCEPT`
+evidence.
 
 After a successful execution, publish one result with the App credentials:
 

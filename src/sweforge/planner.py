@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 from typing import Annotated, Any
 
-from deepagents import create_deep_agent
 from deepagents.backends import (
     CompositeBackend,
     FilesystemBackend,
@@ -15,7 +14,7 @@ from deepagents.middleware.permissions import FilesystemPermission
 from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field, model_validator
 
-from .agent import LiveInputMiddleware
+from .agent import LiveInputMiddleware, build_workflow_agent
 from .context import RepoAgentContext
 from .repo_memory import (
     MEMORY_VIRTUAL_PATH,
@@ -129,8 +128,9 @@ def build_planner(context: PlannerContext, *, model: str):
         if context.live_input_provider is not None
         else []
     )
-    return create_deep_agent(
+    return build_workflow_agent(
         model=model,
+        tools=[],
         backend=_planner_backend(context),
         memory=memory,
         skills=[SKILLS_VIRTUAL_PATH] if context.repo_context else None,
@@ -139,6 +139,18 @@ def build_planner(context: PlannerContext, *, model: str):
         context_schema=RepoAgentContext if context.repo_context else None,
         response_format=PlanResult,
         middleware=middleware,
+        subagents=[
+            {
+                "name": "general-purpose",
+                "description": "Bounded read-only repository investigator.",
+                "system_prompt": (
+                    "Inspect repository files and return concise evidence. Do not "
+                    "write files, execute commands, or advance workflow state."
+                ),
+                "tools": [],
+                "permissions": permissions,
+            }
+        ],
         system_prompt=(
             "You are a read-only repository planner. Inspect files and repository "
             "memory, then produce a concise implementation plan. Do not edit files, "

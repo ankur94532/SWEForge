@@ -326,6 +326,111 @@ CREATE TABLE IF NOT EXISTS deferred_followups (
     consumed_cycle_id INTEGER,
     consumed_at TEXT
 );
+
+-- Versioned generic workflow runtime.  The legacy single-task tables above
+-- remain migration inputs and publication/evidence compatibility storage;
+-- these tables are the workflow-control authority for declarative DAG cycles.
+CREATE TABLE IF NOT EXISTS workflow_cycles_v1 (
+    workflow_cycle_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    root_input_id TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    workflow_version INTEGER NOT NULL,
+    workflow_digest TEXT NOT NULL,
+    workflow_spec_json TEXT NOT NULL,
+    workflow_spec_ref TEXT,
+    status TEXT NOT NULL,
+    active_task_id TEXT,
+    failure_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(thread_id, cycle_id)
+);
+CREATE TABLE IF NOT EXISTS workflow_task_runs_v1 (
+    task_run_id TEXT PRIMARY KEY,
+    workflow_cycle_id TEXT NOT NULL REFERENCES workflow_cycles_v1(workflow_cycle_id),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    cycle_id INTEGER NOT NULL,
+    workflow_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    declaration_index INTEGER NOT NULL,
+    dependencies_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    current_plan_id TEXT,
+    execution_attempt INTEGER NOT NULL DEFAULT 0,
+    validation_round INTEGER NOT NULL DEFAULT 0,
+    repair_feedback_json TEXT NOT NULL DEFAULT '[]',
+    failure_reason TEXT,
+    waiting_from_phase TEXT,
+    clarification_occurrence_key TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(workflow_cycle_id, task_id),
+    UNIQUE(workflow_cycle_id, declaration_index)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_task_runs_cycle
+    ON workflow_task_runs_v1(workflow_cycle_id, declaration_index);
+CREATE TABLE IF NOT EXISTS workflow_task_plans_v1 (
+    plan_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES workflow_task_runs_v1(task_run_id),
+    workflow_cycle_id TEXT NOT NULL REFERENCES workflow_cycles_v1(workflow_cycle_id),
+    task_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    plan_text TEXT NOT NULL,
+    plan_digest TEXT NOT NULL,
+    status TEXT NOT NULL,
+    posted_at TEXT NOT NULL,
+    posted_comment_id INTEGER NOT NULL,
+    approval_occurrence_key TEXT NOT NULL UNIQUE,
+    approved_at TEXT,
+    approved_by TEXT,
+    approval_event_key TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_run_id, version)
+);
+CREATE TABLE IF NOT EXISTS workflow_task_permits_v1 (
+    permit_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES workflow_task_runs_v1(task_run_id),
+    workflow_cycle_id TEXT NOT NULL REFERENCES workflow_cycles_v1(workflow_cycle_id),
+    plan_id TEXT NOT NULL REFERENCES workflow_task_plans_v1(plan_id),
+    plan_version INTEGER NOT NULL,
+    plan_digest TEXT NOT NULL,
+    approval_event_key TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    invalidated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS workflow_task_executions_v1 (
+    execution_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES workflow_task_runs_v1(task_run_id),
+    workflow_cycle_id TEXT NOT NULL REFERENCES workflow_cycles_v1(workflow_cycle_id),
+    plan_id TEXT NOT NULL REFERENCES workflow_task_plans_v1(plan_id),
+    permit_id TEXT NOT NULL REFERENCES workflow_task_permits_v1(permit_id),
+    attempt INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL,
+    UNIQUE(task_run_id, attempt)
+);
+CREATE TABLE IF NOT EXISTS workflow_task_validations_v1 (
+    validation_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES workflow_task_runs_v1(task_run_id),
+    workflow_cycle_id TEXT NOT NULL REFERENCES workflow_cycles_v1(workflow_cycle_id),
+    plan_id TEXT NOT NULL REFERENCES workflow_task_plans_v1(plan_id),
+    execution_attempt INTEGER NOT NULL,
+    validation_round INTEGER NOT NULL,
+    verdict TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    findings_json TEXT NOT NULL,
+    repair_instructions_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_run_id, validation_round)
+);
 """
 
 MAX_EXECUTION_EVIDENCE_PER_ATTEMPT = 96_000

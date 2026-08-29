@@ -664,3 +664,11 @@ M2 event log ─────┴──> M4 invariants ──> M5 twenty-six L1 sc
 M7: S1 → S19 → S2 → S18 → S15 → S16 → S4 → S8 → S9 → S20 → S10 → S11   (LIVE-GITHUB)
     interleaved with S3 S5 S6 S7 S12 S13 S14 S17 S21 S22 S23 S24 S25 S26 (LIVE-PROCESS)
 ```
+# Declarative workflow milestone
+
+The generic serial scheduler, versioned trusted workflow schema, task-run
+persistence, exact plan permits, validation/repair transitions, phase policy,
+progressive skill disclosure, bounded investigator delegation, and all-tasks
+publication gate are implemented and covered offline. A future live campaign
+may exercise the A -> {B,C} -> D fixture against an external repository; this
+refactor intentionally does not create or configure that repository.

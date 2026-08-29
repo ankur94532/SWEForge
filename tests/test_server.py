@@ -211,12 +211,47 @@ def test_server_config_and_cli_mapping_are_deterministic(tmp_path):
     )
     server = SWEForgeServer(config, client_factory=lambda _: (None, None))
     assert config.planning == config.execution == config.review == "m"
+    assert server.workflow_spec.workflow_id == "default"
     assert list(config.repositories) == ["a/repo", "z/repo"]
     assert (
         build_parser().parse_args(["--repo-path", "a/repo=/tmp", "--model", "m"]).once
         is False
     )
     assert server.stop_event.is_set() is False
+
+
+def test_server_loads_explicit_trusted_workflow_spec(tmp_path):
+    spec_path = tmp_path / "operator-workflow.yaml"
+    spec_path.write_text(
+        """version: 1
+workflow_id: operator
+tasks:
+  - id: task
+    depends_on: []
+    planning: {skill: plan, tools: [read_file]}
+    execution: {skill: execute, tools: [edit_file]}
+    validation: {skill: validate, tools: [read_file]}
+"""
+    )
+    config = ServerConfig(
+        repositories=("a/repo",),
+        repo_paths={"a/repo": tmp_path},
+        model="m",
+        workflow_spec=spec_path,
+    )
+    server = SWEForgeServer(config, client_factory=lambda _: (None, None))
+    assert server.workflow_spec.workflow_id == "operator"
+    parsed = build_parser().parse_args(
+        [
+            "--repo-path",
+            "a/repo=/tmp",
+            "--model",
+            "m",
+            "--workflow-spec",
+            str(spec_path),
+        ]
+    )
+    assert parsed.workflow_spec == spec_path
 
 
 def test_server_rejects_invalid_bounds(tmp_path):

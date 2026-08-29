@@ -290,6 +290,7 @@ class WorkflowEngine:
         reviewer: Callable[..., ExecutionReviewResult] | None = None,
         memory_learner: Callable[..., list[RepoMemoryCandidate]] | None = None,
         clarification_classifier: Callable[..., dict] | None = None,
+        allow_legacy_auto_approval: bool = True,
         clock: Callable[[], str] = _now,
     ) -> None:
         self.store = store
@@ -298,6 +299,7 @@ class WorkflowEngine:
         self.reviewer = reviewer or review_execution
         self.memory_learner = memory_learner
         self.clarification_classifier = clarification_classifier
+        self.allow_legacy_auto_approval = allow_legacy_auto_approval
         self.clock = clock
 
     def start_cycle(
@@ -436,7 +438,7 @@ class WorkflowEngine:
             else None
         )
         mode = WorkflowMode.INTERACTIVE
-        if self.client is not None:
+        if self.client is not None and self.allow_legacy_auto_approval:
             repo = self.client.repository(thread["repo_full_name"])
             if issue_has_auto_label(self.client.issue(repo, thread["issue_number"])):
                 mode = WorkflowMode.AUTO
@@ -723,6 +725,10 @@ class WorkflowEngine:
         return permit
 
     def authorize_auto(self, *, thread_id: str) -> ExecutionPermit:
+        if not self.allow_legacy_auto_approval:
+            raise PermissionError(
+                "AUTO approval is disabled; exact authorized human approval is required"
+            )
         state = self.store.workflow_state(thread_id)
         if state is None or state.mode != WorkflowMode.AUTO:
             raise ValueError("AUTO authorization is not enabled")
@@ -2904,7 +2910,16 @@ class WorkflowEngine:
             state.phase == WorkflowPhase.WAITING_FOR_PLAN_APPROVAL
             and state.mode == WorkflowMode.AUTO
         ):
-            if self.client is not None:
+            if not self.allow_legacy_auto_approval:
+                self.store.save_workflow_state(
+                    replace(
+                        state,
+                        mode=WorkflowMode.INTERACTIVE,
+                        updated_at=self.clock(),
+                    )
+                )
+                state = self.store.workflow_state(thread_id)
+            if self.client is not None and self.allow_legacy_auto_approval:
                 repo = self.client.repository(state.repo_full_name)
                 if not issue_has_auto_label(
                     self.client.issue(repo, state.issue_number)

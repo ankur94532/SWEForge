@@ -28,6 +28,7 @@ from .github_publisher import GitHubPublisher
 from .github_store import SQLiteGitHubStore
 from .repo_memory import SQLiteMemoryStore
 from .workflow import WorkflowEngine, WorkflowPhase
+from .workflow_spec import DEFAULT_WORKFLOW, WorkflowSpec, load_workflow_spec
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,7 @@ class ServerConfig:
     resolution_model: str | None = None
     clarification_model: str | None = None
     capabilities_config: Path | None = None
+    workflow_spec: Path | None = None
     sandbox_provider: str | None = None
     # Written once the singleton lock is held and polling is wired, so a test
     # harness can wait on a real signal instead of sleeping and hoping.
@@ -199,6 +201,11 @@ class SWEForgeServer:
         if not config.repo_paths or set(config.repositories) != set(config.repo_paths):
             raise ValueError("repositories and repo-path mappings must match")
         self.config = config
+        self.workflow_spec: WorkflowSpec = (
+            load_workflow_spec(config.workflow_spec)
+            if config.workflow_spec is not None
+            else DEFAULT_WORKFLOW
+        )
         self.client_factory = client_factory or _credentials
         self.poller_factory = poller_factory or GitHubPoller
         self.worker_runner = worker_runner
@@ -253,6 +260,7 @@ class SWEForgeServer:
             engine = WorkflowEngine(
                 store=store,
                 client=client,
+                allow_legacy_auto_approval=False,
                 clarification_classifier=build_clarification_classifier(
                     self.config.clarification
                 ),

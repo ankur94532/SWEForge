@@ -1127,6 +1127,7 @@ dependencies = [
     { name = "langchain-mcp-adapters" },
     { name = "langgraph-checkpoint-sqlite" },
     { name = "pyjwt", extra = ["crypto"] },
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -1145,6 +1146,7 @@ requires-dist = [
     { name = "langchain-mcp-adapters", specifier = ">=0.3.0" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.1" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9.0" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
 ]
 
 [package.metadata.requires-dev]

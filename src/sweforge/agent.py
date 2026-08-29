@@ -43,6 +43,136 @@ from .repo_memory import (
     repo_skills_namespace,
 )
 from .skills import SKILLS_VIRTUAL_PATH
+from .workflow_middleware import (
+    RESEARCH_TOOLS,
+    DelegatedWorkflowPolicyMiddleware,
+    ReadOnlyInvestigatorMiddleware,
+    WorkflowAuthority,
+    WorkflowPolicyMiddleware,
+    WorkflowSkillsMiddleware,
+)
+from .workflow_runtime import TaskPhase
+
+
+def build_workflow_agent(
+    *,
+    model: str | BaseChatModel,
+    tools: list[Any],
+    backend: CompositeBackend,
+    system_prompt: str,
+    memory: list[str] | None = None,
+    skills: list[str] | None = None,
+    permissions: list[FilesystemPermission] | None = None,
+    store: BaseStore | None = None,
+    context_schema: type | None = None,
+    checkpointer: object | None = None,
+    middleware: list[AgentMiddleware] | None = None,
+    response_format: Any = None,
+    subagents: list[dict[str, Any]] | None = None,
+):
+    """Canonical constructor for the one workflow-owning Deep Agent.
+
+    Callers must pass an explicit bounded ``general-purpose`` worker. Its name
+    overrides Deep Agents' automatically added unrestricted worker, so ``task``
+    cannot become an authority expansion.
+    """
+    if not subagents or not any(
+        item.get("name") == "general-purpose" for item in subagents
+    ):
+        raise ValueError(
+            "workflow agent requires an explicit bounded general-purpose subagent"
+        )
+    return create_deep_agent(
+        model=model,
+        tools=tools,
+        subagents=subagents,
+        backend=backend,
+        system_prompt=system_prompt,
+        memory=memory,
+        skills=skills,
+        permissions=permissions,
+        store=store,
+        context_schema=context_schema,
+        checkpointer=checkpointer,
+        middleware=middleware or [],
+        response_format=response_format,
+        name="sweforge-workflow-root",
+    )
+
+
+def build_durable_workflow_agent(
+    *,
+    planning_model: str | BaseChatModel,
+    execution_model: str | BaseChatModel,
+    validation_model: str | BaseChatModel,
+    backend: CompositeBackend,
+    authority: WorkflowAuthority,
+    lifecycle_tools: list[Any],
+    capability_tools: list[Any] | None = None,
+    read_skill: Callable[[int, str], str],
+    checkpointer: object,
+    store: BaseStore | None = None,
+    context_schema: type | None = None,
+    memory: list[str] | None = None,
+    permissions: list[FilesystemPermission] | None = None,
+    middleware: list[AgentMiddleware] | None = None,
+):
+    """Build the one durable root agent with a bounded investigator below it."""
+    extra_tools = capability_tools or []
+    research = [
+        tool for tool in extra_tools if getattr(tool, "name", "") in RESEARCH_TOOLS
+    ]
+    delegated_policy = DelegatedWorkflowPolicyMiddleware(authority)
+    delegated_skills = WorkflowSkillsMiddleware(authority, read_skill)
+    subagents = [
+        {
+            # This explicit bounded override prevents Deep Agents from adding
+            # its unrestricted default general-purpose worker.
+            "name": "general-purpose",
+            "description": (
+                "Read-only repository investigator for the current active task "
+                "and phase. Returns a concise evidence report."
+            ),
+            "system_prompt": (
+                "Investigate only. Lifecycle changes, delegation, writes and "
+                "command execution are structurally unavailable."
+            ),
+            "tools": research,
+            "middleware": [delegated_policy, delegated_skills],
+        }
+    ]
+    policy = WorkflowPolicyMiddleware(
+        authority,
+        phase_models={
+            TaskPhase.PLANNING: planning_model,
+            TaskPhase.EXECUTING: execution_model,
+            TaskPhase.VALIDATING: validation_model,
+        },
+    )
+    return build_workflow_agent(
+        model=planning_model,
+        tools=[*extra_tools, *lifecycle_tools],
+        backend=backend,
+        system_prompt=(
+            "You are the sole SWEForge workflow-owning root agent. Reason freely "
+            "within the authoritative current phase, and use its lifecycle gateway "
+            "when complete. Never infer or perform a workflow transition yourself."
+        ),
+        memory=memory,
+        # Dynamic skill middleware discloses one phase skill. Passing the broad
+        # /skills source here would advertise inactive operational authority.
+        skills=None,
+        permissions=permissions,
+        store=store,
+        context_schema=context_schema,
+        checkpointer=checkpointer,
+        middleware=[
+            policy,
+            WorkflowSkillsMiddleware(authority, read_skill),
+            *(middleware or []),
+        ],
+        subagents=subagents,
+    )
 
 
 def _live_message_id(event_key: str) -> str:
@@ -435,6 +565,7 @@ def run_task(
                 "numbers. Do not modify application state."
             ),
             "tools": [*mcp_tools, *research_tools],
+            "middleware": [ReadOnlyInvestigatorMiddleware()],
         }
     ]
     system_prompt = (
@@ -478,7 +609,7 @@ def run_task(
             middleware=middleware,
         )
         if repair_mode
-        else create_deep_agent(
+        else build_workflow_agent(
             model=model,
             tools=agent_tools,
             subagents=subagents,

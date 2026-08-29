@@ -325,3 +325,14 @@ Then, and only then, the PRIMARY acceptance set runs.
 2. Add the probe MCP server — S4–S9 currently have no substrate at all.
 3. Turn on fixture capture **before** the next live run, so that run stops
    being wasted.
+# Declarative workflow architecture (2026-08)
+
+The acceptance target now treats an IssueThread cycle as a trusted declarative
+DAG of generic task runs. The application persists exactly one active task and
+owns every transition through planning, exact human approval, execution,
+validation, repair/replan, completion, and one cumulative publication. The root
+Deep Agent is the sole workflow owner. Its investigator subagent is a bounded
+read-only worker and cannot receive lifecycle gateways or broader phase
+authority. Deterministic coverage lives in `test_workflow_spec.py`,
+`test_workflow_runtime.py`, `test_workflow_middleware.py`, and
+`test_workflow_agent_runtime.py`.
