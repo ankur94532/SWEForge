@@ -120,6 +120,16 @@ reachable. LangGraph checkpoints remain authoritative for conversation,
 model/tool continuation, summarization, and native interrupts. They are not a
 second workflow state machine.
 
+The production path is direct: `SWEForgeServer._worker_entry` constructs a
+`DeclarativeWorkflowController`, which uses `WorkflowRuntime` to select one
+task and `DeepAgentWorkflowDriver` to invoke the same checkpointed root graph
+under the current phase policy. Once every declared task is `DONE`, the
+existing crash-safe publisher creates one cumulative publication and
+finalization enqueues repository-memory and resolved-issue learning. The
+historical `WorkflowEngine` tables and helpers remain readable for database
+migration and offline regression fixtures, but the server and workflow CLI do
+not import or invoke that state machine.
+
 Every task follows `PENDING -> PLANNING -> WAITING_FOR_APPROVAL -> EXECUTING ->
 VALIDATING -> DONE`. `NEEDS_FIXES` returns the same task to execution;
 scope-changing validation invalidates its permit and returns it to planning.
@@ -139,8 +149,13 @@ Pass `--workflow-spec /operator/path/workflow.yaml` to `sweforge-serve`. The
 path is explicit operator configuration and is never discovered in a target
 repository. Specifications are schema-versioned, canonicalized, hashed, and
 rejected before execution for malformed or duplicate IDs, missing
-dependencies, cycles, unknown tools, missing phase skills, or malformed values.
-If omitted, SWEForge uses a built-in one-task `implementation` workflow.
+dependencies, cycles, unknown tools, or malformed values. Phase skills are
+loaded from repository-scoped operator memory and fail closed when that phase
+starts if one is missing. The canonical document and digest are persisted with
+the cycle; restart rehydrates that exact specification rather than silently
+switching an in-progress cycle to newly configured policy. If omitted,
+SWEForge uses a built-in one-task `implementation` workflow through the same
+controller, approval, validation, and publication path.
 
 ```yaml
 version: 1
@@ -194,22 +209,32 @@ Planning is structurally read-only. Before each model call middleware re-reads
 the authoritative task, filters the registered union of tools to the phase
 allowlist, selects the configured phase model, and discloses only the active
 phase skill. Every tool call is checked again immediately before execution;
-mutating calls also revalidate the exact permit. Waiting phases run neither
-root nor delegated model work.
+every execution-phase root call also revalidates the exact permit. Planning
+and validation filter built-in mutation even if a stale specification lists
+it. Waiting phases run neither root nor delegated model work.
+
+`finish_execution` records the model report together with application-captured
+sandbox command observations and enters `VALIDATING`, never `DONE`. Validation
+must call the application-owned `run_validation` tool, which captures the
+cumulative Git diff and durable task execution records. `finish_validation`
+cannot accept without that record. Final publication independently rechecks
+the visible approval SourceEvent, plan digest, uninvalidated permit, successful
+execution observations, and latest matching `ACCEPT` validation for every
+declared task.
 
 The strict GitHub server and workflow CLI do not honor the legacy `AUTO` label
 as an approval bypass. Existing AUTO waits are downgraded to interactive. A
 named compatibility switch remains only for old standalone test harnesses and
 is disabled by production entry points.
 
-Comments must start with `@agent` to be actionable. While planning or
-executing, persisted leading-invocation comments are injected before the next
-model call using stable event-derived LangGraph message IDs. The delivery is
-at-least-once and logically deduplicated. Control comments are consumed by the
-workflow and cannot later become independent coding executions. Plan and
-execution-summary comments use deterministic markers so publication retries do
-not duplicate them. Repository memory remains read-only to both planner and
-executor agents.
+Comments must start with `@agent` to be actionable. The controller routes
+approval, plan feedback, and clarification replies only to the exact pending
+interrupt occurrence. Other follow-ups remain durable inputs for a later
+cycle; queued legacy deferred inputs are consumed by the same declarative
+controller after migration. Control comments cannot later become independent
+coding executions. Plan comments and cumulative publication use deterministic
+identities so retries do not duplicate them. Repository memory remains
+read-only to the root and delegated agents.
 
 ## Repository-scoped long-term memory
 
@@ -556,11 +581,11 @@ payloads the poller already holds, so learning never needs its own network call.
 Retrieval is local and deterministic: SQLite FTS5/BM25 over the case rows,
 always filtered by authoritative `repo_id`, so one repository can never read
 another's history. The index is derived and rebuildable; the rows are
-authoritative. Planning automatically receives the top few relevant cases,
-capped at one per IssueThread so a single noisy issue cannot flood context, and
-the main agent can call `search_issue_memory` for deeper read-only research.
-Cases are always framed as clues to verify against current code, and the
-approved plan remains the only thing that authorizes work.
+authoritative. The built-in workflow exposes `search_issue_memory` during
+planning, and custom specifications may explicitly expose it in a read-only
+phase. Results are capped at one per IssueThread so a single noisy issue cannot
+flood context. Cases are always framed as clues to verify against current code,
+and the approved plan remains the only thing that authorizes work.
 
 Both learning lanes are optimizations, never authorization inputs. Each claims
 its attempt durably *before* invoking a model, so a hard crash consumes budget

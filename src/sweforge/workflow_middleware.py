@@ -13,7 +13,6 @@ from langchain_core.messages import SystemMessage
 from .workflow_runtime import TaskPhase, WorkflowRuntime
 from .workflow_spec import WorkflowSpec
 
-LIFECYCLE_TOOLS = frozenset({"submit_plan", "finish_execution", "finish_validation"})
 MUTATING_TOOLS = frozenset({"write_file", "edit_file", "execute"})
 RESEARCH_TOOLS = frozenset({"ls", "read_file", "glob", "grep", "search_issue_memory"})
 
@@ -42,15 +41,39 @@ class WorkflowAuthority:
         self.spec = spec
 
     def snapshot(self) -> WorkflowPolicySnapshot:
+        return self._snapshot_for_replay(None)
+
+    def snapshot_for_tool(self, tool_name: str) -> WorkflowPolicySnapshot:
+        return self._snapshot_for_replay(tool_name)
+
+    def resume_snapshot(self, kind: str) -> WorkflowPolicySnapshot:
+        replay_tool = {
+            "PLAN_APPROVAL": "submit_plan",
+            "PLAN_FEEDBACK": "submit_plan",
+            "CLARIFICATION_RESPONSE": "request_clarification",
+        }.get(kind)
+        if replay_tool is None:
+            raise PermissionError("workflow resume kind is invalid")
+        return self._snapshot_for_replay(replay_tool)
+
+    def _snapshot_for_replay(self, replay_tool: str | None) -> WorkflowPolicySnapshot:
         cycle = self.runtime.cycle(self.workflow_cycle_id)
         task = self.runtime.active_task(self.workflow_cycle_id)
         if task is None or cycle.active_task_id != task.task_id:
             raise PermissionError("workflow has no active task")
-        phase = (
-            task.waiting_from_phase
-            if task.phase == TaskPhase.WAITING_FOR_INPUT
-            else task.phase
-        )
+        if (
+            task.phase == TaskPhase.WAITING_FOR_INPUT
+            and replay_tool == "request_clarification"
+            and task.waiting_from_phase is not None
+        ):
+            phase = task.waiting_from_phase
+        elif (
+            task.phase == TaskPhase.WAITING_FOR_APPROVAL
+            and replay_tool == "submit_plan"
+        ):
+            phase = TaskPhase.PLANNING
+        else:
+            phase = task.phase
         if phase not in (
             TaskPhase.PLANNING,
             TaskPhase.EXECUTING,
@@ -119,10 +142,23 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
     @staticmethod
     def allowed_tools(snapshot: WorkflowPolicySnapshot) -> frozenset[str]:
         # ``task`` delegates only to the explicitly bounded investigator.
-        return snapshot.configured_tools | {
-            _phase_gateway(snapshot.phase),
-            "task",
-        }
+        configured = snapshot.configured_tools
+        if snapshot.phase in (TaskPhase.PLANNING, TaskPhase.VALIDATING):
+            # A malformed or stale trusted spec cannot turn a read-only phase
+            # into an execution phase. Custom MCP tools remain operator-owned;
+            # built-in mutation is denied here and again at call time.
+            configured = configured - MUTATING_TOOLS
+        validation_service = (
+            {"run_validation"} if snapshot.phase == TaskPhase.VALIDATING else set()
+        )
+        return (
+            configured
+            | validation_service
+            | {
+                _phase_gateway(snapshot.phase),
+                "task",
+            }
+        )
 
     def wrap_model_call(self, request, handler):
         snapshot = self.authority.snapshot()
@@ -148,14 +184,20 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
         return handler(request.override(**overrides))
 
     def wrap_tool_call(self, request, handler):
-        snapshot = self.authority.snapshot()
         name = _call_name(request)
+        snapshot_for_tool = getattr(self.authority, "snapshot_for_tool", None)
+        snapshot = (
+            snapshot_for_tool(name)
+            if callable(snapshot_for_tool)
+            else self.authority.snapshot()
+        )
         if name not in self.allowed_tools(snapshot):
             raise PermissionError(
                 f"tool {name!r} is forbidden for {snapshot.phase.value}"
             )
-        if name in MUTATING_TOOLS:
-            # The check is intentionally at call time, after model generation.
+        if snapshot.phase == TaskPhase.EXECUTING and name != "task":
+            # Re-authorize every root execution-phase call, including custom
+            # MCP tools whose mutability cannot be inferred from their names.
             self.authority.runtime.assert_execution_authorized(snapshot.task_run_id)
         self._reject_inactive_skill_path(request, snapshot)
         return handler(request)

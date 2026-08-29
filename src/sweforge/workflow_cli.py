@@ -3,6 +3,7 @@
 import argparse
 import os
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .capabilities import load_capability_registry
@@ -12,7 +13,9 @@ from .github_auth import DEFAULT_API_VERSION, GitHubAppAuthenticator
 from .github_client import HttpxGitHubClient
 from .github_store import SQLiteGitHubStore
 from .repo_memory import SQLiteMemoryStore
-from .workflow import WorkflowEngine
+from .workflow_controller import DeclarativeWorkflowController
+from .workflow_driver import DeepAgentWorkflowDriver
+from .workflow_spec import BUILTIN_WORKFLOW_TOOLS, DEFAULT_WORKFLOW, load_workflow_spec
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--capabilities-config",
         type=Path,
         help="trusted operator MCP registry config outside target repositories",
+    )
+    parser.add_argument(
+        "--workflow-spec",
+        type=Path,
+        help="trusted operator-owned declarative workflow specification",
     )
     parser.add_argument(
         "--unsafe-local-shell",
@@ -89,8 +97,6 @@ def main(argv: list[str] | None = None) -> int:
     planning_model = args.planning_model or args.model
     execution_model = args.execution_model or args.model
     review_model = args.review_model or args.model
-    memory_model = args.memory_model or review_model
-    resolution_model = args.resolution_model or memory_model
     if not all((planning_model, execution_model, review_model)):
         print(
             "sweforge-github-workflow: planning, execution, and review "
@@ -132,32 +138,55 @@ def main(argv: list[str] | None = None) -> int:
         store = SQLiteGitHubStore(args.db)
         checkpoints = SQLiteCheckpointer(args.checkpoints)
         memory = SQLiteMemoryStore(args.memory_db)
-        result = WorkflowEngine(
-            store=store, client=client, allow_legacy_auto_approval=False
-        ).advance(
-            thread_id=args.thread_id,
-            model=planning_model,
-            review_model=review_model,
-            memory_model=memory_model,
-            resolution_model=resolution_model,
+        spec = (
+            load_workflow_spec(
+                args.workflow_spec,
+                known_tools=(
+                    set(BUILTIN_WORKFLOW_TOOLS)
+                    | set(capability_registry.known_tool_names())
+                    if capability_registry
+                    else BUILTIN_WORKFLOW_TOOLS
+                ),
+            )
+            if args.workflow_spec
+            else DEFAULT_WORKFLOW
+        )
+        sandbox = resolve_sandbox_provider(args.sandbox_provider)
+
+        def driver_factory(runtime, workflow_cycle_id, worktree, cycle_spec):
+            return DeepAgentWorkflowDriver(
+                runtime=runtime,
+                workflow_cycle_id=workflow_cycle_id,
+                spec=cycle_spec,
+                store=store,
+                client=client,
+                worktree=worktree,
+                planning_model=planning_model,
+                execution_model=execution_model,
+                validation_model=review_model,
+                checkpointer=checkpoints.saver,
+                memory_store=memory.store,
+                capability_registry=capability_registry,
+                sandbox_backend_provider=sandbox,
+                secure_execution=not args.unsafe_local_shell,
+                unsafe_local_shell=args.unsafe_local_shell,
+            )
+
+        result = DeclarativeWorkflowController(
+            store=store,
+            client=client,
+            spec=spec,
+            spec_ref=(
+                str(args.workflow_spec.resolve())
+                if args.workflow_spec
+                else "builtin:default"
+            ),
             repo_paths=mappings,
             workspace_root=args.workspace_root,
-            memory_store=memory.store,
-            execute_kwargs={
-                "model": execution_model,
-                "repo_paths": mappings,
-                "workspace_root": args.workspace_root,
-                "lock_root": args.lock_root,
-                "checkpointer": checkpoints.saver,
-                "memory_store": memory.store,
-                "capability_registry": capability_registry,
-                "secure_execution": not args.unsafe_local_shell,
-                "unsafe_local_shell": args.unsafe_local_shell,
-                "sandbox_backend_provider": resolve_sandbox_provider(
-                    args.sandbox_provider
-                ),
-            },
-        )
+            lock_root=args.lock_root,
+            driver_factory=driver_factory,
+            clock=lambda: datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        ).advance(args.thread_id)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"sweforge-github-workflow: {exc}", file=sys.stderr)
         return 1
@@ -165,13 +194,11 @@ def main(argv: list[str] | None = None) -> int:
         for resource in (memory, checkpoints, store, client, authenticator):
             if resource is not None:
                 resource.close()
-    print(f"workflow phase: {result.phase.value}")
-    if result.plan_id:
-        print(f"plan ID: {result.plan_id}")
-    if result.permit_id:
-        print(f"permit ID: {result.permit_id}")
-    if result.message:
-        print(result.message)
+    print(f"workflow status: {result.status}")
+    if result.active_task_id:
+        print(f"active task: {result.active_task_id}")
+    if result.phase:
+        print(f"task phase: {result.phase.value}")
     return 0
 
 

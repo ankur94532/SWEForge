@@ -89,12 +89,37 @@ def test_planning_cannot_mutate_even_with_stale_tool_call():
         policy.wrap_tool_call(tool_request("edit_file"), lambda item: "ran")
 
 
+def test_planning_filters_mutation_even_if_trusted_spec_is_malformed():
+    policy = WorkflowPolicyMiddleware(
+        Authority(TaskPhase.PLANNING, ("read_file", "edit_file", "execute"))
+    )
+    request = ModelRequest(
+        tools=[
+            SimpleNamespace(name=name) for name in ("read_file", "edit_file", "execute")
+        ]
+    )
+    captured = policy.wrap_model_call(request, lambda item: item)
+    assert {tool.name for tool in captured.tools} == {"read_file"}
+    with pytest.raises(PermissionError, match="forbidden"):
+        policy.wrap_tool_call(tool_request("execute"), lambda item: "ran")
+
+
 def test_mutating_tool_rechecks_exact_permit_at_call_time():
     authority = Authority(
         TaskPhase.EXECUTING, ("read_file", "write_file", "edit_file", "execute")
     )
     policy = WorkflowPolicyMiddleware(authority)
     assert policy.wrap_tool_call(tool_request("edit_file"), lambda item: "ran") == "ran"
+    assert authority.runtime.reauthorized == ["task-run-A"]
+
+
+def test_custom_execution_tool_rechecks_exact_permit_at_call_time():
+    authority = Authority(TaskPhase.EXECUTING, ("trusted_server_change",))
+    policy = WorkflowPolicyMiddleware(authority)
+    assert (
+        policy.wrap_tool_call(tool_request("trusted_server_change"), lambda item: "ran")
+        == "ran"
+    )
     assert authority.runtime.reauthorized == ["task-run-A"]
 
 

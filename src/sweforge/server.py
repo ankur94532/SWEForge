@@ -14,7 +14,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .capabilities import load_capability_registry
-from .clarification import build_clarification_classifier
 from .execution import SQLiteCheckpointer
 from .execution_security import resolve_sandbox_provider
 from .github_auth import (
@@ -27,8 +26,17 @@ from .github_poller import GitHubPoller
 from .github_publisher import GitHubPublisher
 from .github_store import SQLiteGitHubStore
 from .repo_memory import SQLiteMemoryStore
-from .workflow import WorkflowEngine, WorkflowPhase
-from .workflow_spec import DEFAULT_WORKFLOW, WorkflowSpec, load_workflow_spec
+from .workflow_controller import DeclarativeWorkflowController
+from .workflow_driver import DeepAgentWorkflowDriver
+from .workflow_learning import WorkflowLearningService
+from .workflow_spec import (
+    BUILTIN_WORKFLOW_TOOLS,
+    DEFAULT_WORKFLOW,
+    WorkflowSpec,
+    load_workflow_spec,
+)
+
+MAX_DECLARATIVE_DRIVER_FAILURES = 3
 
 
 @dataclass(frozen=True)
@@ -191,6 +199,9 @@ class SWEForgeServer:
         | None = None,
         poller_factory: Callable[..., GitHubPoller] | None = None,
         worker_runner: Callable[[str], None] | None = None,
+        driver_factory: Callable[..., object] | None = None,
+        publisher_factory: Callable[..., object] | None = None,
+        learning_factory: Callable[..., object] | None = None,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         if config.workers < 1 or config.max_ticks < 1 or config.poll_interval < 0:
@@ -201,14 +212,30 @@ class SWEForgeServer:
         if not config.repo_paths or set(config.repositories) != set(config.repo_paths):
             raise ValueError("repositories and repo-path mappings must match")
         self.config = config
+        self.capability_registry = (
+            load_capability_registry(config.capabilities_config)
+            if config.capabilities_config
+            else None
+        )
         self.workflow_spec: WorkflowSpec = (
-            load_workflow_spec(config.workflow_spec)
+            load_workflow_spec(
+                config.workflow_spec,
+                known_tools=(
+                    set(BUILTIN_WORKFLOW_TOOLS)
+                    | set(self.capability_registry.known_tool_names())
+                    if self.capability_registry
+                    else BUILTIN_WORKFLOW_TOOLS
+                ),
+            )
             if config.workflow_spec is not None
             else DEFAULT_WORKFLOW
         )
         self.client_factory = client_factory or _credentials
         self.poller_factory = poller_factory or GitHubPoller
         self.worker_runner = worker_runner
+        self.driver_factory = driver_factory
+        self.publisher_factory = publisher_factory or GitHubPublisher
+        self.learning_factory = learning_factory or WorkflowLearningService
         self.now = now or (lambda: datetime.now(UTC))
         self.stop_event = threading.Event()
         self._futures: dict[Future, str] = {}
@@ -250,6 +277,7 @@ class SWEForgeServer:
     def _worker_entry(self, thread_id: str) -> None:
         store = SQLiteGitHubStore(self.config.db)
         client = authenticator = checkpoints = memory = None
+        controller = None
         try:
             if self.worker_runner is not None:
                 self.worker_runner(thread_id)
@@ -257,41 +285,60 @@ class SWEForgeServer:
             client, authenticator = self.client_factory(self.config)
             checkpoints = SQLiteCheckpointer(self.config.checkpoints)
             memory = SQLiteMemoryStore(self.config.memory_db)
-            engine = WorkflowEngine(
+            capability_registry = self.capability_registry
+            sandbox = resolve_sandbox_provider(self.config.sandbox_provider)
+
+            def production_driver_factory(
+                runtime, workflow_cycle_id, worktree, cycle_spec
+            ):
+                return DeepAgentWorkflowDriver(
+                    runtime=runtime,
+                    workflow_cycle_id=workflow_cycle_id,
+                    spec=cycle_spec,
+                    store=store,
+                    client=client,
+                    worktree=worktree,
+                    planning_model=self.config.planning,
+                    execution_model=self.config.execution,
+                    validation_model=self.config.review,
+                    checkpointer=checkpoints.saver,
+                    memory_store=memory.store,
+                    capability_registry=capability_registry,
+                    sandbox_backend_provider=sandbox,
+                    secure_execution=not self.config.unsafe_local_shell,
+                    unsafe_local_shell=self.config.unsafe_local_shell,
+                )
+
+            controller = DeclarativeWorkflowController(
                 store=store,
                 client=client,
-                allow_legacy_auto_approval=False,
-                clarification_classifier=build_clarification_classifier(
-                    self.config.clarification
+                spec=self.workflow_spec,
+                spec_ref=(
+                    str(self.config.workflow_spec.resolve())
+                    if self.config.workflow_spec
+                    else "builtin:default"
                 ),
+                repo_paths=self.config.repo_paths,
+                workspace_root=self.config.workspace_root,
+                lock_root=self.config.lock_root,
+                driver_factory=self.driver_factory or production_driver_factory,
+                clock=self._timestamp,
             )
-            capability_registry = (
-                load_capability_registry(self.config.capabilities_config)
-                if self.config.capabilities_config
-                else None
+            learning = self.learning_factory(
+                store=store,
+                memory_store=memory.store,
+                memory_model=self.config.memory,
+                resolution_model=self.config.resolution,
+                lock_root=self.config.lock_root,
+                clock=self._timestamp,
             )
-            execute_kwargs = {
-                "model": self.config.execution,
-                "repo_paths": self.config.repo_paths,
-                "workspace_root": self.config.workspace_root,
-                "lock_root": self.config.lock_root,
-                "checkpointer": checkpoints.saver,
-                "memory_store": memory.store,
-                "capability_registry": capability_registry,
-                "secure_execution": not self.config.unsafe_local_shell,
-                "unsafe_local_shell": self.config.unsafe_local_shell,
-                "sandbox_backend_provider": resolve_sandbox_provider(
-                    self.config.sandbox_provider
-                ),
-            }
             self._drain_workflow(
                 thread_id=thread_id,
                 store=store,
-                engine=engine,
+                controller=controller,
                 client=client,
                 token_provider=authenticator,
-                memory_store=memory.store,
-                execute_kwargs=execute_kwargs,
+                learning=learning,
             )
             store.clear_dispatcher_failure(thread_id)
         except Exception as exc:
@@ -299,6 +346,18 @@ class SWEForgeServer:
             store.record_dispatcher_failure(
                 thread_id, now=now, error=_safe_dispatch_error(exc)
             )
+            failure = store.dispatcher_failure(thread_id)
+            if (
+                controller is not None
+                and failure is not None
+                and failure["failure_count"] >= MAX_DECLARATIVE_DRIVER_FAILURES
+            ):
+                cycle = controller.runtime.cycle_for_thread(thread_id)
+                if cycle is not None and cycle.status.value == "ACTIVE":
+                    controller.runtime.fail_active_task(
+                        cycle.workflow_cycle_id,
+                        reason=_safe_dispatch_error(exc),
+                    )
             raise
         finally:
             for resource in (memory, checkpoints, store, client, authenticator):
@@ -310,26 +369,17 @@ class SWEForgeServer:
         *,
         thread_id: str,
         store: SQLiteGitHubStore,
-        engine: WorkflowEngine,
+        controller: DeclarativeWorkflowController,
         client: GitHubClient,
         token_provider: object,
-        memory_store: object,
-        execute_kwargs: dict,
+        learning: WorkflowLearningService,
     ) -> None:
-        """Drain bounded authoritative workflow ticks for one IssueThread."""
+        """Drain bounded generic-runtime ticks for one IssueThread."""
         for _ in range(self.config.max_ticks):
-            result = engine.advance(
-                thread_id=thread_id,
-                model=self.config.planning,
-                review_model=self.config.review,
-                memory_model=self.config.memory,
-                resolution_model=self.config.resolution,
-                repo_paths=self.config.repo_paths,
-                workspace_root=self.config.workspace_root,
-                memory_store=memory_store,
-                execute_kwargs=execute_kwargs,
-            )
-            if result.phase == WorkflowPhase.AWAITING_PUBLICATION:
+            if learning.process_one(thread_id):
+                continue
+            result = controller.advance(thread_id)
+            if result.status == "AWAITING_PUBLICATION":
                 publication_id = store.eligible_publication_id(thread_id)
                 if not publication_id:
                     break
@@ -339,7 +389,7 @@ class SWEForgeServer:
                     and publication_record.status.value == "FAILED"
                 ):
                     break
-                publication = GitHubPublisher(
+                publication = self.publisher_factory(
                     store=store,
                     client=client,
                     token_provider=token_provider,
@@ -348,12 +398,15 @@ class SWEForgeServer:
                 ).publish_one(publication_id)
                 if publication.status not in {"COMPLETED", "NO_CHANGES"}:
                     raise RuntimeError(f"publication {publication.status.lower()}")
-            if result.message == "busy":
+                store.finalize_publication(publication_id, now=self._timestamp())
+                continue
+            if result.status in {"BUSY", "FAILED", "IDLE"}:
                 break
-            if result.phase != WorkflowPhase.AWAITING_PUBLICATION:
-                now = self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
-                if not store.is_thread_runnable(thread_id, now=now):
-                    break
+            if not store.is_thread_runnable(thread_id, now=self._timestamp()):
+                break
+
+    def _timestamp(self) -> str:
+        return self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
 
     def _signal_ready(self) -> None:
         """Announce readiness only after the lock is held and polling ran once."""

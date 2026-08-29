@@ -283,7 +283,13 @@ DEFAULT_WORKFLOW = parse_workflow_spec(
                 "depends_on": [],
                 "planning": {
                     "skill": "implementation-planning",
-                    "tools": ["ls", "read_file", "glob", "grep"],
+                    "tools": [
+                        "ls",
+                        "read_file",
+                        "glob",
+                        "grep",
+                        "search_issue_memory",
+                    ],
                 },
                 "execution": {
                     "skill": "implementation-execution",
@@ -296,6 +302,7 @@ DEFAULT_WORKFLOW = parse_workflow_spec(
                         "edit_file",
                         "execute",
                         "request_clarification",
+                        "propose_repo_memory",
                     ],
                 },
                 "validation": {

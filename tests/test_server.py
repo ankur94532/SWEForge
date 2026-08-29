@@ -10,12 +10,10 @@ from sweforge.github_models import (
     SubjectKind,
 )
 from sweforge.github_store import (
-    AttemptStatus,
     SQLiteGitHubStore,
     WorkflowMode,
     WorkflowPhase,
 )
-from sweforge.reviewer import ReviewFinalizationError
 from sweforge.server import (
     ServerConfig,
     ServerInstanceLock,
@@ -93,67 +91,35 @@ def test_runnable_query_is_stable_and_persisted_backoff_excludes_thread(tmp_path
     reopened.close()
 
 
-def test_server_review_failure_records_backoff_without_hot_loop(monkeypatch, tmp_path):
+def test_server_driver_failure_records_backoff_without_hot_loop(tmp_path):
     store = _store(tmp_path)
-    repo = RepositoryRef(1, "owner/repo")
-    approval = replace(
-        _event(repo, "approval", "@agent approve"),
-        source_updated_at="2026-01-01T00:02:00Z",
-        source_created_at="2026-01-01T00:02:00Z",
-    )
-    store.record_batch(
-        1,
-        "issue_comments",
-        [approval],
-        since="now",
-        etag=None,
-        polled_at="2026-01-01T00:00:01Z",
-    )
-    root_key = store.events()[0]["event_key"]
-    engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:00:01Z")
-    engine.start_cycle(event_key=root_key, plan_text="do work", posted_comment_id=1)
-    engine.approve(event_key=approval.event_key)
-    state = store.workflow_state("github:1:issue:7")
-    plan = store.current_plan("github:1:issue:7")
-    permit = store.permit_for_plan(plan.plan_id)
-    attempt = store.ensure_execution_attempt(
-        attempt_id="attempt-1",
-        thread_id="github:1:issue:7",
-        cycle_id=1,
-        plan_id=plan.plan_id,
-        plan_version=plan.version,
-        root_event_key=state.root_event_key,
-        authorization_id=permit.permit_id,
-        created_at="2026-01-01T00:00:01Z",
-    )
-    store.finish_execution_attempt(
-        attempt.attempt_id,
-        status=AttemptStatus.SUCCEEDED,
-        completed_at="2026-01-01T00:00:02Z",
-        response_text="done",
-        start_head_sha="base",
-        end_head_sha="head",
-    )
-    store.save_workflow_state(
-        replace(state, phase=WorkflowPhase.REVIEW_EXECUTION, updated_at="now")
-    )
-    attempt_id = attempt.attempt_id
     store.close()
-
-    calls = []
-
-    class FailingEngine:
-        def __init__(self, **_kwargs):
-            pass
-
-        def advance(self, **_kwargs):
-            calls.append(True)
-            raise ReviewFinalizationError("finalizer unavailable")
-
-    monkeypatch.setattr("sweforge.server.WorkflowEngine", FailingEngine)
-    monkeypatch.setattr(
-        "sweforge.server.build_clarification_classifier", lambda _: None
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    (source / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=source, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        cwd=source,
+        check=True,
     )
+
+    class FailingDriver:
+        def drive(self, **_kwargs):
+            raise RuntimeError("driver unavailable")
+
+        def reconcile_interrupts(self, **_kwargs):
+            pass
 
     class Client:
         def close(self):
@@ -161,7 +127,7 @@ def test_server_review_failure_records_backoff_without_hot_loop(monkeypatch, tmp
 
     config = ServerConfig(
         repositories=("owner/repo",),
-        repo_paths={"owner/repo": tmp_path},
+        repo_paths={"owner/repo": source},
         db=tmp_path / "state.db",
         checkpoints=tmp_path / "checkpoints.sqlite",
         memory_db=tmp_path / "memory.sqlite",
@@ -170,18 +136,18 @@ def test_server_review_failure_records_backoff_without_hot_loop(monkeypatch, tmp
         model="model",
         max_ticks=20,
     )
-    server = SWEForgeServer(config, client_factory=lambda _: (Client(), None))
-    with pytest.raises(ReviewFinalizationError):
+    server = SWEForgeServer(
+        config,
+        client_factory=lambda _: (Client(), None),
+        driver_factory=lambda *_args: FailingDriver(),
+    )
+    with pytest.raises(RuntimeError, match="driver unavailable"):
         server._worker_entry("github:1:issue:7")
 
     reopened = SQLiteGitHubStore(tmp_path / "state.db")
-    assert len(calls) == 1
-    assert (
-        reopened.workflow_state("github:1:issue:7").phase
-        is WorkflowPhase.REVIEW_EXECUTION
-    )
-    assert reopened.latest_attempt("github:1:issue:7", 1).attempt_id == attempt_id
-    assert reopened.execution_review_for_attempt(attempt_id) is None
+    cycle = reopened.connection.execute("SELECT * FROM workflow_cycles_v1").fetchone()
+    assert cycle["status"] == "ACTIVE"
+    assert cycle["active_task_id"] == "implementation"
     failure = reopened.dispatcher_failure("github:1:issue:7")
     assert failure is not None
     assert failure["failure_count"] == 1
@@ -469,6 +435,75 @@ def test_hard_execution_failure_is_terminal_for_server_drain(tmp_path):
         _event(repo, "root", "@agent fail safely"),
         source_created_at="2026-01-01T00:00:00Z",
     )
+    store.upsert_repository(1, repo.full_name, "2026-01-01T00:00:00Z")
+    store.record_batch(
+        1,
+        "issues",
+        [root],
+        since="now",
+        etag=None,
+        polled_at="2026-01-01T00:00:01Z",
+    )
+    store.close()
+
+    class FailingExecutionDriver:
+        def __init__(self, runtime, *_args):
+            self.runtime = runtime
+
+        def has_pending_interrupt(self, **_kwargs):
+            return True
+
+        def reconcile_interrupts(self, **_kwargs):
+            pass
+
+        def drive(self, *, task, resume=None, **_kwargs):
+            if resume:
+                self.runtime.approve_plan(
+                    task_run_id=task.task_run_id,
+                    occurrence_key=resume["occurrence_key"],
+                    approval_event_key=resume["event_key"],
+                    approved_by=resume["approved_by"],
+                    approval_is_authorized=True,
+                    approval_occurred_at=resume["approved_at"],
+                )
+            elif task.phase.value == "PLANNING":
+                self.runtime.submit_posted_plan(
+                    task_run_id=task.task_run_id,
+                    plan_text="fail safely",
+                    posted_comment_id=1,
+                    posted_at="2026-01-01T00:00:30Z",
+                )
+            else:
+                raise RuntimeError("ACCEPTANCE_DETERMINISTIC_EXECUTION_FAILURE")
+
+    class Client:
+        def repository(self, full_name):
+            return RepositoryRef(1, full_name)
+
+        def collaborator_permission(self, repo_ref, login):
+            return "write"
+
+        def close(self):
+            pass
+
+    config = ServerConfig(
+        repositories=(repo.full_name,),
+        repo_paths={repo.full_name: source},
+        db=store.path,
+        checkpoints=tmp_path / "checkpoints.db",
+        memory_db=tmp_path / "memory.db",
+        workspace_root=tmp_path / "workspaces",
+        lock_root=tmp_path / "locks",
+        model="test-model",
+        max_ticks=20,
+    )
+    client = Client()
+    server = SWEForgeServer(
+        config,
+        client_factory=lambda _: (client, client),
+        driver_factory=lambda *args: FailingExecutionDriver(*args),
+    )
+    server._worker_entry("github:1:issue:7")
     approval = replace(
         _event_for(
             repo,
@@ -480,15 +515,7 @@ def test_hard_execution_failure_is_terminal_for_server_drain(tmp_path):
         source_updated_at="2026-01-01T01:00:00Z",
         source_created_at="2026-01-01T01:00:00Z",
     )
-    store.upsert_repository(1, repo.full_name, "2026-01-01T00:00:00Z")
-    store.record_batch(
-        1,
-        "issues",
-        [root],
-        since="now",
-        etag=None,
-        polled_at="2026-01-01T00:00:01Z",
-    )
+    store = SQLiteGitHubStore(config.db)
     store.record_batch(
         1,
         "issue_comments",
@@ -497,64 +524,18 @@ def test_hard_execution_failure_is_terminal_for_server_drain(tmp_path):
         etag=None,
         polled_at="2026-01-01T01:00:01Z",
     )
-    engine = WorkflowEngine(store=store, clock=lambda: "2026-01-01T00:00:30Z")
-    plan = engine.start_cycle(
-        event_key=root.event_key, plan_text="fail safely", posted_comment_id=1
-    )
-    engine.approve(event_key=approval.event_key)
-    runs = 0
-
-    def failing_runner(**kwargs):
-        nonlocal runs
-        runs += 1
-        raise RuntimeError("ACCEPTANCE_DETERMINISTIC_EXECUTION_FAILURE")
-
-    config = ServerConfig(
-        repositories=(repo.full_name,),
-        repo_paths={repo.full_name: source},
-        db=store.path,
-        workspace_root=tmp_path / "workspaces",
-        lock_root=tmp_path / "locks",
-        model="test-model",
-        max_ticks=20,
-    )
-    server = SWEForgeServer(config, client_factory=lambda _: (None, None))
-    server._drain_workflow(
-        thread_id="github:1:issue:7",
-        store=store,
-        engine=engine,
-        client=object(),
-        token_provider=object(),
-        memory_store=None,
-        execute_kwargs={
-            "model": "test-model",
-            "repo_paths": {repo.full_name: source},
-            "workspace_root": tmp_path / "workspaces",
-            "lock_root": tmp_path / "locks",
-            "checkpointer": object(),
-            "runner": failing_runner,
-            "secure_execution": False,
-            "unsafe_local_shell": True,
-        },
-    )
-    state = store.workflow_state("github:1:issue:7")
-    assert runs == 1
-    assert state.phase is WorkflowPhase.EXECUTION_FAILED
-    assert not store.is_thread_runnable(state.thread_id, now="2026-01-01T00:01:00Z")
-    assert store.latest_attempt(state.thread_id, state.cycle_id).status is (
-        AttemptStatus.FAILED
-    )
-    assert store.eligible_publication_id(state.thread_id) is None
-    assert store.pending_memory_learning(state.thread_id) is None
-    assert store.pending_issue_resolution(state.thread_id) is None
-    assert (
-        store.publication_for_cycle(
-            thread_id=state.thread_id,
-            cycle_id=state.cycle_id,
-            root_event_key=state.root_event_key,
-            root_input_id=state.root_input_id,
-        )
-        is None
-    )
-    assert store.current_plan(state.thread_id).plan_id == plan.plan_id
+    store.close()
+    for _ in range(3):
+        with pytest.raises(
+            RuntimeError, match="ACCEPTANCE_DETERMINISTIC_EXECUTION_FAILURE"
+        ):
+            server._worker_entry("github:1:issue:7")
+    store = SQLiteGitHubStore(config.db)
+    cycle = store.connection.execute("SELECT * FROM workflow_cycles_v1").fetchone()
+    task = store.connection.execute("SELECT * FROM workflow_task_runs_v1").fetchone()
+    assert cycle["status"] == "FAILED"
+    assert task["status"] == "FAILED"
+    assert store.eligible_publication_id("github:1:issue:7") is None
+    assert store.pending_memory_learning("github:1:issue:7") is None
+    assert store.pending_issue_resolution("github:1:issue:7") is None
     store.close()

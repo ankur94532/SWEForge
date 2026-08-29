@@ -1,9 +1,11 @@
+import json
 from dataclasses import replace
 
 import pytest
 
 from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
 from sweforge.github_store import SQLiteGitHubStore
+from sweforge.workflow_middleware import WorkflowAuthority
 from sweforge.workflow_runtime import (
     TaskPhase,
     ValidationVerdict,
@@ -11,6 +13,7 @@ from sweforge.workflow_runtime import (
     WorkflowRuntime,
 )
 from sweforge.workflow_spec import parse_workflow_spec
+from sweforge.workflow_tools import build_lifecycle_tools
 
 
 def _event(repo):
@@ -101,7 +104,15 @@ def _approve_execute_validate(engine, task, verdict=ValidationVerdict.ACCEPT):
         approval_occurred_at="2026-01-01T00:12:00Z",
     )
     assert permit.plan_digest == plan.plan_digest
-    validating = engine.finish_execution(task.task_run_id)
+    validating = engine.finish_execution(
+        task.task_run_id,
+        evidence={
+            "reported": {"tests": "passed"},
+            "tool_observations": [
+                {"command": "tests", "exit_code": 0, "output": "passed"}
+            ],
+        },
+    )
     assert validating.phase == TaskPhase.VALIDATING
     return engine.finish_validation(
         task_run_id=task.task_run_id,
@@ -109,7 +120,10 @@ def _approve_execute_validate(engine, task, verdict=ValidationVerdict.ACCEPT):
         summary="validated",
         findings=[],
         repair_instructions=["repair"] if verdict != ValidationVerdict.ACCEPT else [],
-        evidence={"tests": "passed"},
+        evidence={
+            "reported": {"tests": "passed"},
+            "validation_runs": [{"diff": "", "executions": []}],
+        },
     )
 
 
@@ -146,6 +160,13 @@ def test_waiting_for_approval_retains_owner_and_does_not_start_ready_peer(runtim
     }
     assert statuses["A"] == TaskPhase.WAITING_FOR_APPROVAL
     assert statuses["B"] == statuses["C"] == statuses["D"] == TaskPhase.PENDING
+
+    authority = WorkflowAuthority(engine, cycle.workflow_cycle_id, _spec())
+    with pytest.raises(PermissionError, match="not runnable"):
+        authority.snapshot()
+    assert authority.snapshot_for_tool("submit_plan").phase == TaskPhase.PLANNING
+    with pytest.raises(PermissionError, match="not runnable"):
+        authority.snapshot_for_tool("read_file")
 
 
 def test_b_selected_before_c_and_d_waits_for_both(runtime):
@@ -195,6 +216,12 @@ def test_clarification_occurrence_retains_owner_and_cannot_cross_resume(runtime)
     assert paused.phase == TaskPhase.WAITING_FOR_INPUT
     assert engine.cycle(cycle.workflow_cycle_id).active_task_id == "A"
     assert engine.select_active_task(cycle.workflow_cycle_id).task_id == "A"
+    authority = WorkflowAuthority(engine, cycle.workflow_cycle_id, _spec())
+    with pytest.raises(PermissionError, match="not runnable"):
+        authority.snapshot()
+    assert (
+        authority.snapshot_for_tool("request_clarification").phase == TaskPhase.PLANNING
+    )
     with pytest.raises(ValueError, match="stale"):
         engine.resume_clarification(
             task_run_id=task.task_run_id,
@@ -284,6 +311,21 @@ def test_restart_recovers_exact_active_task_and_phase(runtime):
     assert recovered.phase == TaskPhase.WAITING_FOR_APPROVAL
 
 
+def test_restart_rehydrates_exact_persisted_workflow_spec(runtime):
+    store, engine, cycle = runtime
+    recovered = engine.spec_for_cycle(cycle.workflow_cycle_id)
+    assert recovered.workflow_id == cycle.workflow_id
+    assert recovered.digest == cycle.workflow_digest
+    store.connection.execute(
+        """UPDATE workflow_cycles_v1 SET workflow_spec_json='{}'
+           WHERE workflow_cycle_id=?""",
+        (cycle.workflow_cycle_id,),
+    )
+    store.connection.commit()
+    with pytest.raises(ValueError, match="persisted workflow specification"):
+        engine.spec_for_cycle(cycle.workflow_cycle_id)
+
+
 def test_reordered_workflow_needs_only_configuration_change(tmp_path):
     store = SQLiteGitHubStore(tmp_path / "state.db")
     repo = RepositoryRef(321, "example/reordered")
@@ -345,3 +387,69 @@ def test_reopen_migrates_database_without_generic_tables(tmp_path):
     assert "workflow_task_runs_v1" in names
     assert migrated.repository_id_for_full_name("example/legacy") == 999
     migrated.close()
+
+
+def test_lifecycle_gateways_capture_application_owned_evidence(runtime):
+    store, engine, cycle = runtime
+    task = engine.select_active_task(cycle.workflow_cycle_id)
+    plan = engine.submit_posted_plan(
+        task_run_id=task.task_run_id,
+        plan_text="capture evidence",
+        posted_comment_id=1,
+        posted_at="2026-01-01T00:11:00Z",
+    )
+    engine.approve_plan(
+        task_run_id=task.task_run_id,
+        occurrence_key=plan.approval_occurrence_key,
+        approval_event_key="approval-A",
+        approved_by="maintainer",
+        approval_is_authorized=True,
+        approval_occurred_at="2026-01-01T00:12:00Z",
+    )
+    validation_runs = []
+    tools = {
+        item.name: item
+        for item in build_lifecycle_tools(
+            runtime=engine,
+            workflow_cycle_id=cycle.workflow_cycle_id,
+            publish_plan=lambda **_kwargs: (1, "now"),
+            execution_evidence=lambda: [
+                {"command": "pytest", "exit_code": 0, "output": "passed"}
+            ],
+            validation_evidence=lambda: list(validation_runs),
+        )
+    }
+    tools["finish_execution"].invoke(
+        {"summary": "implemented", "evidence": {"reported": "done"}}
+    )
+    execution = store.connection.execute(
+        "SELECT evidence_json FROM workflow_task_executions_v1"
+    ).fetchone()
+    execution_evidence = json.loads(execution["evidence_json"])
+    assert execution_evidence["tool_observations"][0]["command"] == "pytest"
+
+    with pytest.raises(ValueError, match="run_validation evidence is required"):
+        tools["finish_validation"].invoke(
+            {
+                "verdict": "ACCEPT",
+                "summary": "looks good",
+                "findings": [],
+                "repair_instructions": [],
+                "evidence": {"reported": "passed"},
+            }
+        )
+    validation_runs.append({"diff": "", "executions": []})
+    tools["finish_validation"].invoke(
+        {
+            "verdict": "ACCEPT",
+            "summary": "looks good",
+            "findings": [],
+            "repair_instructions": [],
+            "evidence": {"reported": "passed"},
+        }
+    )
+    validation = store.connection.execute(
+        "SELECT evidence_json FROM workflow_task_validations_v1"
+    ).fetchone()
+    validation_evidence = json.loads(validation["evidence_json"])
+    assert validation_evidence["validation_runs"] == [{"diff": "", "executions": []}]

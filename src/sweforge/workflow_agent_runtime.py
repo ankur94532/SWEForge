@@ -57,7 +57,11 @@ def invoke_workflow_phase(
 ) -> dict[str, Any]:
     """Invoke one phase and fail closed on natural-language completion."""
     config = {"configurable": {"thread_id": thread_id}}
-    before = authority.snapshot()
+    before = (
+        authority.resume_snapshot(str(resume.get("kind") or ""))
+        if resume is not None
+        else authority.snapshot()
+    )
     state: Any = (
         Command(resume=dict(resume))
         if resume is not None

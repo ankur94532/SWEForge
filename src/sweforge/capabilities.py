@@ -51,6 +51,15 @@ class RepoCapabilityRegistry:
     def approved_tools(self, repo_id: int, server_id: str) -> frozenset[str]:
         return self._approved.get(repo_id, {}).get(server_id, frozenset())
 
+    def known_tool_names(self) -> frozenset[str]:
+        """Names a trusted workflow specification may reference."""
+        return frozenset(
+            f"{server_id}_{tool_name}"
+            for servers in self._approved.values()
+            for server_id, tool_names in servers.items()
+            for tool_name in tool_names
+        )
+
 
 def load_capability_registry(path: str | Path) -> RepoCapabilityRegistry:
     """Load trusted operator config; target repositories never provide this file."""

@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from .workflow_spec import PhaseSpec, TaskSpec, WorkflowSpec
+from .workflow_spec import PhaseSpec, TaskSpec, WorkflowSpec, parse_workflow_spec
 
 
 class TaskPhase(StrEnum):
@@ -231,6 +231,53 @@ class WorkflowRuntime:
             raise ValueError("unknown workflow cycle")
         return self._cycle(row)
 
+    def cycle_for_thread(self, thread_id: str) -> WorkflowCycle | None:
+        """Return the latest cycle unless it is fully published."""
+        row = self.db.execute(
+            """SELECT * FROM workflow_cycles_v1 WHERE thread_id=?
+               ORDER BY cycle_id DESC LIMIT 1""",
+            (thread_id,),
+        ).fetchone()
+        if row is None or row["status"] == WorkflowCycleStatus.PUBLISHED.value:
+            return None
+        return self._cycle(row)
+
+    def next_cycle_id(self, thread_id: str) -> int:
+        row = self.db.execute(
+            """SELECT COALESCE(MAX(cycle_id),0)+1 FROM workflow_cycles_v1
+               WHERE thread_id=?""",
+            (thread_id,),
+        ).fetchone()
+        return int(row[0])
+
+    def spec_for_cycle(self, workflow_cycle_id: str) -> WorkflowSpec:
+        """Rehydrate and verify the exact specification persisted for a cycle."""
+        row = self.db.execute(
+            "SELECT * FROM workflow_cycles_v1 WHERE workflow_cycle_id=?",
+            (workflow_cycle_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("unknown workflow cycle")
+        try:
+            document = json.loads(row["workflow_spec_json"])
+            task_documents = document["tasks"]
+            known_tools = {
+                tool_name
+                for task in task_documents
+                for phase in ("planning", "execution", "validation")
+                for tool_name in task[phase]["tools"]
+            }
+            spec = parse_workflow_spec(document, known_tools=known_tools)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("persisted workflow specification is invalid") from exc
+        if (
+            spec.workflow_id != row["workflow_id"]
+            or spec.version != row["workflow_version"]
+            or spec.digest != row["workflow_digest"]
+        ):
+            raise ValueError("persisted workflow specification identity mismatch")
+        return spec
+
     def task_runs(self, workflow_cycle_id: str) -> tuple[TaskRun, ...]:
         rows = self.db.execute(
             """SELECT * FROM workflow_task_runs_v1 WHERE workflow_cycle_id=?
@@ -338,6 +385,8 @@ class WorkflowRuntime:
             if task.phase == TaskPhase.WAITING_FOR_INPUT
             else task.phase
         )
+        if phase == TaskPhase.WAITING_FOR_APPROVAL:
+            phase = TaskPhase.PLANNING
         if phase == TaskPhase.PLANNING:
             return task_spec.planning
         if phase == TaskPhase.EXECUTING:
@@ -760,23 +809,92 @@ class WorkflowRuntime:
             if task.current_plan_id is None:
                 return False
             plan = self.plan(task.current_plan_id)
-            if plan.status != "APPROVED":
+            if (
+                plan.status != "APPROVED"
+                or hashlib.sha256(plan.plan_text.strip().encode()).hexdigest()
+                != plan.plan_digest
+            ):
                 return False
+            execution = self.db.execute(
+                """SELECT * FROM workflow_task_executions_v1
+                   WHERE task_run_id=? AND plan_id=? AND attempt=?
+                   ORDER BY completed_at DESC LIMIT 1""",
+                (task.task_run_id, plan.plan_id, task.execution_attempt),
+            ).fetchone()
             accepted = self.db.execute(
-                """SELECT 1 FROM workflow_task_validations_v1
-                   WHERE task_run_id=? AND plan_id=? AND verdict='ACCEPT'
-                   ORDER BY validation_round DESC LIMIT 1""",
-                (task.task_run_id, plan.plan_id),
+                """SELECT * FROM workflow_task_validations_v1
+                   WHERE task_run_id=? ORDER BY validation_round DESC LIMIT 1""",
+                (task.task_run_id,),
             ).fetchone()
             permit = self.db.execute(
-                """SELECT 1 FROM workflow_task_permits_v1
+                """SELECT * FROM workflow_task_permits_v1
                    WHERE task_run_id=? AND plan_id=? AND plan_version=?
                      AND plan_digest=? AND invalidated_at IS NULL""",
                 (task.task_run_id, plan.plan_id, plan.version, plan.plan_digest),
             ).fetchone()
-            if accepted is None or permit is None:
+            if execution is None or accepted is None:
+                return False
+            try:
+                execution_evidence = json.loads(execution["evidence_json"])
+                validation_evidence = json.loads(accepted["evidence_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+            if (
+                execution["status"] != "SUCCEEDED"
+                or permit is None
+                or execution["permit_id"] != permit["permit_id"]
+                or not isinstance(execution_evidence, dict)
+                or not isinstance(execution_evidence.get("tool_observations"), list)
+                or accepted["plan_id"] != plan.plan_id
+                or accepted["execution_attempt"] != execution["attempt"]
+                or accepted["verdict"] != ValidationVerdict.ACCEPT.value
+                or not isinstance(validation_evidence, dict)
+                or not isinstance(validation_evidence.get("validation_runs"), list)
+                or not validation_evidence["validation_runs"]
+            ):
                 return False
         return True
+
+    def fail_active_task(self, workflow_cycle_id: str, *, reason: str) -> WorkflowCycle:
+        """Terminally fail the current owner after bounded infrastructure retries."""
+        message = reason.strip()[:1_000] or "workflow driver failed"
+        timestamp = self.clock()
+        with self.store.transaction(immediate=True) as db:
+            cycle = db.execute(
+                "SELECT * FROM workflow_cycles_v1 WHERE workflow_cycle_id=?",
+                (workflow_cycle_id,),
+            ).fetchone()
+            if cycle is None:
+                raise ValueError("unknown workflow cycle")
+            if cycle["status"] == WorkflowCycleStatus.FAILED.value:
+                return self._cycle(cycle)
+            if cycle["status"] != WorkflowCycleStatus.ACTIVE.value:
+                raise ValueError("only an active workflow cycle can fail")
+            if cycle["active_task_id"] is not None:
+                db.execute(
+                    """UPDATE workflow_task_runs_v1 SET status=?,phase=?,
+                       failure_reason=?,updated_at=?
+                       WHERE workflow_cycle_id=? AND task_id=?""",
+                    (
+                        TaskPhase.FAILED.value,
+                        TaskPhase.FAILED.value,
+                        message,
+                        timestamp,
+                        workflow_cycle_id,
+                        cycle["active_task_id"],
+                    ),
+                )
+            db.execute(
+                """UPDATE workflow_cycles_v1 SET status=?,failure_reason=?,updated_at=?
+                   WHERE workflow_cycle_id=?""",
+                (
+                    WorkflowCycleStatus.FAILED.value,
+                    message,
+                    timestamp,
+                    workflow_cycle_id,
+                ),
+            )
+        return self.cycle(workflow_cycle_id)
 
     def task(self, task_run_id: str) -> TaskRun:
         row = self.db.execute(

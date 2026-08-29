@@ -104,35 +104,58 @@ class GitHubPublisher:
     def _publish(self, publication: PublicationRecord) -> PublicationResult:
         if not self.store.publication_is_eligible(publication.publication_id):
             raise WorkspaceError(
-                "publication is not authorized by an ACCEPT execution review"
+                "publication is not authorized by completed validated task state"
             )
         workspace = self.store.thread_workspace(publication.thread_id)
-        execution = self.store.execution_for_cycle(
-            thread_id=publication.thread_id,
-            cycle_id=publication.cycle_id,
-            root_event_key=publication.source_event_key,
-            root_input_id=publication.root_input_id,
+        cumulative_summary = self.store.declarative_publication_summary(
+            publication.publication_id
         )
-        if workspace is None or execution is None or execution["status"] != "SUCCEEDED":
-            raise WorkspaceError("successful execution workspace is unavailable")
+        execution = None
+        if cumulative_summary is None:
+            execution = self.store.execution_for_cycle(
+                thread_id=publication.thread_id,
+                cycle_id=publication.cycle_id,
+                root_event_key=publication.source_event_key,
+                root_input_id=publication.root_input_id,
+            )
+        if workspace is None or (
+            cumulative_summary is None
+            and (execution is None or execution["status"] != "SUCCEEDED")
+        ):
+            raise WorkspaceError("successful workflow workspace is unavailable")
         path = Path(workspace.workspace_path).expanduser().resolve()
         if not path.is_dir():
             raise WorkspaceError("persisted workspace directory is missing")
         self._verify_workspace(path, workspace.branch_name, workspace.base_commit)
 
-        start_head_sha = execution["start_head_sha"]
-        end_head_sha = execution["end_head_sha"]
+        start_head_sha = (
+            workspace.base_commit
+            if cumulative_summary is not None
+            else execution["start_head_sha"]
+        )
+        end_head_sha = (
+            self._git(path, "rev-parse", "HEAD")
+            if cumulative_summary is not None
+            else execution["end_head_sha"]
+        )
         if not start_head_sha or not end_head_sha:
-            raise WorkspaceError("execution is missing its Git baseline")
+            raise WorkspaceError("workflow is missing its Git baseline")
         current_head_sha = self._git(path, "rev-parse", "HEAD")
         current_dirty = bool(self._git(path, "status", "--porcelain"))
-        if (
-            end_head_sha == start_head_sha
+        declarative_no_changes = (
+            cumulative_summary is not None
+            and current_head_sha == start_head_sha
+            and not current_dirty
+        )
+        legacy_no_changes = (
+            cumulative_summary is None
+            and end_head_sha == start_head_sha
             and not execution["end_dirty"]
             and current_head_sha == start_head_sha
-        ):
-            if current_dirty:
-                raise WorkspaceError("workspace became dirty after execution")
+        )
+        if legacy_no_changes and current_dirty:
+            raise WorkspaceError("workspace became dirty after execution")
+        if declarative_no_changes or legacy_no_changes:
             self.store.update_publication(
                 publication.publication_id,
                 status=PublicationStatus.NO_CHANGES,
@@ -203,9 +226,12 @@ class GitHubPublisher:
             if prs:
                 pr_number, pr_url = int(prs[0]["number"]), prs[0].get("html_url")
             else:
-                body = (execution["response_text"] or "SWEForge execution completed.")[
-                    :12000
-                ]
+                body = (
+                    cumulative_summary
+                    or (execution["response_text"] or "SWEForge execution completed.")[
+                        :12000
+                    ]
+                )
                 created = self.client.create_pull_request(
                     repo,
                     head=publication.branch_name,

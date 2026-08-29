@@ -950,6 +950,8 @@ class PublicationTarget:
     attempt_id: str
     review_id: str
     execution_completed_at: str | None
+    workflow_cycle_id: str | None = None
+    declarative: bool = False
 
 
 @dataclass(frozen=True)
@@ -4093,6 +4095,19 @@ class SQLiteGitHubStore:
         an ACCEPT from one logical input can never authorize another one that
         happens to share the same SourceEvent.
         """
+        declarative = SQLiteGitHubStore._declarative_publication_target(db, thread_id)
+        if declarative is not None:
+            return declarative
+        if (
+            db.execute(
+                "SELECT 1 FROM workflow_cycles_v1 WHERE thread_id=? LIMIT 1",
+                (thread_id,),
+            ).fetchone()
+            is not None
+        ):
+            # Once a thread enters the declarative authority, historical
+            # compatibility rows can never authorize a later publication.
+            return None
         state = db.execute(
             "SELECT * FROM issue_workflow_state WHERE thread_id = ?", (thread_id,)
         ).fetchone()
@@ -4181,6 +4196,197 @@ class SQLiteGitHubStore:
             execution_completed_at=execution["completed_at"],
         )
 
+    @staticmethod
+    def _declarative_publication_target(
+        db: sqlite3.Connection, thread_id: str
+    ) -> PublicationTarget | None:
+        """Prove cumulative publication eligibility from generic task state."""
+        cycle = db.execute(
+            """SELECT * FROM workflow_cycles_v1 WHERE thread_id=?
+               ORDER BY cycle_id DESC LIMIT 1""",
+            (thread_id,),
+        ).fetchone()
+        if (
+            cycle is None
+            or cycle["status"] != "AWAITING_PUBLICATION"
+            or cycle["active_task_id"] is not None
+        ):
+            return None
+        try:
+            document = json.loads(cycle["workflow_spec_json"])
+            canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
+            declared = document["tasks"]
+            declared_ids = [item["id"] for item in declared]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            document.get("workflow_id") != cycle["workflow_id"]
+            or document.get("version") != cycle["workflow_version"]
+            or hashlib.sha256(canonical.encode()).hexdigest()
+            != cycle["workflow_digest"]
+            or not declared_ids
+            or len(declared_ids) != len(set(declared_ids))
+        ):
+            return None
+        tasks = db.execute(
+            """SELECT * FROM workflow_task_runs_v1 WHERE workflow_cycle_id=?
+               ORDER BY declaration_index""",
+            (cycle["workflow_cycle_id"],),
+        ).fetchall()
+        if len(tasks) != len(declared_ids):
+            return None
+        root = db.execute(
+            "SELECT * FROM source_events WHERE event_key=?",
+            (cycle["root_input_id"],),
+        ).fetchone()
+        if root is None and str(cycle["root_input_id"]).startswith("deferred-"):
+            root = db.execute(
+                """SELECT se.* FROM deferred_followups AS df
+                   JOIN source_events AS se ON se.event_key=df.source_event_key
+                   WHERE df.deferred_id=?""",
+                (cycle["root_input_id"],),
+            ).fetchone()
+        if root is None:
+            return None
+        completed_at: str | None = None
+        last_plan = last_execution = last_validation = None
+        for index, (task, declared_task) in enumerate(zip(tasks, declared)):
+            try:
+                dependencies = json.loads(task["dependencies_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if (
+                task["declaration_index"] != index
+                or task["task_id"] != declared_task["id"]
+                or task["thread_id"] != cycle["thread_id"]
+                or task["cycle_id"] != cycle["cycle_id"]
+                or task["workflow_id"] != cycle["workflow_id"]
+                or dependencies != declared_task.get("depends_on", [])
+                or task["status"] != "DONE"
+                or task["phase"] != "DONE"
+                or not task["current_plan_id"]
+                or task["waiting_from_phase"] is not None
+                or task["clarification_occurrence_key"] is not None
+            ):
+                return None
+            plan = db.execute(
+                "SELECT * FROM workflow_task_plans_v1 WHERE plan_id=?",
+                (task["current_plan_id"],),
+            ).fetchone()
+            if (
+                plan is None
+                or plan["task_run_id"] != task["task_run_id"]
+                or plan["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or plan["task_id"] != task["task_id"]
+                or plan["version"] < 1
+                or hashlib.sha256(plan["plan_text"].strip().encode()).hexdigest()
+                != plan["plan_digest"]
+                or plan["posted_comment_id"] <= 0
+                or plan["status"] != "APPROVED"
+                or not plan["approved_at"]
+                or not plan["approved_by"]
+                or not plan["approval_event_key"]
+            ):
+                return None
+            permit = db.execute(
+                """SELECT * FROM workflow_task_permits_v1
+                   WHERE task_run_id=? AND plan_id=? AND plan_version=?
+                     AND plan_digest=? AND invalidated_at IS NULL
+                   ORDER BY created_at DESC LIMIT 1""",
+                (
+                    task["task_run_id"],
+                    plan["plan_id"],
+                    plan["version"],
+                    plan["plan_digest"],
+                ),
+            ).fetchone()
+            execution = db.execute(
+                """SELECT * FROM workflow_task_executions_v1
+                   WHERE task_run_id=? AND plan_id=? AND attempt=?
+                   ORDER BY completed_at DESC LIMIT 1""",
+                (task["task_run_id"], plan["plan_id"], task["execution_attempt"]),
+            ).fetchone()
+            validation = db.execute(
+                """SELECT * FROM workflow_task_validations_v1
+                   WHERE task_run_id=? ORDER BY validation_round DESC LIMIT 1""",
+                (task["task_run_id"],),
+            ).fetchone()
+            approval = db.execute(
+                "SELECT * FROM source_events WHERE event_key=?",
+                (plan["approval_event_key"],),
+            ).fetchone()
+            if execution is None or validation is None:
+                return None
+            try:
+                execution_evidence = json.loads(execution["evidence_json"])
+                validation_evidence = json.loads(validation["evidence_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if (
+                permit is None
+                or permit["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or permit["approval_event_key"] != plan["approval_event_key"]
+                or permit["approved_by"] != plan["approved_by"]
+                or approval is None
+                or approval["author_login"] != plan["approved_by"]
+                or approval["source_created_at"] != plan["approved_at"]
+                or approval["source_created_at"] <= plan["posted_at"]
+                or not is_exact_agent_approval(approval["body"])
+                or approval["origin_surface"] != root["origin_surface"]
+                or approval["subject_number"] != root["subject_number"]
+                or (
+                    root["origin_surface"] == "PR_INLINE_REVIEW"
+                    and approval["review_thread_root_id"]
+                    != root["review_thread_root_id"]
+                )
+                or execution["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or execution["permit_id"] != permit["permit_id"]
+                or execution["status"] != "SUCCEEDED"
+                or not isinstance(execution_evidence, dict)
+                or not isinstance(execution_evidence.get("tool_observations"), list)
+                or validation["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or validation["plan_id"] != plan["plan_id"]
+                or validation["execution_attempt"] != execution["attempt"]
+                or validation["verdict"] != "ACCEPT"
+                or not isinstance(validation_evidence, dict)
+                or not isinstance(validation_evidence.get("validation_runs"), list)
+                or not validation_evidence["validation_runs"]
+            ):
+                return None
+            completed_at = max(completed_at or "", execution["completed_at"])
+            last_plan, last_execution, last_validation = plan, execution, validation
+        thread = db.execute(
+            "SELECT * FROM issue_threads WHERE thread_id=?", (thread_id,)
+        ).fetchone()
+        workspace = db.execute(
+            "SELECT branch_name FROM thread_workspaces WHERE thread_id=?",
+            (thread_id,),
+        ).fetchone()
+        if root is None or thread is None or workspace is None:
+            return None
+        return PublicationTarget(
+            publication_id=publication_id_for(
+                thread_id=thread_id,
+                cycle_id=cycle["cycle_id"],
+                root_input_id=cycle["root_input_id"],
+            ),
+            source_event_key=root["event_key"],
+            thread_id=thread_id,
+            cycle_id=cycle["cycle_id"],
+            root_input_id=cycle["root_input_id"],
+            repo_id=thread["repo_id"],
+            repo_full_name=thread["repo_full_name"],
+            issue_number=thread["issue_number"],
+            branch_name=workspace["branch_name"],
+            plan_id=last_plan["plan_id"],
+            plan_version=last_plan["version"],
+            attempt_id=last_execution["execution_id"],
+            review_id=last_validation["validation_id"],
+            execution_completed_at=completed_at,
+            workflow_cycle_id=cycle["workflow_cycle_id"],
+            declarative=True,
+        )
+
     def publication_target(self, thread_id: str) -> PublicationTarget | None:
         return self._publication_target(self.connection, thread_id)
 
@@ -4255,8 +4461,11 @@ class SQLiteGitHubStore:
         self, publication_id: str | None = None
     ) -> PublicationRecord | None:
         rows = self.connection.execute(
-            "SELECT thread_id FROM issue_workflow_state WHERE phase = ? "
-            "ORDER BY thread_id",
+            """SELECT thread_id FROM issue_workflow_state WHERE phase = ?
+               UNION
+               SELECT thread_id FROM workflow_cycles_v1
+               WHERE status = 'AWAITING_PUBLICATION'
+               ORDER BY thread_id""",
             (WorkflowPhase.AWAITING_PUBLICATION.value,),
         ).fetchall()
         targets: list[PublicationTarget] = []
@@ -4370,7 +4579,7 @@ class SQLiteGitHubStore:
     def finalize_publication(
         self, publication_id: str, *, now: str
     ) -> RepoMemoryLearningRecord:
-        """Close one lifecycle: mark its plan executed and return it to IDLE.
+        """Close one lifecycle and enqueue both durable learning jobs.
 
         Fails closed when the publication is not the thread's current one, so a
         stale completion can never finalize a newer cycle.
@@ -4390,19 +4599,29 @@ class SQLiteGitHubStore:
             target = self._publication_target(db, publication["thread_id"])
             if target is None or target.publication_id != publication_id:
                 raise ValueError("publication is stale for the current workflow cycle")
-            db.execute(
-                """UPDATE issue_plans SET status = ?
-                   WHERE plan_id = ? AND thread_id = ? AND cycle_id = ?
-                     AND status IN (?, ?)""",
-                (
-                    PlanStatus.EXECUTED.value,
-                    target.plan_id,
-                    target.thread_id,
-                    target.cycle_id,
-                    PlanStatus.APPROVED.value,
-                    PlanStatus.AUTO_APPROVED.value,
-                ),
-            )
+            if target.declarative:
+                finalized = db.execute(
+                    """UPDATE workflow_cycles_v1 SET status='PUBLISHED',updated_at=?
+                       WHERE workflow_cycle_id=? AND status='AWAITING_PUBLICATION'
+                         AND active_task_id IS NULL""",
+                    (now, target.workflow_cycle_id),
+                )
+                if finalized.rowcount != 1:
+                    raise ValueError("workflow state changed during finalization")
+            else:
+                db.execute(
+                    """UPDATE issue_plans SET status = ?
+                       WHERE plan_id = ? AND thread_id = ? AND cycle_id = ?
+                         AND status IN (?, ?)""",
+                    (
+                        PlanStatus.EXECUTED.value,
+                        target.plan_id,
+                        target.thread_id,
+                        target.cycle_id,
+                        PlanStatus.APPROVED.value,
+                        PlanStatus.AUTO_APPROVED.value,
+                    ),
+                )
             learning_id = memory_learning_id_for(
                 thread_id=target.thread_id,
                 cycle_id=target.cycle_id,
@@ -4466,24 +4685,52 @@ class SQLiteGitHubStore:
                     now,
                 ),
             )
-            finalized = db.execute(
-                """UPDATE issue_workflow_state SET phase = ?, updated_at = ?
-                   WHERE thread_id = ? AND cycle_id = ? AND phase = ?
-                     AND root_event_key = ?
-                     AND COALESCE(root_input_id, root_event_key) = ?""",
-                (
-                    WorkflowPhase.IDLE.value,
-                    now,
-                    target.thread_id,
-                    target.cycle_id,
-                    WorkflowPhase.AWAITING_PUBLICATION.value,
-                    target.source_event_key,
-                    target.root_input_id,
-                ),
-            )
-            if finalized.rowcount != 1:
-                raise ValueError("workflow state changed during finalization")
+            if not target.declarative:
+                finalized = db.execute(
+                    """UPDATE issue_workflow_state SET phase = ?, updated_at = ?
+                       WHERE thread_id = ? AND cycle_id = ? AND phase = ?
+                         AND root_event_key = ?
+                         AND COALESCE(root_input_id, root_event_key) = ?""",
+                    (
+                        WorkflowPhase.IDLE.value,
+                        now,
+                        target.thread_id,
+                        target.cycle_id,
+                        WorkflowPhase.AWAITING_PUBLICATION.value,
+                        target.source_event_key,
+                        target.root_input_id,
+                    ),
+                )
+                if finalized.rowcount != 1:
+                    raise ValueError("workflow state changed during finalization")
         return self.memory_learning_for_id(learning_id)  # type: ignore[return-value]
+
+    def declarative_publication_summary(self, publication_id: str) -> str | None:
+        """Render bounded cumulative task summaries for a declarative PR body."""
+        publication = self.publication_for_id(publication_id)
+        if publication is None:
+            return None
+        cycle = self.connection.execute(
+            """SELECT workflow_cycle_id FROM workflow_cycles_v1
+               WHERE thread_id=? AND cycle_id=? AND root_input_id=?""",
+            (publication.thread_id, publication.cycle_id, publication.root_input_id),
+        ).fetchone()
+        if cycle is None:
+            return None
+        rows = self.connection.execute(
+            """SELECT t.task_id,e.summary
+               FROM workflow_task_runs_v1 AS t
+               JOIN workflow_task_executions_v1 AS e
+                 ON e.task_run_id=t.task_run_id AND e.attempt=t.execution_attempt
+               WHERE t.workflow_cycle_id=? ORDER BY t.declaration_index""",
+            (cycle["workflow_cycle_id"],),
+        ).fetchall()
+        return "\n\n".join(
+            [
+                "SWEForge completed the declared workflow tasks:",
+                *[f"### {row['task_id']}\n{row['summary']}" for row in rows],
+            ]
+        )[:12_000]
 
     @staticmethod
     def _publication_record(row: sqlite3.Row) -> PublicationRecord:
@@ -6242,6 +6489,15 @@ class SQLiteGitHubStore:
             is_actionable_source_event(item["source_kind"], item["body"])
             for item in pending
         )
+        generic = self.connection.execute(
+            """SELECT * FROM workflow_cycles_v1 WHERE thread_id=?
+               ORDER BY cycle_id DESC LIMIT 1""",
+            (thread_id,),
+        ).fetchone()
+        if generic is not None:
+            return self._declarative_thread_runnable(
+                generic=generic, pending=pending, actionable=actionable
+            )
         if state is None:
             return actionable
         phase = state.phase
@@ -6280,6 +6536,77 @@ class SQLiteGitHubStore:
                 return self.publication_target(thread_id) is not None
             return publication.status in RESUMABLE_PUBLICATION_STATUSES
         return False
+
+    def _declarative_thread_runnable(
+        self, *, generic: sqlite3.Row, pending: list[sqlite3.Row], actionable: bool
+    ) -> bool:
+        status = generic["status"]
+        if status == "FAILED":
+            return False
+        if status == "PUBLISHED":
+            return bool(
+                self.pending_memory_learning(generic["thread_id"])
+                or self.pending_issue_resolution(generic["thread_id"])
+                or self.deferred_followups(generic["thread_id"])
+                or actionable
+            )
+        if status == "AWAITING_PUBLICATION":
+            publication_id = publication_id_for(
+                thread_id=generic["thread_id"],
+                cycle_id=generic["cycle_id"],
+                root_input_id=generic["root_input_id"],
+            )
+            publication = self.publication_for_id(publication_id)
+            if publication is None:
+                return (
+                    self._publication_target(self.connection, generic["thread_id"])
+                    is not None
+                )
+            return publication.status in RESUMABLE_PUBLICATION_STATUSES
+        task = self.connection.execute(
+            """SELECT * FROM workflow_task_runs_v1
+               WHERE workflow_cycle_id=? AND task_id=?""",
+            (generic["workflow_cycle_id"], generic["active_task_id"]),
+        ).fetchone()
+        if task is None:
+            return True
+        if task["phase"] in {"PLANNING", "EXECUTING", "VALIDATING"}:
+            return True
+        root = self.source_event(generic["root_input_id"])
+        if root is None:
+            return False
+        if task["phase"] == "WAITING_FOR_APPROVAL":
+            plan = self.connection.execute(
+                "SELECT posted_at FROM workflow_task_plans_v1 WHERE plan_id=?",
+                (task["current_plan_id"],),
+            ).fetchone()
+            if plan is None:
+                return False
+            return any(
+                self._same_generic_target(item, root)
+                and self._after_posted_at(item, plan["posted_at"])
+                and starts_with_agent_invocation(item["body"])
+                for item in pending
+            )
+        if task["phase"] == "WAITING_FOR_INPUT":
+            return any(
+                self._same_generic_target(item, root)
+                and self._after_posted_at(item, task["updated_at"])
+                and starts_with_agent_invocation(item["body"])
+                for item in pending
+            )
+        return False
+
+    @staticmethod
+    def _same_generic_target(item: sqlite3.Row, root: sqlite3.Row) -> bool:
+        if (
+            item["origin_surface"] != root["origin_surface"]
+            or item["subject_number"] != root["subject_number"]
+        ):
+            return False
+        return root["origin_surface"] != "PR_INLINE_REVIEW" or (
+            item["review_thread_root_id"] == root["review_thread_root_id"]
+        )
 
     @staticmethod
     def _same_conversation_target(item, state) -> bool:

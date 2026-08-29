@@ -17,6 +17,8 @@ def build_lifecycle_tools(
     runtime: WorkflowRuntime,
     workflow_cycle_id: str,
     publish_plan: Callable[..., tuple[int, str]],
+    execution_evidence: Callable[[], list[dict[str, Any]]] | None = None,
+    validation_evidence: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> list[Any]:
     """Build gateways bound to one authoritative cycle.
 
@@ -67,6 +69,14 @@ def build_lifecycle_tools(
                 "plan_digest": plan.plan_digest,
             }
         )
+        if isinstance(approval, dict) and approval.get("kind") == "PLAN_FEEDBACK":
+            if approval.get("occurrence_key") != plan.approval_occurrence_key:
+                raise PermissionError("plan feedback occurrence is stale")
+            runtime.replan_from_feedback(task.task_run_id)
+            return (
+                "Plan feedback received. Replan the same task and call submit_plan "
+                f"again. Feedback: {str(approval.get('feedback') or '')[:2_000]}"
+            )
         if not isinstance(approval, dict) or approval.get("kind") != "PLAN_APPROVAL":
             raise PermissionError("plan approval resume payload is invalid")
         runtime.approve_plan(
@@ -87,7 +97,12 @@ def build_lifecycle_tools(
         task = runtime.active_task(workflow_cycle_id)
         if task is None:
             raise PermissionError("workflow has no active task")
-        runtime.finish_execution(task.task_run_id, summary=summary, evidence=evidence)
+        captured = execution_evidence() if execution_evidence is not None else []
+        runtime.finish_execution(
+            task.task_run_id,
+            summary=summary,
+            evidence={"reported": evidence, "tool_observations": captured},
+        )
         return "Execution recorded. Continue in VALIDATING."
 
     @tool
@@ -102,14 +117,73 @@ def build_lifecycle_tools(
         task = runtime.active_task(workflow_cycle_id)
         if task is None:
             raise PermissionError("workflow has no active task")
+        captured = validation_evidence() if validation_evidence is not None else []
+        if validation_evidence is not None and not captured:
+            raise ValueError("run_validation evidence is required")
         result = runtime.finish_validation(
             task_run_id=task.task_run_id,
             verdict=ValidationVerdict(verdict),
             summary=summary,
             findings=findings,
             repair_instructions=repair_instructions,
-            evidence=evidence,
+            evidence={"reported": evidence, "validation_runs": captured},
         )
         return f"Validation recorded. Task phase is now {result.phase.value}."
 
-    return [submit_plan, finish_execution, finish_validation]
+    @tool
+    def request_clarification(
+        question: str,
+        reason: str,
+        answer_type: str = "TEXT",
+        choices: list[str] | None = None,
+    ) -> str:
+        """Pause the same active task to request narrowly scoped human input."""
+        task = runtime.active_task(workflow_cycle_id)
+        if task is None:
+            raise PermissionError("workflow has no active task")
+        normalized = answer_type.upper()
+        if normalized not in {"TEXT", "VALUE", "BOOLEAN", "CHOICE"}:
+            raise ValueError("unsupported clarification answer type")
+        normalized_choices = tuple(choices or ())
+        if normalized == "CHOICE" and not normalized_choices:
+            raise ValueError("CHOICE clarification requires choices")
+        occurrence = task.clarification_occurrence_key
+        if occurrence is None:
+            suffix = hashlib.sha256(
+                f"{task.task_run_id}\0{task.phase.value}\0{question}\0{reason}".encode()
+            ).hexdigest()[:24]
+            occurrence = f"clarification:{task.task_run_id}:{suffix}"
+        if task.phase != TaskPhase.WAITING_FOR_INPUT:
+            runtime.pause_for_clarification(
+                task_run_id=task.task_run_id, occurrence_key=occurrence
+            )
+        response = interrupt(
+            {
+                "kind": "CLARIFICATION",
+                "occurrence_key": occurrence,
+                "workflow_cycle_id": workflow_cycle_id,
+                "task_run_id": task.task_run_id,
+                "task_id": task.task_id,
+                "question": question[:2_000],
+                "reason": reason[:2_000],
+                "answer_type": normalized,
+                "choices": normalized_choices,
+            }
+        )
+        if (
+            not isinstance(response, dict)
+            or response.get("kind") != "CLARIFICATION_RESPONSE"
+            or response.get("occurrence_key") != occurrence
+        ):
+            raise PermissionError("clarification resume payload is invalid")
+        runtime.resume_clarification(
+            task_run_id=task.task_run_id, occurrence_key=occurrence
+        )
+        return f"Clarification answer received: {response.get('answer', '')}"
+
+    return [
+        submit_plan,
+        finish_execution,
+        finish_validation,
+        request_clarification,
+    ]
