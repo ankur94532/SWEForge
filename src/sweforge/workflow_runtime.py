@@ -11,15 +11,17 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from .github_models import InteractionMode
 from .workflow_spec import PhaseSpec, TaskSpec, WorkflowSpec, parse_workflow_spec
 
 
 class TaskPhase(StrEnum):
     PENDING = "PENDING"
     PLANNING = "PLANNING"
-    WAITING_FOR_APPROVAL = "WAITING_FOR_APPROVAL"
+    WAITING_FOR_PLAN_APPROVAL = "WAITING_FOR_PLAN_APPROVAL"
     EXECUTING = "EXECUTING"
     VALIDATING = "VALIDATING"
+    WAITING_FOR_RESULT_APPROVAL = "WAITING_FOR_RESULT_APPROVAL"
     WAITING_FOR_INPUT = "WAITING_FOR_INPUT"
     DONE = "DONE"
     FAILED = "FAILED"
@@ -101,7 +103,38 @@ class TaskPermit:
     plan_digest: str
     approval_event_key: str
     approved_by: str
+    approval_mode: str
     created_at: str
+    invalidated_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskResult:
+    result_id: str
+    task_run_id: str
+    workflow_cycle_id: str
+    plan_id: str
+    execution_id: str
+    validation_id: str
+    result_occurrence_key: str
+    posted_at: str
+    posted_comment_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class TaskResultApproval:
+    result_approval_id: str
+    result_id: str
+    task_run_id: str
+    workflow_cycle_id: str
+    plan_id: str
+    execution_id: str
+    validation_id: str
+    result_occurrence_key: str
+    mode: str
+    approved_by: str
+    approval_event_key: str | None
+    approved_at: str
     invalidated_at: str | None
 
 
@@ -385,8 +418,10 @@ class WorkflowRuntime:
             if task.phase == TaskPhase.WAITING_FOR_INPUT
             else task.phase
         )
-        if phase == TaskPhase.WAITING_FOR_APPROVAL:
+        if phase == TaskPhase.WAITING_FOR_PLAN_APPROVAL:
             phase = TaskPhase.PLANNING
+        if phase == TaskPhase.WAITING_FOR_RESULT_APPROVAL:
+            phase = TaskPhase.VALIDATING
         if phase == TaskPhase.PLANNING:
             return task_spec.planning
         if phase == TaskPhase.EXECUTING:
@@ -459,8 +494,8 @@ class WorkflowRuntime:
                    SET status=?,phase=?,current_plan_id=?,updated_at=?
                    WHERE task_run_id=?""",
                 (
-                    TaskPhase.WAITING_FOR_APPROVAL.value,
-                    TaskPhase.WAITING_FOR_APPROVAL.value,
+                    TaskPhase.WAITING_FOR_PLAN_APPROVAL.value,
+                    TaskPhase.WAITING_FOR_PLAN_APPROVAL.value,
                     plan_id,
                     timestamp,
                     task_run_id,
@@ -482,9 +517,16 @@ class WorkflowRuntime:
             raise PermissionError("approver permission could not be proven")
         if not approval_event_key or not approved_by:
             raise ValueError("human approval identity is required")
+        if (
+            self.store.interaction_mode(self.task(task_run_id).thread_id)
+            != InteractionMode.MANUAL
+        ):
+            raise PermissionError("human plan approval requires MANUAL mode")
         timestamp = self.clock()
         with self.store.transaction(immediate=True) as db:
-            task = self._owned_task(db, task_run_id, TaskPhase.WAITING_FOR_APPROVAL)
+            task = self._owned_task(
+                db, task_run_id, TaskPhase.WAITING_FOR_PLAN_APPROVAL
+            )
             plan = db.execute(
                 "SELECT * FROM workflow_task_plans_v1 WHERE plan_id=?",
                 (task.current_plan_id,),
@@ -516,8 +558,8 @@ class WorkflowRuntime:
             db.execute(
                 """INSERT OR IGNORE INTO workflow_task_permits_v1(
                    permit_id,task_run_id,workflow_cycle_id,plan_id,plan_version,
-                   plan_digest,approval_event_key,approved_by,created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                   plan_digest,approval_event_key,approved_by,approval_mode,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
                 (
                     permit_id,
                     task_run_id,
@@ -527,6 +569,69 @@ class WorkflowRuntime:
                     plan["plan_digest"],
                     approval_event_key,
                     approved_by,
+                    "HUMAN",
+                    timestamp,
+                ),
+            )
+            db.execute(
+                """UPDATE workflow_task_runs_v1 SET status=?,phase=?,updated_at=?
+                   WHERE task_run_id=?""",
+                (
+                    TaskPhase.EXECUTING.value,
+                    TaskPhase.EXECUTING.value,
+                    timestamp,
+                    task_run_id,
+                ),
+            )
+        return self.permit(permit_id)
+
+    def auto_authorize_plan(self, task_run_id: str) -> TaskPermit:
+        """Application-owned exact authorization for an immutable AUTO thread."""
+        if (
+            self.store.interaction_mode(self.task(task_run_id).thread_id)
+            != InteractionMode.AUTO
+        ):
+            raise PermissionError("AUTO plan authorization requires AUTO mode")
+        timestamp = self.clock()
+        with self.store.transaction(immediate=True) as db:
+            task = self._owned_task(
+                db, task_run_id, TaskPhase.WAITING_FOR_PLAN_APPROVAL
+            )
+            plan = db.execute(
+                "SELECT * FROM workflow_task_plans_v1 WHERE plan_id=?",
+                (task.current_plan_id,),
+            ).fetchone()
+            if plan is None or plan["status"] != "POSTED":
+                raise ValueError("current posted plan is missing")
+            authority_id = f"auto-plan-authority:{plan['approval_occurrence_key']}"
+            permit_id = _stable(
+                "task-permit",
+                task_run_id,
+                plan["plan_id"],
+                plan["version"],
+                plan["plan_digest"],
+                authority_id,
+            )
+            db.execute(
+                """UPDATE workflow_task_plans_v1 SET status='APPROVED',
+                   approved_at=?,approved_by=?,approval_event_key=? WHERE plan_id=?""",
+                (timestamp, "sweforge:auto-policy", authority_id, plan["plan_id"]),
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO workflow_task_permits_v1(
+                   permit_id,task_run_id,workflow_cycle_id,plan_id,plan_version,
+                   plan_digest,approval_event_key,approved_by,approval_mode,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    permit_id,
+                    task_run_id,
+                    task.workflow_cycle_id,
+                    plan["plan_id"],
+                    plan["version"],
+                    plan["plan_digest"],
+                    authority_id,
+                    "sweforge:auto-policy",
+                    "AUTO",
                     timestamp,
                 ),
             )
@@ -546,7 +651,9 @@ class WorkflowRuntime:
         """Invalidate approval and return the same waiting owner to planning."""
         timestamp = self.clock()
         with self.store.transaction(immediate=True) as db:
-            task = self._owned_task(db, task_run_id, TaskPhase.WAITING_FOR_APPROVAL)
+            task = self._owned_task(
+                db, task_run_id, TaskPhase.WAITING_FOR_PLAN_APPROVAL
+            )
             db.execute(
                 """UPDATE workflow_task_plans_v1 SET status='SUPERSEDED'
                    WHERE plan_id=?""",
@@ -586,8 +693,24 @@ class WorkflowRuntime:
                AND invalidated_at IS NULL ORDER BY created_at DESC LIMIT 1""",
             (task_run_id, plan.plan_id, plan.version, plan.plan_digest),
         ).fetchone()
-        if row is None or plan.status != "APPROVED":
+        expected_mode = (
+            "AUTO"
+            if self.store.interaction_mode(task.thread_id) == InteractionMode.AUTO
+            else "HUMAN"
+        )
+        if (
+            row is None
+            or plan.status != "APPROVED"
+            or row["approval_mode"] != expected_mode
+        ):
             raise PermissionError("exact current-plan permit is missing or stale")
+        if expected_mode == "AUTO" and (
+            row["approved_by"] != "sweforge:auto-policy"
+            or not row["approval_event_key"].startswith(
+                "auto-plan-authority:plan-approval:"
+            )
+        ):
+            raise PermissionError("AUTO plan authority provenance is invalid")
         return self._permit(row)
 
     def finish_execution(
@@ -664,6 +787,26 @@ class WorkflowRuntime:
             task = self._owned_task(db, task_run_id, TaskPhase.VALIDATING)
             if task.current_plan_id is None:
                 raise RuntimeError("validated task has no plan")
+            prior = db.execute(
+                """SELECT * FROM workflow_task_validations_v1
+                   WHERE task_run_id=? AND plan_id=? AND execution_attempt=?
+                   ORDER BY validation_round DESC LIMIT 1""",
+                (task_run_id, task.current_plan_id, task.execution_attempt),
+            ).fetchone()
+            if prior is not None:
+                same = (
+                    prior["verdict"] == verdict.value
+                    and prior["summary"] == summary.strip()
+                    and prior["findings_json"] == json.dumps(findings, sort_keys=True)
+                    and prior["repair_instructions_json"]
+                    == json.dumps(repair_instructions)
+                    and prior["evidence_json"] == json.dumps(evidence, sort_keys=True)
+                )
+                if same and verdict == ValidationVerdict.ACCEPT:
+                    return task
+                raise ValueError(
+                    "this execution attempt already has a validation decision"
+                )
             round_number = task.validation_round + 1
             validation_id = _stable(
                 "validation", task_run_id, round_number, verdict.value
@@ -690,12 +833,10 @@ class WorkflowRuntime:
                 ),
             )
             if verdict == ValidationVerdict.ACCEPT:
-                next_phase = TaskPhase.DONE
-                db.execute(
-                    """UPDATE workflow_cycles_v1 SET active_task_id=NULL,updated_at=?
-                       WHERE workflow_cycle_id=? AND active_task_id=?""",
-                    (timestamp, task.workflow_cycle_id, task.task_id),
-                )
+                # Publication of the exact validated result is an external
+                # side effect. Keep ownership in VALIDATING until its GitHub
+                # comment has been reconciled and durably bound below.
+                next_phase = TaskPhase.VALIDATING
             elif verdict == ValidationVerdict.NEEDS_FIXES:
                 next_phase = TaskPhase.EXECUTING
             elif verdict == ValidationVerdict.REPLAN:
@@ -722,14 +863,17 @@ class WorkflowRuntime:
                         task.workflow_cycle_id,
                     ),
                 )
-            feedback = (
-                json.dumps(
-                    [{"summary": summary, "instructions": repair_instructions}],
-                    sort_keys=True,
+            feedback_history = list(task.repair_feedback)
+            if verdict in (ValidationVerdict.NEEDS_FIXES, ValidationVerdict.REPLAN):
+                feedback_history.append(
+                    {
+                        "kind": "VALIDATION_FEEDBACK",
+                        "summary": summary,
+                        "instructions": repair_instructions,
+                        "verdict": verdict.value,
+                    }
                 )
-                if verdict in (ValidationVerdict.NEEDS_FIXES, ValidationVerdict.REPLAN)
-                else "[]"
-            )
+            feedback = json.dumps(feedback_history, sort_keys=True)
             db.execute(
                 """UPDATE workflow_task_runs_v1 SET status=?,phase=?,
                    validation_round=?,repair_feedback_json=?,failure_reason=?,updated_at=?
@@ -740,6 +884,254 @@ class WorkflowRuntime:
                     round_number,
                     feedback,
                     summary.strip() if next_phase == TaskPhase.FAILED else None,
+                    timestamp,
+                    task_run_id,
+                ),
+            )
+        return self.task(task_run_id)
+
+    def publish_validated_result(
+        self,
+        *,
+        task_run_id: str,
+        posted_comment_id: int,
+        posted_at: str,
+    ) -> TaskResult:
+        """Bind the visible result for the latest exact ACCEPT validation."""
+        if not isinstance(posted_comment_id, int) or posted_comment_id <= 0:
+            raise ValueError("a reconciled GitHub result comment is required")
+        timestamp = self.clock()
+        with self.store.transaction(immediate=True) as db:
+            task = self._owned_task(db, task_run_id, TaskPhase.VALIDATING)
+            validation = db.execute(
+                """SELECT * FROM workflow_task_validations_v1
+                   WHERE task_run_id=? AND plan_id=? AND execution_attempt=?
+                   ORDER BY validation_round DESC LIMIT 1""",
+                (task_run_id, task.current_plan_id, task.execution_attempt),
+            ).fetchone()
+            execution = db.execute(
+                """SELECT * FROM workflow_task_executions_v1
+                   WHERE task_run_id=? AND plan_id=? AND attempt=?""",
+                (task_run_id, task.current_plan_id, task.execution_attempt),
+            ).fetchone()
+            if (
+                validation is None
+                or validation["verdict"] != ValidationVerdict.ACCEPT.value
+                or execution is None
+                or execution["status"] != "SUCCEEDED"
+            ):
+                raise ValueError("latest exact validated result is not acceptable")
+            result_id = _stable(
+                "task-result",
+                task_run_id,
+                task.current_plan_id,
+                execution["execution_id"],
+                validation["validation_id"],
+            )
+            occurrence = (
+                f"result-approval:{task_run_id}:{result_id}:"
+                f"{execution['execution_id']}:{validation['validation_id']}"
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO workflow_task_results_v1(
+                   result_id,task_run_id,workflow_cycle_id,plan_id,execution_id,
+                   validation_id,result_occurrence_key,posted_at,posted_comment_id,
+                   created_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    result_id,
+                    task_run_id,
+                    task.workflow_cycle_id,
+                    task.current_plan_id,
+                    execution["execution_id"],
+                    validation["validation_id"],
+                    occurrence,
+                    posted_at,
+                    posted_comment_id,
+                    timestamp,
+                ),
+            )
+            db.execute(
+                """UPDATE workflow_task_runs_v1 SET status=?,phase=?,updated_at=?
+                   WHERE task_run_id=?""",
+                (
+                    TaskPhase.WAITING_FOR_RESULT_APPROVAL.value,
+                    TaskPhase.WAITING_FOR_RESULT_APPROVAL.value,
+                    timestamp,
+                    task_run_id,
+                ),
+            )
+        return self.result(result_id)
+
+    def approve_result(
+        self,
+        *,
+        task_run_id: str,
+        occurrence_key: str,
+        approval_event_key: str | None,
+        approved_by: str,
+        approval_is_authorized: bool,
+        approval_occurred_at: str,
+        mode: str = "HUMAN",
+    ) -> TaskResultApproval:
+        """Accept one exact plan/execution/validation result occurrence."""
+        if not approval_is_authorized:
+            raise PermissionError("result approver permission could not be proven")
+        normalized_mode = mode.upper()
+        if normalized_mode not in {"HUMAN", "AUTO"}:
+            raise ValueError("result approval mode is invalid")
+        if not approved_by or (normalized_mode == "HUMAN" and not approval_event_key):
+            raise ValueError("result approval identity is required")
+        expected_mode = (
+            "AUTO"
+            if self.store.interaction_mode(self.task(task_run_id).thread_id)
+            == InteractionMode.AUTO
+            else "HUMAN"
+        )
+        if normalized_mode != expected_mode:
+            raise PermissionError(
+                f"{normalized_mode} result approval is invalid for {expected_mode} mode"
+            )
+        timestamp = self.clock()
+        with self.store.transaction(immediate=True) as db:
+            task = self._owned_task(
+                db, task_run_id, TaskPhase.WAITING_FOR_RESULT_APPROVAL
+            )
+            result = db.execute(
+                """SELECT * FROM workflow_task_results_v1
+                   WHERE task_run_id=? AND result_occurrence_key=?""",
+                (task_run_id, occurrence_key),
+            ).fetchone()
+            current = self._current_result_row(db, task_run_id)
+            if (
+                result is None
+                or current is None
+                or result["result_id"] != current["result_id"]
+                or result["plan_id"] != task.current_plan_id
+            ):
+                raise ValueError("result approval interrupt occurrence is stale")
+            if (
+                normalized_mode == "HUMAN"
+                and approval_occurred_at <= result["posted_at"]
+            ):
+                raise ValueError("result approval predates the visible result")
+            approval_id = _stable(
+                "task-result-approval",
+                result["result_id"],
+                occurrence_key,
+                normalized_mode,
+                approval_event_key or approved_by,
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO workflow_task_result_approvals_v1(
+                   result_approval_id,result_id,task_run_id,workflow_cycle_id,
+                   plan_id,execution_id,validation_id,result_occurrence_key,mode,
+                   approved_by,approval_event_key,approved_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    approval_id,
+                    result["result_id"],
+                    task_run_id,
+                    task.workflow_cycle_id,
+                    result["plan_id"],
+                    result["execution_id"],
+                    result["validation_id"],
+                    occurrence_key,
+                    normalized_mode,
+                    approved_by,
+                    approval_event_key,
+                    approval_occurred_at,
+                ),
+            )
+            db.execute(
+                """UPDATE workflow_task_runs_v1 SET status=?,phase=?,updated_at=?
+                   WHERE task_run_id=?""",
+                (TaskPhase.DONE.value, TaskPhase.DONE.value, timestamp, task_run_id),
+            )
+            released = db.execute(
+                """UPDATE workflow_cycles_v1 SET active_task_id=NULL,updated_at=?
+                   WHERE workflow_cycle_id=? AND active_task_id=?""",
+                (timestamp, task.workflow_cycle_id, task.task_id),
+            )
+            if released.rowcount != 1:
+                raise RuntimeError(
+                    "active task ownership changed during result approval"
+                )
+        return self.result_approval(approval_id)
+
+    def auto_accept_result(self, task_run_id: str) -> TaskResultApproval:
+        result = self.current_result(task_run_id)
+        if result is None:
+            raise ValueError("validated result is missing")
+        return self.approve_result(
+            task_run_id=task_run_id,
+            occurrence_key=result.result_occurrence_key,
+            approval_event_key=None,
+            approved_by="sweforge:auto-policy",
+            approval_is_authorized=True,
+            approval_occurred_at=self.clock(),
+            mode="AUTO",
+        )
+
+    def replan_from_result_feedback(
+        self, *, task_run_id: str, event_key: str, feedback: str
+    ) -> TaskRun:
+        """Carry the exact rejected result into same-owner cumulative planning."""
+        if not event_key or not feedback.strip():
+            raise ValueError("durable result feedback identity and text are required")
+        timestamp = self.clock()
+        with self.store.transaction(immediate=True) as db:
+            task = self._owned_task(
+                db, task_run_id, TaskPhase.WAITING_FOR_RESULT_APPROVAL
+            )
+            plan = db.execute(
+                "SELECT * FROM workflow_task_plans_v1 WHERE plan_id=?",
+                (task.current_plan_id,),
+            ).fetchone()
+            result = self._current_result_row(db, task_run_id)
+            if plan is None or result is None:
+                raise RuntimeError("result feedback context is incomplete")
+            execution = db.execute(
+                "SELECT * FROM workflow_task_executions_v1 WHERE execution_id=?",
+                (result["execution_id"],),
+            ).fetchone()
+            validation = db.execute(
+                "SELECT * FROM workflow_task_validations_v1 WHERE validation_id=?",
+                (result["validation_id"],),
+            ).fetchone()
+            history = list(task.repair_feedback)
+            history.append(
+                {
+                    "kind": "RESULT_FEEDBACK",
+                    "event_key": event_key,
+                    "feedback": feedback.strip()[:4_000],
+                    "previous_plan": plan["plan_text"],
+                    "execution_summary": execution["summary"] if execution else "",
+                    "validation_summary": validation["summary"] if validation else "",
+                    "validation_id": result["validation_id"],
+                    "execution_id": result["execution_id"],
+                }
+            )
+            db.execute(
+                "UPDATE workflow_task_plans_v1 SET status='SUPERSEDED' WHERE plan_id=?",
+                (plan["plan_id"],),
+            )
+            db.execute(
+                """UPDATE workflow_task_permits_v1 SET invalidated_at=?
+                   WHERE task_run_id=? AND invalidated_at IS NULL""",
+                (timestamp, task_run_id),
+            )
+            db.execute(
+                """UPDATE workflow_task_result_approvals_v1 SET invalidated_at=?
+                   WHERE task_run_id=? AND invalidated_at IS NULL""",
+                (timestamp, task_run_id),
+            )
+            db.execute(
+                """UPDATE workflow_task_runs_v1 SET status=?,phase=?,
+                   repair_feedback_json=?,updated_at=? WHERE task_run_id=?""",
+                (
+                    TaskPhase.PLANNING.value,
+                    TaskPhase.PLANNING.value,
+                    json.dumps(history, sort_keys=True),
                     timestamp,
                     task_run_id,
                 ),
@@ -832,6 +1224,31 @@ class WorkflowRuntime:
                      AND plan_digest=? AND invalidated_at IS NULL""",
                 (task.task_run_id, plan.plan_id, plan.version, plan.plan_digest),
             ).fetchone()
+            expected_mode = (
+                "AUTO"
+                if self.store.interaction_mode(task.thread_id) == InteractionMode.AUTO
+                else "HUMAN"
+            )
+            result = self.db.execute(
+                """SELECT * FROM workflow_task_results_v1
+                   WHERE task_run_id=? AND plan_id=? AND execution_id=?
+                     AND validation_id=?""",
+                (
+                    task.task_run_id,
+                    plan.plan_id,
+                    execution["execution_id"] if execution else "",
+                    accepted["validation_id"] if accepted else "",
+                ),
+            ).fetchone()
+            result_approval = (
+                self.db.execute(
+                    """SELECT * FROM workflow_task_result_approvals_v1
+                       WHERE result_id=? AND invalidated_at IS NULL""",
+                    (result["result_id"],),
+                ).fetchone()
+                if result is not None
+                else None
+            )
             if execution is None or accepted is None:
                 return False
             try:
@@ -842,6 +1259,7 @@ class WorkflowRuntime:
             if (
                 execution["status"] != "SUCCEEDED"
                 or permit is None
+                or permit["approval_mode"] != expected_mode
                 or execution["permit_id"] != permit["permit_id"]
                 or not isinstance(execution_evidence, dict)
                 or not isinstance(execution_evidence.get("tool_observations"), list)
@@ -851,6 +1269,21 @@ class WorkflowRuntime:
                 or not isinstance(validation_evidence, dict)
                 or not isinstance(validation_evidence.get("validation_runs"), list)
                 or not validation_evidence["validation_runs"]
+                or result is None
+                or result_approval is None
+                or result_approval["task_run_id"] != task.task_run_id
+                or result_approval["plan_id"] != plan.plan_id
+                or result_approval["execution_id"] != execution["execution_id"]
+                or result_approval["validation_id"] != accepted["validation_id"]
+                or result_approval["result_occurrence_key"]
+                != result["result_occurrence_key"]
+                or result_approval["mode"]
+                != (
+                    "AUTO"
+                    if self.store.interaction_mode(task.thread_id)
+                    == InteractionMode.AUTO
+                    else "HUMAN"
+                )
             ):
                 return False
         return True
@@ -919,6 +1352,41 @@ class WorkflowRuntime:
         if row is None:
             raise ValueError("unknown task permit")
         return self._permit(row)
+
+    def result(self, result_id: str) -> TaskResult:
+        row = self.db.execute(
+            "SELECT * FROM workflow_task_results_v1 WHERE result_id=?", (result_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("unknown task result")
+        return self._result(row)
+
+    def current_result(self, task_run_id: str) -> TaskResult | None:
+        row = self._current_result_row(self.db, task_run_id)
+        return self._result(row) if row is not None else None
+
+    @staticmethod
+    def _current_result_row(
+        db: sqlite3.Connection, task_run_id: str
+    ) -> sqlite3.Row | None:
+        return db.execute(
+            """SELECT r.* FROM workflow_task_results_v1 AS r
+               JOIN workflow_task_validations_v1 AS v
+                 ON v.validation_id=r.validation_id
+               WHERE r.task_run_id=?
+               ORDER BY v.validation_round DESC,r.result_id DESC LIMIT 1""",
+            (task_run_id,),
+        ).fetchone()
+
+    def result_approval(self, approval_id: str) -> TaskResultApproval:
+        row = self.db.execute(
+            """SELECT * FROM workflow_task_result_approvals_v1
+               WHERE result_approval_id=?""",
+            (approval_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("unknown task result approval")
+        return self._result_approval(row)
 
     def _owned_task(
         self, db: sqlite3.Connection, task_run_id: str, expected: TaskPhase
@@ -1012,6 +1480,39 @@ class WorkflowRuntime:
             plan_digest=row["plan_digest"],
             approval_event_key=row["approval_event_key"],
             approved_by=row["approved_by"],
+            approval_mode=row["approval_mode"],
             created_at=row["created_at"],
+            invalidated_at=row["invalidated_at"],
+        )
+
+    @staticmethod
+    def _result(row: sqlite3.Row) -> TaskResult:
+        return TaskResult(
+            result_id=row["result_id"],
+            task_run_id=row["task_run_id"],
+            workflow_cycle_id=row["workflow_cycle_id"],
+            plan_id=row["plan_id"],
+            execution_id=row["execution_id"],
+            validation_id=row["validation_id"],
+            result_occurrence_key=row["result_occurrence_key"],
+            posted_at=row["posted_at"],
+            posted_comment_id=row["posted_comment_id"],
+        )
+
+    @staticmethod
+    def _result_approval(row: sqlite3.Row) -> TaskResultApproval:
+        return TaskResultApproval(
+            result_approval_id=row["result_approval_id"],
+            result_id=row["result_id"],
+            task_run_id=row["task_run_id"],
+            workflow_cycle_id=row["workflow_cycle_id"],
+            plan_id=row["plan_id"],
+            execution_id=row["execution_id"],
+            validation_id=row["validation_id"],
+            result_occurrence_key=row["result_occurrence_key"],
+            mode=row["mode"],
+            approved_by=row["approved_by"],
+            approval_event_key=row["approval_event_key"],
+            approved_at=row["approved_at"],
             invalidated_at=row["invalidated_at"],
         )

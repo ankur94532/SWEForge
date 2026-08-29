@@ -19,6 +19,7 @@ from .agent import (
 from .capabilities import RepoCapabilityRegistry, load_repo_mcp_tools
 from .context import RepoAgentContext
 from .execution_security import SandboxBackendProvider, require_secure_backend
+from .github_models import InteractionMode
 from .github_store import (
     RepoMemoryCandidateRecord,
     RepoMemoryCandidateStatus,
@@ -171,6 +172,7 @@ class DeepAgentWorkflowDriver:
             runtime=self.runtime,
             workflow_cycle_id=cycle.workflow_cycle_id,
             publish_plan=lambda **kwargs: self._publish_plan(cycle, **kwargs),
+            publish_result=lambda **kwargs: self._publish_result(cycle, **kwargs),
             execution_evidence=lambda: list(observations),
             validation_evidence=lambda: list(validations),
         )
@@ -235,9 +237,73 @@ class DeepAgentWorkflowDriver:
             raise RuntimeError("multiple matching task plan comments are ambiguous")
         body = (
             f"{marker}\n### SWEForge task `{task_id}` plan — v{version}\n\n"
-            f"{plan_text.strip()}\n\nReply with `@agent approve` to execute "
-            "this exact plan, or `@agent <feedback>` to revise it."
+            f"{plan_text.strip()}\n\n"
         )
+        if self.store.interaction_mode(cycle.thread_id) == InteractionMode.AUTO:
+            body += (
+                "AUTO mode is enabled. This exact plan has been recorded and "
+                "SWEForge will proceed automatically."
+            )
+        else:
+            body += (
+                "Reply with `@agent approve` to execute this exact plan, or "
+                "`@agent <feedback>` to revise it."
+            )
+        comment = matches[0] if matches else self._post_response(repo, root, body)
+        return int(comment["id"]), str(
+            comment.get("created_at") or self.runtime.clock()
+        )
+
+    def _publish_result(
+        self,
+        cycle: WorkflowCycle,
+        *,
+        task_run_id: str,
+        task_id: str,
+    ) -> tuple[int, str]:
+        task = self.runtime.task(task_run_id)
+        execution = self.store.connection.execute(
+            """SELECT * FROM workflow_task_executions_v1
+               WHERE task_run_id=? AND plan_id=? AND attempt=?""",
+            (task_run_id, task.current_plan_id, task.execution_attempt),
+        ).fetchone()
+        validation = self.store.connection.execute(
+            """SELECT * FROM workflow_task_validations_v1
+               WHERE task_run_id=? AND plan_id=? AND execution_attempt=?
+               ORDER BY validation_round DESC LIMIT 1""",
+            (task_run_id, task.current_plan_id, task.execution_attempt),
+        ).fetchone()
+        if execution is None or validation is None or validation["verdict"] != "ACCEPT":
+            raise RuntimeError("exact accepted validation is missing")
+        identity = hashlib.sha256(
+            (
+                f"{task_run_id}\0{task.current_plan_id}\0"
+                f"{execution['execution_id']}\0{validation['validation_id']}"
+            ).encode()
+        ).hexdigest()[:24]
+        marker = f"<!-- sweforge:task-result:{identity} -->"
+        root = self._root_event(cycle)
+        repo = self.client.repository(root["repo_full_name"])
+        comments = self._conversation_comments(repo, root)
+        matches = [item for item in comments if marker in (item.get("body") or "")]
+        if len(matches) > 1:
+            raise RuntimeError("multiple matching task result comments are ambiguous")
+        body = (
+            f"{marker}\n### SWEForge task `{task_id}` implementation ready for review"
+            f"\n\nThe approved plan has been executed and validation passed.\n\n"
+            f"Execution:\n- {execution['summary'][:2_000]}\n\n"
+            f"Validation:\n- {validation['summary'][:2_000]}\n- Verdict: ACCEPT\n\n"
+        )
+        if self.store.interaction_mode(cycle.thread_id) == InteractionMode.AUTO:
+            body += (
+                "AUTO mode is enabled; SWEForge will accept this exact result "
+                "automatically."
+            )
+        else:
+            body += (
+                "Reply with `@agent approve` to accept this task result, or "
+                "`@agent <feedback>` to request changes."
+            )
         comment = matches[0] if matches else self._post_response(repo, root, body)
         return int(comment["id"]), str(
             comment.get("created_at") or self.runtime.clock()

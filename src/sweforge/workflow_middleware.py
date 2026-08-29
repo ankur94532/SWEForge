@@ -50,6 +50,8 @@ class WorkflowAuthority:
         replay_tool = {
             "PLAN_APPROVAL": "submit_plan",
             "PLAN_FEEDBACK": "submit_plan",
+            "RESULT_APPROVAL": "finish_validation",
+            "RESULT_FEEDBACK": "finish_validation",
             "CLARIFICATION_RESPONSE": "request_clarification",
         }.get(kind)
         if replay_tool is None:
@@ -68,10 +70,15 @@ class WorkflowAuthority:
         ):
             phase = task.waiting_from_phase
         elif (
-            task.phase == TaskPhase.WAITING_FOR_APPROVAL
+            task.phase == TaskPhase.WAITING_FOR_PLAN_APPROVAL
             and replay_tool == "submit_plan"
         ):
             phase = TaskPhase.PLANNING
+        elif (
+            task.phase == TaskPhase.WAITING_FOR_RESULT_APPROVAL
+            and replay_tool == "finish_validation"
+        ):
+            phase = TaskPhase.VALIDATING
         else:
             phase = task.phase
         if phase not in (

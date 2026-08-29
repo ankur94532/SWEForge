@@ -335,6 +335,7 @@ def test_planning_receives_bounded_cases_but_plan_stays_authoritative(tmp_path):
         model="planning-sonnet",
         repo_paths={harness.repo.full_name: harness.source},
         workspace_root=harness.tmp_path / "workspaces",
+        lock_root=harness.tmp_path / "locks",
     )
     assert "#142" in seen["cases"]
     assert "clues, not" in seen["cases"]
@@ -365,6 +366,7 @@ def test_planning_context_is_empty_when_no_cases_exist(tmp_path):
         model="planning-sonnet",
         repo_paths={harness.repo.full_name: harness.source},
         workspace_root=harness.tmp_path / "workspaces",
+        lock_root=harness.tmp_path / "locks",
     )
     assert seen["cases"] == ""
     harness.store.close()

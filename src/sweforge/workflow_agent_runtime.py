@@ -39,17 +39,17 @@ def approval_resume_for_interrupt(
     approved_at: str,
     authorized: bool,
 ) -> dict[str, Any] | None:
-    """Build a resume only for the exact pending plan-approval occurrence."""
+    """Build a resume only for an exact pending approval occurrence."""
     matches = [
         item
         for item in pending
-        if item.get("kind") == "PLAN_APPROVAL"
+        if item.get("kind") in {"PLAN_APPROVAL", "RESULT_APPROVAL"}
         and item.get("occurrence_key") == occurrence_key
     ]
     if len(matches) != 1 or not authorized:
         return None
     return {
-        "kind": "PLAN_APPROVAL",
+        "kind": str(matches[0]["kind"]),
         "occurrence_key": occurrence_key,
         "event_key": event_key,
         "approved_by": approved_by,

@@ -2532,16 +2532,14 @@ class WorkflowEngine:
         transition is persisted before the method returns, so a later tick can
         safely recover after a process crash.
         """
+        execution_options = execute_kwargs or {}
+        lock_root = execution_options.get("lock_root", DEFAULT_LOCK_ROOT)
+        memory_lock_root = execution_options.get("memory_lock_root", lock_root)
         state = self.store.workflow_state(thread_id)
         self._drain_approval_controls(thread_id, state)
         if state:
             was_executing = state.phase == WorkflowPhase.EXECUTING
-            recovery_lock_root = (execute_kwargs or {}).get(
-                "lock_root", DEFAULT_LOCK_ROOT
-            )
-            state, busy = self._recover_executing_state(
-                state, lock_root=recovery_lock_root
-            )
+            state, busy = self._recover_executing_state(state, lock_root=lock_root)
             if busy:
                 return WorkflowAdvanceResult(
                     WorkflowPhase.EXECUTING, thread_id, message="busy"
@@ -2588,9 +2586,7 @@ class WorkflowEngine:
                     state=state,
                     workspace_path=workspace.workspace_path if workspace else None,
                     memory_store=memory_store,
-                    lock_root=(execute_kwargs or {}).get(
-                        "memory_lock_root", "~/.sweforge/locks"
-                    ),
+                    lock_root=memory_lock_root,
                     memory_model=memory_model,
                 )
                 return WorkflowAdvanceResult(
@@ -2650,9 +2646,7 @@ class WorkflowEngine:
                 response_text=execution["response_text"] if execution else "",
                 pr_url=publication.pr_url,
                 memory_store=memory_store,
-                memory_lock_root=(execute_kwargs or {}).get(
-                    "memory_lock_root", "~/.sweforge/locks"
-                ),
+                memory_lock_root=memory_lock_root,
                 memory_model=memory_model,
                 resolution_model=resolution_model,
             )
@@ -2848,6 +2842,7 @@ class WorkflowEngine:
                 repo_paths=repo_paths,
                 workspace_root=workspace_root,
                 memory_store=memory_store,
+                lock_root=lock_root,
             )
             if plan is None:
                 return WorkflowAdvanceResult(WorkflowPhase.IDLE, thread_id)
@@ -2887,6 +2882,7 @@ class WorkflowEngine:
                     repo_paths=repo_paths,
                     workspace_root=workspace_root,
                     memory_store=memory_store,
+                    lock_root=lock_root,
                 )
             if self.client is not None and plan.status is PlanStatus.DRAFT:
                 plan = self.publish_plan(plan.plan_id)

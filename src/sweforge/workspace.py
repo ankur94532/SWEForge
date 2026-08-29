@@ -41,6 +41,7 @@ class ThreadWorkspace:
         expected_branch: str | None = None,
         expected_base: str | None = None,
         lock_root: str | Path | None = None,
+        fetch_remote_main: bool = False,
     ) -> "ThreadWorkspace":
         """Open or create one IssueThread's persistent worktree.
 
@@ -69,6 +70,7 @@ class ThreadWorkspace:
                 existing_path=existing_path,
                 expected_branch=expected_branch,
                 expected_base=expected_base,
+                fetch_remote_main=fetch_remote_main,
             )
 
     @classmethod
@@ -82,6 +84,7 @@ class ThreadWorkspace:
         existing_path: str | None,
         expected_branch: str | None,
         expected_base: str | None,
+        fetch_remote_main: bool,
     ) -> "ThreadWorkspace":
         if existing_path is not None and Path(existing_path).resolve() != path:
             raise WorkspaceError(
@@ -92,7 +95,20 @@ class ThreadWorkspace:
 
         if path.exists():
             if existing_path is None:
-                raise WorkspaceError("workspace path exists without persisted metadata")
+                if not fetch_remote_main:
+                    raise WorkspaceError(
+                        "workspace path exists without persisted metadata"
+                    )
+                # Recover a crash after exact worktree creation but before the
+                # application DB record committed. No agent can receive this
+                # path before create() returns, so HEAD is still the frozen base.
+                actual_root = Path(_git(path, "rev-parse", "--show-toplevel")).resolve()
+                actual_branch = _git(path, "branch", "--show-current")
+                if actual_root != path or actual_branch != branch:
+                    raise WorkspaceError(
+                        "unrecorded workspace does not match the issue branch"
+                    )
+                return cls(repo, path, _git(path, "rev-parse", "HEAD"), branch, False)
             if not path.is_dir():
                 raise WorkspaceError(f"Workspace path is not a directory: {path}")
             actual_root = Path(_git(path, "rev-parse", "--show-toplevel")).resolve()
@@ -121,7 +137,15 @@ class ThreadWorkspace:
         # dead registration and reattach to the orphan instead of recreating it.
         _prune_worktrees(repo)
         orphan = _orphan_branch(repo, branch)
-        base = _git(repo, "rev-parse", branch if orphan else "HEAD")
+        if orphan:
+            # A branch left by a failed worktree attachment already freezes
+            # the fetched base; refetching here could incorrectly move it.
+            base = _git(repo, "rev-parse", branch)
+        elif fetch_remote_main:
+            _git(repo, "fetch", "origin", "main")
+            base = _git(repo, "rev-parse", "refs/remotes/origin/main")
+        else:
+            base = _git(repo, "rev-parse", "HEAD")
         add_args = (
             ["worktree", "add", str(path), branch]
             if orphan

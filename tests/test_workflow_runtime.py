@@ -114,7 +114,7 @@ def _approve_execute_validate(engine, task, verdict=ValidationVerdict.ACCEPT):
         },
     )
     assert validating.phase == TaskPhase.VALIDATING
-    return engine.finish_validation(
+    validated = engine.finish_validation(
         task_run_id=task.task_run_id,
         verdict=verdict,
         summary="validated",
@@ -125,6 +125,22 @@ def _approve_execute_validate(engine, task, verdict=ValidationVerdict.ACCEPT):
             "validation_runs": [{"diff": "", "executions": []}],
         },
     )
+    if verdict != ValidationVerdict.ACCEPT:
+        return validated
+    result = engine.publish_validated_result(
+        task_run_id=task.task_run_id,
+        posted_comment_id=200 + task.declaration_index,
+        posted_at="2026-01-01T00:13:00Z",
+    )
+    engine.approve_result(
+        task_run_id=task.task_run_id,
+        occurrence_key=result.result_occurrence_key,
+        approval_event_key=f"result-approval-{task.task_id}",
+        approved_by="maintainer",
+        approval_is_authorized=True,
+        approval_occurred_at="2026-01-01T00:14:00Z",
+    )
+    return engine.task(task.task_run_id)
 
 
 def test_diamond_runs_strictly_serial_in_declaration_order(runtime):
@@ -158,7 +174,7 @@ def test_waiting_for_approval_retains_owner_and_does_not_start_ready_peer(runtim
     statuses = {
         item.task_id: item.status for item in engine.task_runs(cycle.workflow_cycle_id)
     }
-    assert statuses["A"] == TaskPhase.WAITING_FOR_APPROVAL
+    assert statuses["A"] == TaskPhase.WAITING_FOR_PLAN_APPROVAL
     assert statuses["B"] == statuses["C"] == statuses["D"] == TaskPhase.PENDING
 
     authority = WorkflowAuthority(engine, cycle.workflow_cycle_id, _spec())
@@ -308,7 +324,7 @@ def test_restart_recovers_exact_active_task_and_phase(runtime):
     restarted = WorkflowRuntime(store)
     recovered = restarted.select_active_task(cycle.workflow_cycle_id)
     assert recovered.task_run_id == task.task_run_id
-    assert recovered.phase == TaskPhase.WAITING_FOR_APPROVAL
+    assert recovered.phase == TaskPhase.WAITING_FOR_PLAN_APPROVAL
 
 
 def test_restart_rehydrates_exact_persisted_workflow_spec(runtime):
@@ -413,6 +429,7 @@ def test_lifecycle_gateways_capture_application_owned_evidence(runtime):
             runtime=engine,
             workflow_cycle_id=cycle.workflow_cycle_id,
             publish_plan=lambda **_kwargs: (1, "now"),
+            publish_result=lambda **_kwargs: (2, "2026-01-01T00:13:00Z"),
             execution_evidence=lambda: [
                 {"command": "pytest", "exit_code": 0, "output": "passed"}
             ],
@@ -439,15 +456,16 @@ def test_lifecycle_gateways_capture_application_owned_evidence(runtime):
             }
         )
     validation_runs.append({"diff": "", "executions": []})
-    tools["finish_validation"].invoke(
-        {
-            "verdict": "ACCEPT",
-            "summary": "looks good",
-            "findings": [],
-            "repair_instructions": [],
-            "evidence": {"reported": "passed"},
-        }
-    )
+    with pytest.raises(KeyError, match="pregel_scratchpad"):
+        tools["finish_validation"].invoke(
+            {
+                "verdict": "ACCEPT",
+                "summary": "looks good",
+                "findings": [],
+                "repair_instructions": [],
+                "evidence": {"reported": "passed"},
+            }
+        )
     validation = store.connection.execute(
         "SELECT evidence_json FROM workflow_task_validations_v1"
     ).fetchone()

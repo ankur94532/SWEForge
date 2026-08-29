@@ -9,6 +9,7 @@ from typing import Any
 from langchain_core.tools import tool
 from langgraph.types import interrupt
 
+from .github_models import InteractionMode
 from .workflow_runtime import TaskPhase, ValidationVerdict, WorkflowRuntime
 
 
@@ -17,6 +18,7 @@ def build_lifecycle_tools(
     runtime: WorkflowRuntime,
     workflow_cycle_id: str,
     publish_plan: Callable[..., tuple[int, str]],
+    publish_result: Callable[..., tuple[int, str]],
     execution_evidence: Callable[[], list[dict[str, Any]]] | None = None,
     validation_evidence: Callable[[], list[dict[str, Any]]] | None = None,
 ) -> list[Any]:
@@ -38,7 +40,7 @@ def build_lifecycle_tools(
         if task.current_plan_id:
             current = runtime.plan(task.current_plan_id)
             if current.plan_digest == digest and task.phase in (
-                TaskPhase.WAITING_FOR_APPROVAL,
+                TaskPhase.WAITING_FOR_PLAN_APPROVAL,
                 TaskPhase.EXECUTING,
             ):
                 plan = current
@@ -57,6 +59,13 @@ def build_lifecycle_tools(
                 posted_comment_id=comment_id,
                 posted_at=posted_at,
             )
+        if runtime.store.interaction_mode(task.thread_id) == InteractionMode.AUTO:
+            if (
+                runtime.task(task.task_run_id).phase
+                == TaskPhase.WAITING_FOR_PLAN_APPROVAL
+            ):
+                runtime.auto_authorize_plan(task.task_run_id)
+            return "Exact AUTO plan authorization recorded. Continue in EXECUTING."
         approval = interrupt(
             {
                 "kind": "PLAN_APPROVAL",
@@ -117,18 +126,72 @@ def build_lifecycle_tools(
         task = runtime.active_task(workflow_cycle_id)
         if task is None:
             raise PermissionError("workflow has no active task")
-        captured = validation_evidence() if validation_evidence is not None else []
-        if validation_evidence is not None and not captured:
-            raise ValueError("run_validation evidence is required")
-        result = runtime.finish_validation(
-            task_run_id=task.task_run_id,
-            verdict=ValidationVerdict(verdict),
-            summary=summary,
-            findings=findings,
-            repair_instructions=repair_instructions,
-            evidence={"reported": evidence, "validation_runs": captured},
+        parsed_verdict = ValidationVerdict(verdict)
+        if task.phase == TaskPhase.VALIDATING:
+            captured = validation_evidence() if validation_evidence is not None else []
+            if validation_evidence is not None and not captured:
+                raise ValueError("run_validation evidence is required")
+            result = runtime.finish_validation(
+                task_run_id=task.task_run_id,
+                verdict=parsed_verdict,
+                summary=summary,
+                findings=findings,
+                repair_instructions=repair_instructions,
+                evidence={"reported": evidence, "validation_runs": captured},
+            )
+            if parsed_verdict != ValidationVerdict.ACCEPT:
+                return f"Validation recorded. Task phase is now {result.phase.value}."
+            comment_id, posted_at = publish_result(
+                task_run_id=task.task_run_id,
+                task_id=task.task_id,
+            )
+            accepted_result = runtime.publish_validated_result(
+                task_run_id=task.task_run_id,
+                posted_comment_id=comment_id,
+                posted_at=posted_at,
+            )
+        elif task.phase == TaskPhase.WAITING_FOR_RESULT_APPROVAL:
+            accepted_result = runtime.current_result(task.task_run_id)
+            if accepted_result is None:
+                raise RuntimeError("waiting task has no exact result")
+        else:
+            raise PermissionError("only validation may submit a result")
+        if runtime.store.interaction_mode(task.thread_id) == InteractionMode.AUTO:
+            runtime.auto_accept_result(task.task_run_id)
+            return "Exact AUTO result acceptance recorded. Task is DONE."
+        approval = interrupt(
+            {
+                "kind": "RESULT_APPROVAL",
+                "occurrence_key": accepted_result.result_occurrence_key,
+                "workflow_cycle_id": workflow_cycle_id,
+                "task_run_id": task.task_run_id,
+                "task_id": task.task_id,
+                "plan_id": accepted_result.plan_id,
+                "execution_id": accepted_result.execution_id,
+                "validation_id": accepted_result.validation_id,
+                "result_id": accepted_result.result_id,
+            }
         )
-        return f"Validation recorded. Task phase is now {result.phase.value}."
+        if isinstance(approval, dict) and approval.get("kind") == "RESULT_FEEDBACK":
+            if approval.get("occurrence_key") != accepted_result.result_occurrence_key:
+                raise PermissionError("result feedback occurrence is stale")
+            runtime.replan_from_result_feedback(
+                task_run_id=task.task_run_id,
+                event_key=str(approval.get("event_key") or ""),
+                feedback=str(approval.get("feedback") or ""),
+            )
+            return "Result feedback recorded. Replan the same cumulative task."
+        if not isinstance(approval, dict) or approval.get("kind") != "RESULT_APPROVAL":
+            raise PermissionError("result approval resume payload is invalid")
+        runtime.approve_result(
+            task_run_id=task.task_run_id,
+            occurrence_key=str(approval.get("occurrence_key") or ""),
+            approval_event_key=str(approval.get("event_key") or ""),
+            approved_by=str(approval.get("approved_by") or ""),
+            approval_is_authorized=approval.get("authorized") is True,
+            approval_occurred_at=str(approval.get("approved_at") or ""),
+        )
+        return "Exact validated result approval accepted. Task is DONE."
 
     @tool
     def request_clarification(

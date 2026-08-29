@@ -93,6 +93,22 @@ class FakeDriver:
                 self.events.append((task.task_id, "APPROVED"))
             elif resume["kind"] == "PLAN_FEEDBACK":
                 self.runtime.replan_from_feedback(task.task_run_id)
+            elif resume["kind"] == "RESULT_APPROVAL":
+                self.runtime.approve_result(
+                    task_run_id=task.task_run_id,
+                    occurrence_key=resume["occurrence_key"],
+                    approval_event_key=resume["event_key"],
+                    approved_by=resume["approved_by"],
+                    approval_is_authorized=resume["authorized"],
+                    approval_occurred_at=resume["approved_at"],
+                )
+                self.events.append((task.task_id, "RESULT_APPROVED"))
+            elif resume["kind"] == "RESULT_FEEDBACK":
+                self.runtime.replan_from_result_feedback(
+                    task_run_id=task.task_run_id,
+                    event_key=resume["event_key"],
+                    feedback=resume["feedback"],
+                )
             elif resume["kind"] == "CLARIFICATION_RESPONSE":
                 self.runtime.resume_clarification(
                     task_run_id=task.task_run_id,
@@ -131,7 +147,7 @@ class FakeDriver:
         elif task.phase == TaskPhase.VALIDATING:
             queue = self.verdicts.setdefault(task.task_id, [ValidationVerdict.ACCEPT])
             verdict = queue.pop(0)
-            self.runtime.finish_validation(
+            validated = self.runtime.finish_validation(
                 task_run_id=task.task_run_id,
                 verdict=verdict,
                 summary=f"Validated {task.task_id}: {verdict.value}",
@@ -146,6 +162,12 @@ class FakeDriver:
                     "validation_runs": [{"diff": "", "executions": []}],
                 },
             )
+            if verdict == ValidationVerdict.ACCEPT:
+                self.runtime.publish_validated_result(
+                    task_run_id=validated.task_run_id,
+                    posted_comment_id=500 + len(self.events),
+                    posted_at="2026-01-01T00:10:30Z",
+                )
             self.events.append((task.task_id, verdict.value))
 
 
@@ -182,6 +204,10 @@ def _git_repo(path):
         cwd=path,
         check=True,
     )
+    remote = path.parent / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
+    subprocess.run(["git", "remote", "add", "origin", remote], cwd=path, check=True)
+    subprocess.run(["git", "push", "-qu", "origin", "main"], cwd=path, check=True)
 
 
 def _event(kind, source_id, body, created_at):
@@ -212,6 +238,17 @@ def _record(db, stream, event):
         polled_at=event.source_updated_at,
     )
     store.close()
+
+
+def _approve(server, source_id, minute):
+    event = _event(
+        SourceKind.ISSUE_COMMENT,
+        source_id,
+        "@agent approve",
+        f"2026-01-01T00:{minute:02d}:00Z",
+    )
+    _record(server.config.db, "issue_comments", event)
+    server._worker_entry("github:41:issue:9")
 
 
 def _server(tmp_path, spec_path=None, *, max_ticks=30):
@@ -281,39 +318,32 @@ def test_server_drives_custom_diamond_serially_and_publishes_once(tmp_path):
     assert cycle["workflow_id"] == "diamond"
     assert cycle["active_task_id"] == "A"
     assert [row["status"] for row in tasks] == [
-        "WAITING_FOR_APPROVAL",
+        "WAITING_FOR_PLAN_APPROVAL",
         "PENDING",
         "PENDING",
         "PENDING",
     ]
     store.close()
-    for index, expected_wait in enumerate(("B", "C", "D"), start=1):
-        approval = _event(
-            SourceKind.ISSUE_COMMENT,
-            f"approval-{index}",
-            "@agent approve",
-            f"2026-01-01T00:{10 + index + 1:02d}:00Z",
-        )
-        _record(server.config.db, "issue_comments", approval)
-        server._worker_entry(thread_id)
+    task_ids = ("A", "B", "C", "D")
+    for index, task_id in enumerate(task_ids, start=1):
+        _approve(server, f"plan-approval-{index}", 10 + index * 2)
         store = SQLiteGitHubStore(server.config.db)
         cycle = store.connection.execute("SELECT * FROM workflow_cycles_v1").fetchone()
-        assert cycle["active_task_id"] == expected_wait
+        assert cycle["active_task_id"] == task_id
         waiting = store.connection.execute(
             """SELECT task_id FROM workflow_task_runs_v1
-               WHERE status='WAITING_FOR_APPROVAL'"""
+               WHERE status='WAITING_FOR_RESULT_APPROVAL'"""
         ).fetchall()
-        assert [row["task_id"] for row in waiting] == [expected_wait]
+        assert [row["task_id"] for row in waiting] == [task_id]
         store.close()
-
-    final_approval = _event(
-        SourceKind.ISSUE_COMMENT,
-        "approval-4",
-        "@agent approve",
-        "2026-01-01T00:20:00Z",
-    )
-    _record(server.config.db, "issue_comments", final_approval)
-    server._worker_entry(thread_id)
+        _approve(server, f"result-approval-{index}", 11 + index * 2)
+        if task_id != "D":
+            store = SQLiteGitHubStore(server.config.db)
+            cycle = store.connection.execute(
+                "SELECT * FROM workflow_cycles_v1"
+            ).fetchone()
+            assert cycle["active_task_id"] == task_ids[index]
+            store.close()
     store = SQLiteGitHubStore(server.config.db)
     cycle = store.connection.execute("SELECT * FROM workflow_cycles_v1").fetchone()
     assert cycle["status"] == "PUBLISHED"
@@ -363,8 +393,8 @@ def test_server_accepts_lifecycle_gateway_from_langgraph_tool_thread(tmp_path):
         "SELECT status, phase FROM workflow_task_runs_v1"
     ).fetchone()
     assert (task["status"], task["phase"]) == (
-        "WAITING_FOR_APPROVAL",
-        "WAITING_FOR_APPROVAL",
+        "WAITING_FOR_PLAN_APPROVAL",
+        "WAITING_FOR_PLAN_APPROVAL",
     )
     assert store.dispatcher_failure("github:41:issue:9") is None
     store.close()
@@ -393,6 +423,7 @@ def test_default_server_runtime_repair_loop_keeps_same_task(tmp_path):
     )
     _record(server.config.db, "issue_comments", approval)
     server._worker_entry(thread_id)
+    _approve(server, "result-approval", 21)
 
     assert FakeDriver.events.count(("implementation", "EXECUTED")) == 2
     assert ("implementation", "NEEDS_FIXES") in FakeDriver.events
@@ -400,6 +431,49 @@ def test_default_server_runtime_repair_loop_keeps_same_task(tmp_path):
     cycle = store.connection.execute("SELECT * FROM workflow_cycles_v1").fetchone()
     assert cycle["workflow_id"] == "default"
     assert cycle["status"] == "PUBLISHED"
+    assert len(FakePublisher.calls) == 1
+    store.close()
+
+
+def test_auto_issue_completes_both_barriers_without_human_events(tmp_path):
+    FakeDriver.events = []
+    FakeDriver.verdicts = {}
+    FakePublisher.calls = []
+    server = _server(tmp_path)
+    root = replace(
+        _event(
+            SourceKind.ISSUE,
+            "auto-root",
+            "@agent run automatically",
+            "2026-01-01T00:00:00Z",
+        ),
+        issue_labels=("AUTO",),
+    )
+    _record(server.config.db, "issues", root)
+    server._worker_entry("github:41:issue:9")
+
+    store = SQLiteGitHubStore(server.config.db)
+    task = store.connection.execute("SELECT * FROM workflow_task_runs_v1").fetchone()
+    permit = store.connection.execute(
+        "SELECT * FROM workflow_task_permits_v1"
+    ).fetchone()
+    result_approval = store.connection.execute(
+        "SELECT * FROM workflow_task_result_approvals_v1"
+    ).fetchone()
+    assert task["phase"] == "DONE"
+    assert permit["approval_mode"] == "AUTO"
+    assert result_approval["mode"] == "AUTO"
+    assert result_approval["approval_event_key"] is None
+    assert (
+        store.connection.execute(
+            "SELECT count(*) FROM source_events WHERE body='@agent approve'"
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        store.connection.execute("SELECT status FROM workflow_cycles_v1").fetchone()[0]
+        == "PUBLISHED"
+    )
     assert len(FakePublisher.calls) == 1
     store.close()
 
@@ -444,7 +518,7 @@ def test_validation_replan_requires_new_same_task_approval(tmp_path):
         "SELECT * FROM workflow_task_permits_v1 ORDER BY created_at"
     ).fetchall()
     assert cycle["active_task_id"] == "implementation"
-    assert task["status"] == "WAITING_FOR_APPROVAL"
+    assert task["status"] == "WAITING_FOR_PLAN_APPROVAL"
     assert [row["status"] for row in plans] == ["SUPERSEDED", "POSTED"]
     assert permits[0]["invalidated_at"] is not None
     store.close()
@@ -460,6 +534,7 @@ def test_validation_replan_requires_new_same_task_approval(tmp_path):
         ),
     )
     server._worker_entry(thread_id)
+    _approve(server, "result-approval", 26)
     store = SQLiteGitHubStore(server.config.db)
     assert (
         store.connection.execute("SELECT status FROM workflow_cycles_v1").fetchone()[0]
@@ -516,7 +591,15 @@ def test_server_restarts_recover_executing_and_validating_owner(tmp_path):
     store.close()
 
     server._worker_entry(thread_id)
-    server._worker_entry(thread_id)
+    store = SQLiteGitHubStore(server.config.db)
+    assert (
+        store.connection.execute("SELECT phase FROM workflow_task_runs_v1").fetchone()[
+            0
+        ]
+        == "WAITING_FOR_RESULT_APPROVAL"
+    )
+    store.close()
+    _approve(server, "result-approval", 21)
     store = SQLiteGitHubStore(server.config.db)
     assert (
         store.connection.execute("SELECT status FROM workflow_cycles_v1").fetchone()[0]
@@ -577,7 +660,7 @@ def test_clarification_keeps_owner_and_rejects_approval_as_answer(tmp_path):
     task = store.connection.execute("SELECT * FROM workflow_task_runs_v1").fetchone()
     cycle = store.connection.execute("SELECT * FROM workflow_cycles_v1").fetchone()
     assert cycle["active_task_id"] == "implementation"
-    assert task["phase"] == "WAITING_FOR_APPROVAL"
+    assert task["phase"] == "WAITING_FOR_PLAN_APPROVAL"
     assert ("implementation", "CLARIFIED") in FakeDriver.events
     store.close()
     FakeDriver.clarify_once = False
@@ -611,6 +694,7 @@ def test_queued_deferred_followup_becomes_next_declarative_cycle(tmp_path):
         ),
     )
     server._worker_entry(thread_id)
+    _approve(server, "result-approval", 21)
 
     followup = _event(
         SourceKind.ISSUE_COMMENT,

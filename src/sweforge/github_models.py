@@ -23,6 +23,13 @@ class OriginSurface(StrEnum):
     PR_INLINE_REVIEW = "PR_INLINE_REVIEW"
 
 
+class InteractionMode(StrEnum):
+    """Immutable human-interaction policy captured at first issue ingestion."""
+
+    MANUAL = "MANUAL"
+    AUTO = "AUTO"
+
+
 _EXACT_APPROVAL_RE = re.compile(r"^\s*@agent\s+approve\s*$", re.IGNORECASE)
 
 
@@ -64,6 +71,7 @@ class SourceEvent:
     in_reply_to_id: str | None = None
     pull_request_review_id: str | None = None
     review_thread_root_id: str | None = None
+    issue_labels: tuple[str, ...] = ()
 
     @property
     def event_key(self) -> str:

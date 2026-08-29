@@ -394,6 +394,40 @@ def test_declarative_multitask_publication_is_one_cumulative_pr(tmp_path):
                 "validation_runs": [{"diff": "", "executions": []}],
             },
         )
+        result = runtime.publish_validated_result(
+            task_run_id=task.task_run_id,
+            posted_comment_id=100 + index,
+            posted_at="2026-01-01T00:13:00Z",
+        )
+        result_approval_event = SourceEvent(
+            1,
+            repo.full_name,
+            SourceKind.ISSUE_COMMENT,
+            f"result-approval-{task_id}",
+            "2026-01-01T00:14:00Z",
+            SubjectKind.ISSUE,
+            8,
+            "maintainer",
+            "@agent approve",
+            None,
+            source_created_at="2026-01-01T00:14:00Z",
+        )
+        store.record_batch(
+            1,
+            f"result-approval-{task_id}",
+            [result_approval_event],
+            since="now",
+            etag=None,
+            polled_at="2026-01-01T00:14:00Z",
+        )
+        runtime.approve_result(
+            task_run_id=task.task_run_id,
+            occurrence_key=result.result_occurrence_key,
+            approval_event_key=result_approval_event.event_key,
+            approved_by="maintainer",
+            approval_is_authorized=True,
+            approval_occurred_at="2026-01-01T00:14:00Z",
+        )
     assert runtime.select_active_task(cycle.workflow_cycle_id) is None
 
     expected_publication = store.eligible_publication_id(thread_id)

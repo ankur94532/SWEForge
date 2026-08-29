@@ -10,7 +10,12 @@ from sweforge.github_store import SQLiteGitHubStore
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def issue_item(number=7, updated="2026-01-01T00:00:00Z", body="@agent fix this"):
+def issue_item(
+    number=7,
+    updated="2026-01-01T00:00:00Z",
+    body="@agent fix this",
+    labels=(),
+):
     return {
         "id": number + 100,
         "number": number,
@@ -18,6 +23,7 @@ def issue_item(number=7, updated="2026-01-01T00:00:00Z", body="@agent fix this")
         "body": body,
         "html_url": f"https://github.com/example/repo/issues/{number}",
         "user": {"login": "octocat"},
+        "labels": [{"name": label} for label in labels],
     }
 
 
@@ -71,6 +77,38 @@ def test_issue_event_is_persisted_once_and_thread_is_deterministic(tmp_path):
         "2026-01-01T00:00:00Z"
     )
     assert [row["thread_id"] for row in store.events()] == ["github:123:issue:7"]
+    store.close()
+
+
+@pytest.mark.parametrize(
+    ("initial_labels", "later_labels", "expected"),
+    [(("AUTO",), (), "AUTO"), ((), ("AUTO",), "MANUAL")],
+)
+def test_poller_captures_issue_interaction_mode_only_on_first_routing(
+    tmp_path, initial_labels, later_labels, expected
+):
+    repo = RepositoryRef(123, "example/repo")
+    fake = FakeGitHub(
+        {repo.full_name: repo},
+        {
+            (123, "issues"): PollResponse(
+                (issue_item(body="@agent first", labels=initial_labels),)
+            )
+        },
+    )
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    poller(fake, store).poll([repo.full_name])
+    fake.responses[(123, "issues")] = PollResponse(
+        (
+            issue_item(
+                updated="2026-01-01T00:01:00Z",
+                body="@agent second",
+                labels=later_labels,
+            ),
+        )
+    )
+    poller(fake, store).poll([repo.full_name])
+    assert store.issue_thread("github:123:issue:7")["interaction_mode"] == expected
     store.close()
 
 

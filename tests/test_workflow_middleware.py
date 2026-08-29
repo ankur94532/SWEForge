@@ -28,7 +28,7 @@ class Authority:
         self.tools = tools
 
     def snapshot(self):
-        if self.phase == TaskPhase.WAITING_FOR_APPROVAL:
+        if self.phase == TaskPhase.WAITING_FOR_PLAN_APPROVAL:
             raise PermissionError("not runnable")
         return WorkflowPolicySnapshot(
             workflow_id="flow",
@@ -161,7 +161,7 @@ def test_investigator_can_use_read_only_tool_in_active_phase():
 
 
 def test_waiting_for_approval_runs_no_root_or_subagent_model():
-    authority = Authority(TaskPhase.WAITING_FOR_APPROVAL)
+    authority = Authority(TaskPhase.WAITING_FOR_PLAN_APPROVAL)
     request = ModelRequest(tools=[])
     with pytest.raises(PermissionError, match="not runnable"):
         WorkflowPolicyMiddleware(authority).wrap_model_call(request, lambda item: item)

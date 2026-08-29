@@ -111,6 +111,12 @@ the two authentication modes are never combined.
 The boundary is: GitHub → poller → durable `SourceEvent`/`IssueThread`;
 execution comes later.
 
+On the first routed observation of a GitHub issue, SWEForge captures its
+interaction policy once. An `AUTO` label at that moment persists
+`interaction_mode=AUTO`; otherwise the thread is `MANUAL`. Later label changes,
+process restarts, and follow-up workflow cycles cannot change that IssueThread
+policy. Databases created before this field existed migrate safely to `MANUAL`.
+
 ## One-agent declarative workflow
 
 The durable GitHub architecture has one workflow-owning root Deep Agent and an
@@ -130,11 +136,17 @@ historical `WorkflowEngine` tables and helpers remain readable for database
 migration and offline regression fixtures, but the server and workflow CLI do
 not import or invoke that state machine.
 
-Every task follows `PENDING -> PLANNING -> WAITING_FOR_APPROVAL -> EXECUTING ->
-VALIDATING -> DONE`. `NEEDS_FIXES` returns the same task to execution;
-scope-changing validation invalidates its permit and returns it to planning.
-Execution alone never satisfies a dependency. Only `DONE`, after an `ACCEPT`
-validation with evidence, does.
+In `MANUAL` mode every task follows `PENDING -> PLANNING ->
+WAITING_FOR_PLAN_APPROVAL -> EXECUTING -> VALIDATING ->
+WAITING_FOR_RESULT_APPROVAL -> DONE`. `NEEDS_FIXES` returns the same task to
+execution; scope-changing validation invalidates its permit and returns it to
+planning. Validation `ACCEPT` publishes the exact validated result but does not
+finish a manual task. Only exact result approval makes it `DONE`.
+
+`AUTO` follows the same planning, plan publication, execution, validation, and
+validated-result publication path. Application policy records an exact AUTO
+plan permit and exact AUTO result acceptance, so it skips both human waits
+without skipping either durable authority record or any work phase.
 
 The root can delegate research to one explicitly configured read-only
 investigator. That worker inherits repository, worktree, workflow, cycle,
@@ -187,23 +199,26 @@ tasks:
 
 Task declaration order is the deterministic tie-breaker. Exactly one
 `active_task_id` is persisted. A task retains ownership while waiting for
-approval or input, executing, validating, repairing, or replanning; no eligible
-peer starts. When it reaches `DONE`, ownership is released and the first
+plan approval, result approval, or input, executing, validating, repairing, or
+replanning; no eligible peer starts. When it reaches `DONE`, ownership is
+released and the first
 declaration-order pending task whose dependencies are all `DONE` is selected.
 All tasks share the IssueThread worktree and cumulative branch. One final
 commit/push/PR publication is authorized only after every task is `DONE`, no
-task is active, and every final plan/permit/validation identity still matches.
+task is active, and every final plan, permit, execution, validation, and result
+approval identity still matches.
 
 ### Plan and phase authorization
 
 The root agent must call `submit_plan`; plan-like prose is not phase
-completion. SWEForge first publishes or reconciles the versioned plan comment,
-binds its digest to the thread/cycle/workflow/task run, and then creates a
-native LangGraph approval interrupt. Publication failure leaves execution
-impossible. Only exact `@agent approve` on the correct conversation after the
-visible plan, from a user whose `admin`, `maintain`, or `write` permission can
-be proven, resumes that occurrence and creates a current-plan permit. Feedback
-replans the same task, supersedes the old plan, and requires new approval.
+completion. SWEForge first publishes or reconciles the versioned plan comment
+and binds its digest to the thread/cycle/workflow/task run. In `MANUAL`, a
+native LangGraph plan-approval interrupt then requires exact `@agent approve`
+on the correct conversation after the visible plan, from a user whose `admin`,
+`maintain`, or `write` permission can be proven. In `AUTO`, application policy
+immediately records equivalent exact-plan authorization with AUTO provenance.
+Plan feedback replans the same task, supersedes the old plan, and requires a
+new exact permit.
 
 Planning is structurally read-only. Before each model call middleware re-reads
 the authoritative task, filters the registered union of tools to the phase
@@ -217,24 +232,26 @@ it. Waiting phases run neither root nor delegated model work.
 sandbox command observations and enters `VALIDATING`, never `DONE`. Validation
 must call the application-owned `run_validation` tool, which captures the
 cumulative Git diff and durable task execution records. `finish_validation`
-cannot accept without that record. Final publication independently rechecks
-the visible approval SourceEvent, plan digest, uninvalidated permit, successful
-execution observations, and latest matching `ACCEPT` validation for every
-declared task.
+cannot accept without that record. On `ACCEPT`, SWEForge publishes one bounded,
+idempotently marked result comment tied to the exact execution and validation.
+Manual result feedback keeps the same task and cumulative worktree, preserves
+the previous plan/execution/validation context, invalidates stale authority,
+and produces a complete superseding plan version rather than resetting work.
 
-The strict GitHub server and workflow CLI do not honor the legacy `AUTO` label
-as an approval bypass. Existing AUTO waits are downgraded to interactive. A
-named compatibility switch remains only for old standalone test harnesses and
-is disabled by production entry points.
+Final publication independently rechecks the plan digest, provenance-correct
+uninvalidated permit, matching successful execution observations, latest exact
+`ACCEPT` validation, result-comment identity, and non-stale exact result
+approval for every declared task. A validated task still waiting for result
+approval cannot unlock a dependency or authorize publication.
 
 Comments must start with `@agent` to be actionable. The controller routes
-approval, plan feedback, and clarification replies only to the exact pending
-interrupt occurrence. Other follow-ups remain durable inputs for a later
+plan approval, result approval, plan/result feedback, and clarification replies
+only to the exact pending interrupt occurrence. Other follow-ups remain durable inputs for a later
 cycle; queued legacy deferred inputs are consumed by the same declarative
 controller after migration. Control comments cannot later become independent
-coding executions. Plan comments and cumulative publication use deterministic
-identities so retries do not duplicate them. Repository memory remains
-read-only to the root and delegated agents.
+coding executions. Plan comments, validated-result comments, and cumulative
+publication use deterministic identities so retries do not duplicate them.
+Repository memory remains read-only to the root and delegated agents.
 
 ## Repository-scoped long-term memory
 
@@ -316,7 +333,13 @@ event. `--repo-path` mappings are trusted local checkouts. Worktrees
 remain under `~/.sweforge/workspaces/{repo_id}/issue-{number}/`, while
 checkpoints live in their separate SQLite file. The same deterministic
 `IssueThread.thread_id` is the LangGraph `thread_id`, so follow-up events reuse
-both the worktree and checkpointed conversation. Per-thread locks allow
+both the worktree and checkpointed conversation. On first initialization,
+SWEForge holds the repository Git lock, fetches `origin main`, resolves
+`refs/remotes/origin/main`, and creates `sweforge/issue-{number}` at that exact
+commit without switching or pulling the source checkout. The persisted
+`base_commit` is then frozen: reopening the issue never rebases or resets its
+cumulative worktree, while a later issue may begin at a newer remote main.
+Fetch or worktree failure fails closed. Per-thread locks allow
 different issues to execute independently; this SQLite checkpointer is for the
 local milestone, not final production scale.
 

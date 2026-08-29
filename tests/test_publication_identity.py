@@ -162,6 +162,7 @@ class Harness:
             repo_paths={self.repo.full_name: self.source},
             workspace_root=self.tmp_path / "workspaces",
             root_input_id=root_input_id,
+            lock_root=self.tmp_path / "locks",
         )
         self.engine.publish_plan(plan.plan_id)
         self.record(approval_event)

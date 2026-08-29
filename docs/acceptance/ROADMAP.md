@@ -667,8 +667,11 @@ M7: S1 → S19 → S2 → S18 → S15 → S16 → S4 → S8 → S9 → S20 → S
 # Declarative workflow milestone
 
 The generic serial scheduler, versioned trusted workflow schema, task-run
-persistence, exact plan permits, validation/repair transitions, phase policy,
+persistence, immutable per-issue MANUAL/AUTO policy, exact plan permits,
+validation/repair transitions, exact validated-result approvals, phase policy,
 progressive skill disclosure, bounded investigator delegation, and all-tasks
-publication gate are implemented and covered offline. A future live campaign
-may exercise the A -> {B,C} -> D fixture against an external repository; this
-refactor intentionally does not create or configure that repository.
+publication gate are implemented and covered offline. MANUAL has distinct plan
+and result approval barriers; AUTO records both authorities without human
+waits. A future live campaign may exercise the A -> {B,C} -> D fixture against
+an external repository; this refactor intentionally does not create or
+configure that repository.

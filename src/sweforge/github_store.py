@@ -16,6 +16,7 @@ from pathlib import Path
 
 from .events import EventKind, emit
 from .github_models import (
+    InteractionMode,
     SourceEvent,
     SubjectKind,
     is_actionable_source_event,
@@ -35,6 +36,7 @@ CREATE TABLE IF NOT EXISTS issue_threads (
     repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
     repo_full_name TEXT NOT NULL,
     issue_number INTEGER NOT NULL,
+    interaction_mode TEXT NOT NULL DEFAULT 'MANUAL',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(repo_id, issue_number)
@@ -399,6 +401,7 @@ CREATE TABLE IF NOT EXISTS workflow_task_permits_v1 (
     plan_digest TEXT NOT NULL,
     approval_event_key TEXT NOT NULL,
     approved_by TEXT NOT NULL,
+    approval_mode TEXT NOT NULL DEFAULT 'HUMAN',
     created_at TEXT NOT NULL,
     invalidated_at TEXT
 );
@@ -430,6 +433,34 @@ CREATE TABLE IF NOT EXISTS workflow_task_validations_v1 (
     evidence_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     UNIQUE(task_run_id, validation_round)
+);
+CREATE TABLE IF NOT EXISTS workflow_task_results_v1 (
+    result_id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL REFERENCES workflow_task_runs_v1(task_run_id),
+    workflow_cycle_id TEXT NOT NULL REFERENCES workflow_cycles_v1(workflow_cycle_id),
+    plan_id TEXT NOT NULL REFERENCES workflow_task_plans_v1(plan_id),
+    execution_id TEXT NOT NULL REFERENCES workflow_task_executions_v1(execution_id),
+    validation_id TEXT NOT NULL REFERENCES workflow_task_validations_v1(validation_id),
+    result_occurrence_key TEXT NOT NULL UNIQUE,
+    posted_at TEXT NOT NULL,
+    posted_comment_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_run_id, validation_id)
+);
+CREATE TABLE IF NOT EXISTS workflow_task_result_approvals_v1 (
+    result_approval_id TEXT PRIMARY KEY,
+    result_id TEXT NOT NULL UNIQUE REFERENCES workflow_task_results_v1(result_id),
+    task_run_id TEXT NOT NULL REFERENCES workflow_task_runs_v1(task_run_id),
+    workflow_cycle_id TEXT NOT NULL REFERENCES workflow_cycles_v1(workflow_cycle_id),
+    plan_id TEXT NOT NULL REFERENCES workflow_task_plans_v1(plan_id),
+    execution_id TEXT NOT NULL REFERENCES workflow_task_executions_v1(execution_id),
+    validation_id TEXT NOT NULL REFERENCES workflow_task_validations_v1(validation_id),
+    result_occurrence_key TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    approved_by TEXT NOT NULL,
+    approval_event_key TEXT,
+    approved_at TEXT NOT NULL,
+    invalidated_at TEXT
 );
 """
 
@@ -1185,9 +1216,43 @@ class SQLiteGitHubStore:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.executescript(SCHEMA)
+        self._migrate_declarative_lifecycle()
         self._migrate_execution_baselines()
         self._migrate_post_execution_identity()
         self.connection.commit()
+
+    def _migrate_declarative_lifecycle(self) -> None:
+        """Add exact two-barrier workflow identity without rewriting old data."""
+        thread_columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(issue_threads)")
+        }
+        if "interaction_mode" not in thread_columns:
+            self.connection.execute(
+                "ALTER TABLE issue_threads ADD COLUMN interaction_mode "
+                "TEXT NOT NULL DEFAULT 'MANUAL'"
+            )
+        permit_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(workflow_task_permits_v1)"
+            )
+        }
+        if "approval_mode" not in permit_columns:
+            self.connection.execute(
+                "ALTER TABLE workflow_task_permits_v1 ADD COLUMN approval_mode "
+                "TEXT NOT NULL DEFAULT 'HUMAN'"
+            )
+        self.connection.execute(
+            """UPDATE workflow_task_runs_v1
+               SET status='WAITING_FOR_PLAN_APPROVAL'
+               WHERE status='WAITING_FOR_APPROVAL'"""
+        )
+        self.connection.execute(
+            """UPDATE workflow_task_runs_v1
+               SET phase='WAITING_FOR_PLAN_APPROVAL'
+               WHERE phase='WAITING_FOR_APPROVAL'"""
+        )
 
     def _migrate_execution_baselines(self) -> None:
         columns = {
@@ -4252,6 +4317,16 @@ class SQLiteGitHubStore:
             ).fetchone()
         if root is None:
             return None
+        thread = db.execute(
+            "SELECT * FROM issue_threads WHERE thread_id=?", (thread_id,)
+        ).fetchone()
+        if thread is None:
+            return None
+        expected_approval_mode = (
+            "AUTO"
+            if thread["interaction_mode"] == InteractionMode.AUTO.value
+            else "HUMAN"
+        )
         completed_at: str | None = None
         last_plan = last_execution = last_validation = None
         for index, (task, declared_task) in enumerate(zip(tasks, declared)):
@@ -4319,6 +4394,38 @@ class SQLiteGitHubStore:
                 "SELECT * FROM source_events WHERE event_key=?",
                 (plan["approval_event_key"],),
             ).fetchone()
+            result = (
+                db.execute(
+                    """SELECT * FROM workflow_task_results_v1
+                       WHERE task_run_id=? AND plan_id=? AND execution_id=?
+                         AND validation_id=?""",
+                    (
+                        task["task_run_id"],
+                        plan["plan_id"],
+                        execution["execution_id"] if execution else "",
+                        validation["validation_id"] if validation else "",
+                    ),
+                ).fetchone()
+                if execution is not None and validation is not None
+                else None
+            )
+            result_approval = (
+                db.execute(
+                    """SELECT * FROM workflow_task_result_approvals_v1
+                       WHERE result_id=? AND invalidated_at IS NULL""",
+                    (result["result_id"],),
+                ).fetchone()
+                if result is not None
+                else None
+            )
+            human_result_event = (
+                db.execute(
+                    "SELECT * FROM source_events WHERE event_key=?",
+                    (result_approval["approval_event_key"],),
+                ).fetchone()
+                if result_approval is not None and result_approval["mode"] == "HUMAN"
+                else None
+            )
             if execution is None or validation is None:
                 return None
             try:
@@ -4331,16 +4438,40 @@ class SQLiteGitHubStore:
                 or permit["workflow_cycle_id"] != cycle["workflow_cycle_id"]
                 or permit["approval_event_key"] != plan["approval_event_key"]
                 or permit["approved_by"] != plan["approved_by"]
-                or approval is None
-                or approval["author_login"] != plan["approved_by"]
-                or approval["source_created_at"] != plan["approved_at"]
-                or approval["source_created_at"] <= plan["posted_at"]
-                or not is_exact_agent_approval(approval["body"])
-                or approval["origin_surface"] != root["origin_surface"]
-                or approval["subject_number"] != root["subject_number"]
+                or permit["approval_mode"] != expected_approval_mode
                 or (
-                    root["origin_surface"] == "PR_INLINE_REVIEW"
+                    expected_approval_mode == "HUMAN"
+                    and (
+                        approval is None
+                        or approval["author_login"] != plan["approved_by"]
+                        or approval["source_created_at"] != plan["approved_at"]
+                        or approval["source_created_at"] <= plan["posted_at"]
+                        or not is_exact_agent_approval(approval["body"])
+                        or approval["origin_surface"] != root["origin_surface"]
+                        or approval["subject_number"] != root["subject_number"]
+                    )
+                )
+                or (
+                    expected_approval_mode == "HUMAN"
+                    and root["origin_surface"] == "PR_INLINE_REVIEW"
+                    and approval is not None
                     and approval["review_thread_root_id"]
+                    != root["review_thread_root_id"]
+                )
+                or (
+                    expected_approval_mode == "AUTO"
+                    and (
+                        permit["approved_by"] != "sweforge:auto-policy"
+                        or not permit["approval_event_key"].startswith(
+                            "auto-plan-authority:plan-approval:"
+                        )
+                    )
+                )
+                or (
+                    expected_approval_mode == "HUMAN"
+                    and human_result_event is not None
+                    and root["origin_surface"] == "PR_INLINE_REVIEW"
+                    and human_result_event["review_thread_root_id"]
                     != root["review_thread_root_id"]
                 )
                 or execution["workflow_cycle_id"] != cycle["workflow_cycle_id"]
@@ -4355,13 +4486,45 @@ class SQLiteGitHubStore:
                 or not isinstance(validation_evidence, dict)
                 or not isinstance(validation_evidence.get("validation_runs"), list)
                 or not validation_evidence["validation_runs"]
+                or result is None
+                or result["result_occurrence_key"].startswith("plan-approval:")
+                or result_approval is None
+                or result_approval["task_run_id"] != task["task_run_id"]
+                or result_approval["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or result_approval["plan_id"] != plan["plan_id"]
+                or result_approval["execution_id"] != execution["execution_id"]
+                or result_approval["validation_id"] != validation["validation_id"]
+                or result_approval["result_occurrence_key"]
+                != result["result_occurrence_key"]
+                or result_approval["mode"] != expected_approval_mode
+                or (
+                    expected_approval_mode == "HUMAN"
+                    and (
+                        human_result_event is None
+                        or human_result_event["author_login"]
+                        != result_approval["approved_by"]
+                        or human_result_event["source_created_at"]
+                        != result_approval["approved_at"]
+                        or human_result_event["source_created_at"]
+                        <= result["posted_at"]
+                        or not is_exact_agent_approval(human_result_event["body"])
+                        or human_result_event["origin_surface"]
+                        != root["origin_surface"]
+                        or human_result_event["subject_number"]
+                        != root["subject_number"]
+                    )
+                )
+                or (
+                    expected_approval_mode == "AUTO"
+                    and (
+                        result_approval["approval_event_key"] is not None
+                        or result_approval["approved_by"] != "sweforge:auto-policy"
+                    )
+                )
             ):
                 return None
             completed_at = max(completed_at or "", execution["completed_at"])
             last_plan, last_execution, last_validation = plan, execution, validation
-        thread = db.execute(
-            "SELECT * FROM issue_threads WHERE thread_id=?", (thread_id,)
-        ).fetchone()
         workspace = db.execute(
             "SELECT branch_name FROM thread_workspaces WHERE thread_id=?",
             (thread_id,),
@@ -4820,14 +4983,21 @@ class SQLiteGitHubStore:
                 (now, thread_id),
             )
         else:
+            interaction_mode = (
+                InteractionMode.AUTO
+                if any(label.casefold() == "auto" for label in event.issue_labels)
+                else InteractionMode.MANUAL
+            )
             db.execute(
                 """INSERT INTO issue_threads(thread_id, repo_id, repo_full_name,
-                   issue_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)""",
+                   issue_number, interaction_mode, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (
                     thread_id,
                     event.repo_id,
                     event.repo_full_name,
                     event.subject_number,
+                    interaction_mode.value,
                     now,
                     now,
                 ),
@@ -4874,6 +5044,12 @@ class SQLiteGitHubStore:
         return self.connection.execute(
             "SELECT * FROM issue_threads WHERE thread_id = ?", (thread_id,)
         ).fetchone()
+
+    def interaction_mode(self, thread_id: str) -> InteractionMode:
+        thread = self.issue_thread(thread_id)
+        if thread is None:
+            raise ValueError("unknown IssueThread")
+        return InteractionMode(thread["interaction_mode"])
 
     def source_events_for_thread(self, thread_id: str) -> list[sqlite3.Row]:
         return self.connection.execute(
@@ -6576,10 +6752,19 @@ class SQLiteGitHubStore:
             return True
         if task["phase"] in {"PLANNING", "EXECUTING", "VALIDATING"}:
             return True
+        if (
+            task["phase"]
+            in {
+                "WAITING_FOR_PLAN_APPROVAL",
+                "WAITING_FOR_RESULT_APPROVAL",
+            }
+            and self.interaction_mode(generic["thread_id"]) == InteractionMode.AUTO
+        ):
+            return True
         root = self.source_event(generic["root_input_id"])
         if root is None:
             return False
-        if task["phase"] == "WAITING_FOR_APPROVAL":
+        if task["phase"] == "WAITING_FOR_PLAN_APPROVAL":
             plan = self.connection.execute(
                 "SELECT posted_at FROM workflow_task_plans_v1 WHERE plan_id=?",
                 (task["current_plan_id"],),
@@ -6589,6 +6774,23 @@ class SQLiteGitHubStore:
             return any(
                 self._same_generic_target(item, root)
                 and self._after_posted_at(item, plan["posted_at"])
+                and starts_with_agent_invocation(item["body"])
+                for item in pending
+            )
+        if task["phase"] == "WAITING_FOR_RESULT_APPROVAL":
+            result = self.connection.execute(
+                """SELECT r.posted_at FROM workflow_task_results_v1 AS r
+                   JOIN workflow_task_validations_v1 AS v
+                     ON v.validation_id=r.validation_id
+                   WHERE r.task_run_id=?
+                   ORDER BY v.validation_round DESC,r.result_id DESC LIMIT 1""",
+                (task["task_run_id"],),
+            ).fetchone()
+            if result is None:
+                return False
+            return any(
+                self._same_generic_target(item, root)
+                and self._after_posted_at(item, result["posted_at"])
                 and starts_with_agent_invocation(item["body"])
                 for item in pending
             )

@@ -154,10 +154,12 @@ class GitHubPoller:
     ) -> Iterable[SourceEvent]:
         for item in items:
             body = item.get("body")
+            issue_labels: tuple[str, ...] = ()
             if stream == "issues":
                 if item.get("pull_request"):
                     continue
                 self._snapshot_issue(repo, item, item["number"], observed)
+                issue_labels = self._labels(item)
             actionable = is_actionable_source_event(
                 SourceKind.ISSUE if stream == "issues" else SourceKind.ISSUE_COMMENT,
                 body,
@@ -181,6 +183,7 @@ class GitHubPoller:
                     item["number"],
                     body,
                     origin_surface=OriginSurface.ISSUE,
+                    issue_labels=issue_labels,
                 )
             elif stream == "issue_comments":
                 number = self._number_from_url(item.get("issue_url"))
@@ -190,6 +193,8 @@ class GitHubPoller:
                     payload = self.client.issue(repo, number)
                     classifications[number] = classify_subject(payload)
                     self._snapshot_issue(repo, payload, number, observed)
+                    if classifications[number] == SubjectKind.ISSUE:
+                        issue_labels = self._labels(payload)
                 subject = classifications[number]
                 yield self._event(
                     repo,
@@ -203,6 +208,7 @@ class GitHubPoller:
                         if subject == SubjectKind.PULL_REQUEST
                         else OriginSurface.ISSUE
                     ),
+                    issue_labels=issue_labels,
                 )
             else:
                 number = self._number_from_url(item.get("pull_request_url"))
@@ -233,6 +239,7 @@ class GitHubPoller:
         body: str,
         *,
         origin_surface: OriginSurface,
+        issue_labels: tuple[str, ...] = (),
     ) -> SourceEvent:
         in_reply_to_id = item.get("in_reply_to_id")
         return SourceEvent(
@@ -267,7 +274,18 @@ class GitHubPoller:
             review_thread_root_id=(
                 str(in_reply_to_id) if in_reply_to_id is not None else str(item["id"])
             ),
+            issue_labels=issue_labels,
         )
+
+    @staticmethod
+    def _labels(payload: dict) -> tuple[str, ...]:
+        labels = payload.get("labels") or ()
+        values = []
+        for label in labels:
+            value = label.get("name") if isinstance(label, dict) else label
+            if value is not None:
+                values.append(str(value))
+        return tuple(values)
 
     @staticmethod
     def _timestamp(value: datetime) -> str:

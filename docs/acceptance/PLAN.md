@@ -329,10 +329,13 @@ Then, and only then, the PRIMARY acceptance set runs.
 
 The acceptance target now treats an IssueThread cycle as a trusted declarative
 DAG of generic task runs. The application persists exactly one active task and
-owns every transition through planning, exact human approval, execution,
-validation, repair/replan, completion, and one cumulative publication. The root
-Deep Agent is the sole workflow owner. Its investigator subagent is a bounded
-read-only worker and cannot receive lifecycle gateways or broader phase
-authority. Deterministic coverage lives in `test_workflow_spec.py`,
+owns every transition through planning, exact plan authorization, execution,
+validation, exact result acceptance, repair/replan, completion, and one
+cumulative publication. MANUAL obtains the two authorities from exact human
+approvals; the IssueThread's immutable AUTO policy records both through trusted
+application logic. The root Deep Agent is the sole workflow owner. Its
+investigator subagent is a bounded read-only worker and cannot receive
+lifecycle gateways or broader phase authority. Deterministic coverage lives in
+`test_workflow_spec.py`,
 `test_workflow_runtime.py`, `test_workflow_middleware.py`, and
 `test_workflow_agent_runtime.py`.

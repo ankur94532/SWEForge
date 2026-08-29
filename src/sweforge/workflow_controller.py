@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from .execution import normalize_task
 from .execution_locks import ThreadLockUnavailable, thread_lock
 from .github_models import (
+    InteractionMode,
     is_actionable_source_event,
     is_exact_agent_approval,
     parse_timestamp,
@@ -125,11 +126,33 @@ class DeclarativeWorkflowController:
         driver = self.driver_factory(
             self.runtime, cycle.workflow_cycle_id, workspace.path, cycle_spec
         )
-        if task.phase == TaskPhase.WAITING_FOR_APPROVAL:
+        mode = self.store.interaction_mode(cycle.thread_id)
+        if task.phase == TaskPhase.WAITING_FOR_PLAN_APPROVAL:
+            if mode == InteractionMode.AUTO:
+                self.runtime.auto_authorize_plan(task.task_run_id)
+                return self._result(
+                    cycle, self.runtime.task(task.task_run_id), "ACTIVE"
+                )
             resume = self._plan_wait_resume(cycle, task, driver)
             if resume is None:
                 driver.reconcile_interrupts(cycle=cycle, task=task)
-                return self._result(cycle, task, "WAITING_FOR_APPROVAL")
+                return self._result(cycle, task, "WAITING_FOR_PLAN_APPROVAL")
+            driver.drive(cycle=cycle, task=task, prompt="", resume=resume)
+        elif task.phase == TaskPhase.WAITING_FOR_RESULT_APPROVAL:
+            if mode == InteractionMode.AUTO:
+                self.runtime.auto_accept_result(task.task_run_id)
+                fresh = self.runtime.select_active_task(cycle.workflow_cycle_id)
+                return ControllerResult(
+                    cycle.thread_id,
+                    self.runtime.cycle(cycle.workflow_cycle_id).status.value,
+                    cycle.workflow_cycle_id,
+                    fresh.task_id if fresh else None,
+                    fresh.phase if fresh else None,
+                )
+            resume = self._result_wait_resume(cycle, task, driver)
+            if resume is None:
+                driver.reconcile_interrupts(cycle=cycle, task=task)
+                return self._result(cycle, task, "WAITING_FOR_RESULT_APPROVAL")
             driver.drive(cycle=cycle, task=task, prompt="", resume=resume)
         elif task.phase == TaskPhase.WAITING_FOR_INPUT:
             resume = self._clarification_resume(cycle, task, driver)
@@ -236,6 +259,7 @@ class DeclarativeWorkflowController:
             expected_branch=existing.branch_name if existing else None,
             expected_base=existing.base_commit if existing else None,
             lock_root=self.lock_root,
+            fetch_remote_main=existing is None,
         )
         if existing is None:
             now = self.clock()
@@ -337,6 +361,57 @@ class DeclarativeWorkflowController:
                 }
         return None
 
+    def _result_wait_resume(
+        self,
+        cycle: WorkflowCycle,
+        task: TaskRun,
+        driver: WorkflowAgentDriver,
+    ) -> dict[str, Any] | None:
+        result = self.runtime.current_result(task.task_run_id)
+        if result is None:
+            raise RuntimeError("waiting task has no current validated result")
+        root = self._root_event(cycle)
+        for event in self.store.unconsumed_inputs(cycle.thread_id):
+            if not self._same_target(event, root) or not self._after(
+                event["source_created_at"], result.posted_at
+            ):
+                continue
+            if not self._has_pending_interrupt(
+                driver,
+                cycle,
+                task,
+                "RESULT_APPROVAL",
+                result.result_occurrence_key,
+            ):
+                driver.reconcile_interrupts(cycle=cycle, task=task)
+                return None
+            if is_exact_agent_approval(event["body"]):
+                authorized = self._authorized_approver(
+                    root["repo_full_name"], event["author_login"]
+                )
+                self._consume(
+                    event, cycle, "RESULT_APPROVAL" if authorized else "STALE"
+                )
+                if not authorized:
+                    continue
+                return {
+                    "kind": "RESULT_APPROVAL",
+                    "occurrence_key": result.result_occurrence_key,
+                    "event_key": event["event_key"],
+                    "approved_by": event["author_login"],
+                    "approved_at": event["source_created_at"],
+                    "authorized": True,
+                }
+            if starts_with_agent_invocation(event["body"]):
+                self._consume(event, cycle, "RESULT_FEEDBACK")
+                return {
+                    "kind": "RESULT_FEEDBACK",
+                    "occurrence_key": result.result_occurrence_key,
+                    "event_key": event["event_key"],
+                    "feedback": normalize_task(event["body"]),
+                }
+        return None
+
     @staticmethod
     def _has_pending_interrupt(
         driver: WorkflowAgentDriver,
@@ -366,14 +441,25 @@ class DeclarativeWorkflowController:
             for item in self.runtime.task_runs(cycle.workflow_cycle_id)
             if item.status == TaskPhase.DONE
         ]
-        feedback = "\n".join(item.get("summary", "") for item in task.repair_feedback)
+        feedback = "\n".join(
+            str(
+                item.get("feedback")
+                or item.get("summary")
+                or item.get("instructions")
+                or ""
+            )
+            for item in task.repair_feedback
+        )
+        cumulative_history = str(list(task.repair_feedback))[:10_000]
         root_request = normalize_task(self._root_body(cycle, root))
         return (
             f"Workflow task: {task.task_id}\n"
             f"Phase: {task.phase.value}\n"
             f"Completed dependencies/tasks: {completed}\n"
             f"Root request (untrusted): {root_request}\n"
-            f"Validation/repair feedback: {feedback or '(none)'}"
+            f"Validation/repair feedback: {feedback or '(none)'}\n"
+            "Durable cumulative task history (preserve prior intended and "
+            f"implemented behavior when replanning): {cumulative_history}"
         )
 
     def _authorized_approver(self, repo_name: str, login: str | None) -> bool:

@@ -113,6 +113,10 @@ def test_server_driver_failure_records_backoff_without_hot_loop(tmp_path):
         cwd=source,
         check=True,
     )
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
+    subprocess.run(["git", "remote", "add", "origin", remote], cwd=source, check=True)
+    subprocess.run(["git", "push", "-qu", "origin", "main"], cwd=source, check=True)
 
     class FailingDriver:
         def drive(self, **_kwargs):
@@ -429,6 +433,10 @@ def test_hard_execution_failure_is_terminal_for_server_drain(tmp_path):
         cwd=source,
         check=True,
     )
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", remote], check=True)
+    subprocess.run(["git", "remote", "add", "origin", remote], cwd=source, check=True)
+    subprocess.run(["git", "push", "-qu", "origin", "main"], cwd=source, check=True)
     store = SQLiteGitHubStore(tmp_path / "state.db")
     repo = RepositoryRef(1, "owner/repo")
     root = replace(

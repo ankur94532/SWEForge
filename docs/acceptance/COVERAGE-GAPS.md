@@ -10,7 +10,7 @@ Two of these — S27 and S28 — are the ones I would not ship without.
 | # | Scenario | Why it matters | Uncovered path |
 | --- | --- | --- | --- |
 | **S27** | AUTO mode full lifecycle | `PermitSource.AUTO` is a second authorization path where no human approves. S1–S26 never exercise it. | `authorize_auto`, `WorkflowMode.AUTO` |
-| **S28** | AUTO label removed before permit creation | README specifies fallback to interactive approval. This is a race on the authorization boundary. | `workflow.py:685`, label re-check |
+| **S28** | Immutable AUTO capture | Superseded legacy behavior re-read the label at permit creation. Production now captures AUTO once on IssueThread creation; later label removal or addition is ignored. | `issue_threads.interaction_mode`, declarative runtime |
 | **S29** | No sandbox provider configured | Strict execution must refuse to run. Security-critical fail-closed. | `SecureExecutionUnavailable` |
 | **S30** | Unapproved MCP tool invoked | Interceptor must reject. Distinct from S9 — that proves identity, this proves the allowlist. | `repo_scope_interceptor` |
 
