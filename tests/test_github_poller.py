@@ -43,6 +43,28 @@ def comment_item(
     }
 
 
+def submitted_review_item(
+    review_id=70,
+    number=12,
+    submitted="2026-01-01T00:02:00Z",
+    body="@agent preserve compatibility",
+    state="CHANGES_REQUESTED",
+):
+    return {
+        "id": review_id,
+        "updated_at": submitted,
+        "submitted_at": submitted,
+        "body": body,
+        "state": state,
+        "commit_id": "review-anchor-sha",
+        "pull_request_url": (
+            f"https://api.github.com/repos/example/repo/pulls/{number}"
+        ),
+        "html_url": f"https://github.com/example/repo/pull/{number}#review-{review_id}",
+        "user": {"login": "reviewer"},
+    }
+
+
 def poller(fake, store):
     return GitHubPoller(
         fake,
@@ -281,6 +303,71 @@ def test_inline_review_context_is_persisted(tmp_path):
     assert event["commit_id"] == "newsha"
     assert event["original_commit_id"] == "oldsha"
     assert event["review_thread_root_id"] == "40"
+    store.close()
+
+
+def test_submitted_reviews_are_distinct_actionable_idempotent_inputs(tmp_path):
+    repo = RepositoryRef(123, "example/repo")
+    fake = FakeGitHub(
+        {repo.full_name: repo},
+        {
+            (123, "issues"): PollResponse((issue_item(),)),
+            (123, "pull_request_reviews"): PollResponse(
+                (
+                    submitted_review_item(review_id=70),
+                    submitted_review_item(review_id=71, body="  @AGENT case works"),
+                    submitted_review_item(review_id=72, body="looks good @agent"),
+                    submitted_review_item(review_id=73, body="", state="APPROVED"),
+                    submitted_review_item(
+                        review_id=74,
+                        body="No command",
+                        state="CHANGES_REQUESTED",
+                    ),
+                )
+            ),
+        },
+    )
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    initial = poller(fake, store).poll([repo.full_name])
+    store.register_pr_mapping(123, 12, "github:123:issue:7")
+
+    first = poller(fake, store).poll([repo.full_name])
+    second = poller(fake, store).poll([repo.full_name])
+    reviews = [
+        row for row in store.events() if row["source_kind"] == "pull_request_review"
+    ]
+
+    assert initial.events_persisted == 3  # issue plus two actionable reviews
+    assert initial.pr_events_unrouted == 2
+    assert first.events_persisted == 0  # replay after mapping is idempotent
+    assert second.events_persisted == 0
+    assert {row["source_id"] for row in reviews} == {"70", "71"}
+    assert all(row["thread_id"] == "github:123:issue:7" for row in reviews)
+    event = next(row for row in reviews if row["source_id"] == "70")
+    assert event["origin_surface"] == "PR_REVIEW"
+    assert event["review_state"] == "CHANGES_REQUESTED"
+    assert event["pull_request_review_id"] == "70"
+    assert event["source_created_at"] == "2026-01-01T00:02:00Z"
+    assert event["commit_id"] == "review-anchor-sha"
+    assert event["html_url"].endswith("#review-70")
+    assert event["review_thread_root_id"] is None
+    assert store.cursor(123, "pull_request_reviews")["last_successful_poll_at"]
+    store.close()
+
+
+def test_unmapped_submitted_review_never_invents_issue_thread(tmp_path):
+    repo = RepositoryRef(123, "example/repo")
+    fake = FakeGitHub(
+        {repo.full_name: repo},
+        {(123, "pull_request_reviews"): PollResponse((submitted_review_item(),))},
+    )
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    result = poller(fake, store).poll([repo.full_name])
+
+    assert result.events_persisted == 1
+    assert result.pr_events_unrouted == 1
+    assert store.events()[0]["thread_id"] is None
+    assert store.threads() == []
     store.close()
 
 

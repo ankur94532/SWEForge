@@ -31,6 +31,10 @@ class GitHubClient(Protocol):
         self, repo: RepositoryRef, since: str, etag: str | None
     ) -> PollResponse: ...
 
+    def pull_request_reviews(
+        self, repo: RepositoryRef, since: str, etag: str | None
+    ) -> PollResponse: ...
+
     def issue(self, repo: RepositoryRef, number: int) -> dict: ...
 
     def collaborator_permission(self, repo: RepositoryRef, login: str) -> str: ...
@@ -123,6 +127,54 @@ class HttpxGitHubClient:
         self, repo: RepositoryRef, since: str, etag: str | None
     ) -> PollResponse:
         return self._poll(repo, "pulls/comments", since, etag)
+
+    def pull_request_reviews(
+        self, repo: RepositoryRef, since: str, etag: str | None
+    ) -> PollResponse:
+        """Discover submitted review resources through recently updated PRs.
+
+        GitHub has no repository-wide submitted-review endpoint. The aggregate
+        stream therefore enumerates updated pull requests and paginates each
+        pull request's reviews. Event keys provide replay idempotency; an ETag
+        cannot safely describe this multi-request result.
+        """
+        pulls_response = self._request(
+            "GET",
+            f"/repos/{repo.full_name}/pulls",
+            params={
+                "state": "all",
+                "sort": "updated",
+                "direction": "asc",
+                "per_page": "100",
+            },
+            token_scope=repo.full_name,
+        )
+        reviews: list[dict] = []
+        for pull in self._pages(pulls_response, repo.full_name):
+            updated = pull.get("updated_at")
+            if updated and updated < since:
+                continue
+            number = int(pull["number"])
+            response = self._request(
+                "GET",
+                f"/repos/{repo.full_name}/pulls/{number}/reviews",
+                params={"per_page": "100"},
+                token_scope=repo.full_name,
+            )
+            for review in self._pages(response, repo.full_name):
+                item = dict(review)
+                submitted = item.get("submitted_at")
+                if submitted is None:
+                    continue
+                item["updated_at"] = item.get("updated_at") or submitted
+                item["submitted_at"] = submitted
+                item["pull_request_url"] = (
+                    item.get("pull_request_url")
+                    or pull.get("url")
+                    or (f"/repos/{repo.full_name}/pulls/{number}")
+                )
+                reviews.append(item)
+        return PollResponse(items=tuple(reviews))
 
     def pull_requests(self, repo: RepositoryRef, *, head: str, base: str) -> list[dict]:
         response = self._request(

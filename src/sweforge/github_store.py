@@ -208,7 +208,8 @@ CREATE TABLE IF NOT EXISTS source_events (
     original_commit_id TEXT,
     in_reply_to_id TEXT,
     pull_request_review_id TEXT,
-    review_thread_root_id TEXT
+    review_thread_root_id TEXT,
+    review_state TEXT
 );
 CREATE TABLE IF NOT EXISTS poll_cursors (
     repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
@@ -1037,6 +1038,7 @@ class ClaimedEvent:
     in_reply_to_id: str | None = None
     pull_request_review_id: str | None = None
     review_thread_root_id: str | None = None
+    review_state: str | None = None
     execution_id: str | None = None
 
 
@@ -1905,6 +1907,7 @@ class SQLiteGitHubStore:
             "review_thread_root_id": (
                 "ALTER TABLE source_events ADD COLUMN review_thread_root_id TEXT"
             ),
+            "review_state": "ALTER TABLE source_events ADD COLUMN review_state TEXT",
         }
         for column, statement in source_migrations.items():
             if column not in source_columns:
@@ -2474,12 +2477,12 @@ class SQLiteGitHubStore:
                        body, html_url, thread_id, discovered_at, origin_surface,
                        path, line, start_line, side, start_side, diff_hunk,
                        commit_id, original_commit_id, in_reply_to_id,
-                       pull_request_review_id, review_thread_root_id)
+                       pull_request_review_id, review_thread_root_id, review_state)
                        VALUES (?, ?, ?, ?, ?,
                                ?, ?, ?, ?, ?, ?,
                                ?, ?, ?, ?, ?,
                                ?, ?, ?, ?, ?,
-                               ?, ?, ?, ?, ?)""",
+                               ?, ?, ?, ?, ?, ?)""",
                     (
                         event.event_key,
                         event.repo_id,
@@ -2507,6 +2510,7 @@ class SQLiteGitHubStore:
                         event.in_reply_to_id,
                         event.pull_request_review_id,
                         event.review_thread_root_id,
+                        event.review_state,
                     ),
                 )
                 if thread_id is not None:
@@ -2972,6 +2976,7 @@ class SQLiteGitHubStore:
                           se.side, se.start_side, se.diff_hunk, se.commit_id,
                           se.original_commit_id, se.in_reply_to_id,
                           se.pull_request_review_id, se.review_thread_root_id,
+                          se.review_state,
                           ee.status AS execution_status
                    FROM source_events AS se
                    JOIN issue_threads AS thread
@@ -3069,6 +3074,7 @@ class SQLiteGitHubStore:
                 in_reply_to_id=row["in_reply_to_id"],
                 pull_request_review_id=row["pull_request_review_id"],
                 review_thread_root_id=row["review_thread_root_id"],
+                review_state=row["review_state"],
             )
 
     def release_execution_claim(self, event_key: str, *, retrying: bool) -> None:
@@ -7962,6 +7968,7 @@ class SQLiteGitHubStore:
             in_reply_to_id=row["in_reply_to_id"],
             pull_request_review_id=row["pull_request_review_id"],
             review_thread_root_id=row["review_thread_root_id"],
+            review_state=row["review_state"],
             execution_id=execution_id,
         )
 

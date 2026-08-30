@@ -111,6 +111,9 @@ class FakeGitHub:
     def review_comments(self, repo: RepositoryRef, since, etag) -> PollResponse:
         return self._poll("review_comments", repo, since, etag)
 
+    def pull_request_reviews(self, repo: RepositoryRef, since, etag) -> PollResponse:
+        return self._poll("pull_request_reviews", repo, since, etag)
+
     # -- comments -----------------------------------------------------------
 
     def comments(self, repo: RepositoryRef, number: int) -> list[dict]:

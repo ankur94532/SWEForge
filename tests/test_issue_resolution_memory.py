@@ -406,6 +406,9 @@ def test_issue_title_and_body_are_snapshotted_during_ingestion(tmp_path):
         def review_comments(self, repo, since, etag):
             return PollResponse(items=[])
 
+        def pull_request_reviews(self, repo, since, etag):
+            return PollResponse(items=[])
+
         def issue(self, repo, number):
             self.issue_calls += 1
             return {

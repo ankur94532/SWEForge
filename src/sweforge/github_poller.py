@@ -19,7 +19,7 @@ from .github_models import (
 )
 from .github_store import RecordBatchResult, SQLiteGitHubStore
 
-STREAMS = ("issues", "issue_comments", "review_comments")
+STREAMS = ("issues", "issue_comments", "review_comments", "pull_request_reviews")
 _NUMBER_RE = re.compile(r"/(?:issues|pulls)/(\d+)(?:$|/)")
 
 
@@ -161,7 +161,13 @@ class GitHubPoller:
                 self._snapshot_issue(repo, item, item["number"], observed)
                 issue_labels = self._labels(item)
             actionable = is_actionable_source_event(
-                SourceKind.ISSUE if stream == "issues" else SourceKind.ISSUE_COMMENT,
+                (
+                    SourceKind.ISSUE
+                    if stream == "issues"
+                    else SourceKind.PULL_REQUEST_REVIEW
+                    if stream == "pull_request_reviews"
+                    else SourceKind.ISSUE_COMMENT
+                ),
                 body,
             )
             if not actionable:
@@ -210,7 +216,7 @@ class GitHubPoller:
                     ),
                     issue_labels=issue_labels,
                 )
-            else:
+            elif stream == "review_comments":
                 number = self._number_from_url(item.get("pull_request_url"))
                 yield self._event(
                     repo,
@@ -220,6 +226,17 @@ class GitHubPoller:
                     number,
                     body,
                     origin_surface=OriginSurface.PR_INLINE_REVIEW,
+                )
+            else:
+                number = self._number_from_url(item.get("pull_request_url"))
+                yield self._event(
+                    repo,
+                    SourceKind.PULL_REQUEST_REVIEW,
+                    item,
+                    SubjectKind.PULL_REQUEST,
+                    number,
+                    body,
+                    origin_surface=OriginSurface.PR_REVIEW,
                 )
 
     @staticmethod
@@ -248,7 +265,7 @@ class GitHubPoller:
             source_kind=source_kind,
             source_id=str(item["id"]),
             source_updated_at=item["updated_at"],
-            source_created_at=item.get("created_at"),
+            source_created_at=item.get("created_at") or item.get("submitted_at"),
             subject_kind=subject_kind,
             subject_number=subject_number,
             author_login=(item.get("user") or {}).get("login"),
@@ -267,12 +284,19 @@ class GitHubPoller:
                 str(in_reply_to_id) if in_reply_to_id is not None else None
             ),
             pull_request_review_id=(
-                str(item["pull_request_review_id"])
+                str(item["id"])
+                if source_kind == SourceKind.PULL_REQUEST_REVIEW
+                else str(item["pull_request_review_id"])
                 if item.get("pull_request_review_id") is not None
                 else None
             ),
             review_thread_root_id=(
-                str(in_reply_to_id) if in_reply_to_id is not None else str(item["id"])
+                (str(in_reply_to_id) if in_reply_to_id is not None else str(item["id"]))
+                if source_kind == SourceKind.REVIEW_COMMENT
+                else None
+            ),
+            review_state=(
+                str(item["state"]) if item.get("state") is not None else None
             ),
             issue_labels=issue_labels,
         )

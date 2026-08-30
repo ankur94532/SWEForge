@@ -92,6 +92,23 @@ def test_inline_source_context_contains_bounded_review_provenance():
     assert "outdated" in context
 
 
+def test_submitted_review_source_context_separates_state_from_user_request():
+    context = format_source_context(
+        {
+            "origin_surface": "PR_REVIEW",
+            "author_login": "alice",
+            "subject_number": 42,
+            "review_state": "CHANGES_REQUESTED",
+            "commit_id": "reviewsha",
+        },
+        "@agent preserve compatibility",
+    )
+    assert "GitHub PR #42 submitted review by alice" in context
+    assert "Review state: CHANGES_REQUESTED" in context
+    assert "Review anchor commit: reviewsha" in context
+    assert context.endswith("@agent preserve compatibility")
+
+
 def test_normal_external_task_remains_bounded():
     context = format_source_context(
         {"origin_surface": "ISSUE", "author_login": "alice", "subject_number": 7},

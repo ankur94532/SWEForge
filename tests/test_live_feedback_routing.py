@@ -81,6 +81,8 @@ def source(
             else (
                 SourceKind.REVIEW_COMMENT
                 if surface == OriginSurface.PR_INLINE_REVIEW
+                else SourceKind.PULL_REQUEST_REVIEW
+                if surface == OriginSurface.PR_REVIEW
                 else SourceKind.ISSUE_COMMENT
             )
         ),
@@ -308,6 +310,7 @@ def test_ack_reconciliation_survives_repoll_restart_and_post_before_commit(tmp_p
     [
         (OriginSurface.PR_CONVERSATION, 9, None, "conversation"),
         (OriginSurface.PR_INLINE_REVIEW, 9, "700", "inline"),
+        (OriginSurface.PR_REVIEW, 9, None, "conversation"),
     ],
 )
 def test_wrong_surface_input_is_acknowledged_on_its_own_pr_surface(

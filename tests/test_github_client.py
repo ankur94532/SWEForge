@@ -1,6 +1,7 @@
 import httpx
 
 from sweforge.github_client import HttpxGitHubClient
+from sweforge.github_models import RepositoryRef
 
 
 def test_http_client_headers_pagination_and_304():
@@ -78,5 +79,75 @@ def test_writeback_endpoints_use_repository_write_scope():
     assert client.create_comment(repo, 7, "body")["id"] == 8
     assert all(
         request.headers["authorization"] == "Bearer token-value" for request in requests
+    )
+    client.close()
+
+
+def test_submitted_review_discovery_paginates_recent_pull_reviews():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if request.url.path.endswith("/pulls"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "number": 12,
+                        "updated_at": "2026-01-01T00:05:00Z",
+                        "url": "https://api.example/repos/example/repo/pulls/12",
+                    },
+                    {
+                        "number": 11,
+                        "updated_at": "2025-12-31T23:00:00Z",
+                        "url": "https://api.example/repos/example/repo/pulls/11",
+                    },
+                ],
+            )
+        if request.url.params.get("page") == "2":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 72,
+                        "body": "@agent second page",
+                        "submitted_at": "2026-01-01T00:04:00Z",
+                    }
+                ],
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 71,
+                    "body": "@agent first page",
+                    "submitted_at": "2026-01-01T00:03:00Z",
+                },
+                {"id": 73, "body": "@agent pending draft", "submitted_at": None},
+            ],
+            headers={
+                "link": (
+                    "<https://api.example/repos/example/repo/pulls/12/reviews?page=2>; "
+                    'rel="next"'
+                )
+            },
+        )
+
+    client = HttpxGitHubClient(
+        "token-value",
+        api_url="https://api.example",
+        transport=httpx.MockTransport(handler),
+    )
+    reviews = client.pull_request_reviews(
+        RepositoryRef(123, "example/repo"),
+        "2026-01-01T00:00:00Z",
+        None,
+    )
+
+    assert [item["id"] for item in reviews.items] == [71, 72]
+    assert all(item["updated_at"] == item["submitted_at"] for item in reviews.items)
+    assert all(item["pull_request_url"].endswith("/pulls/12") for item in reviews.items)
+    assert not any(
+        request.url.path.endswith("/pulls/11/reviews") for request in requests
     )
     client.close()

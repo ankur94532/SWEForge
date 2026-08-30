@@ -10,6 +10,7 @@ class SourceKind(StrEnum):
     ISSUE = "issue"
     ISSUE_COMMENT = "issue_comment"
     REVIEW_COMMENT = "review_comment"
+    PULL_REQUEST_REVIEW = "pull_request_review"
 
 
 class SubjectKind(StrEnum):
@@ -21,6 +22,7 @@ class OriginSurface(StrEnum):
     ISSUE = "ISSUE"
     PR_CONVERSATION = "PR_CONVERSATION"
     PR_INLINE_REVIEW = "PR_INLINE_REVIEW"
+    PR_REVIEW = "PR_REVIEW"
 
 
 class InteractionMode(StrEnum):
@@ -71,6 +73,7 @@ class SourceEvent:
     in_reply_to_id: str | None = None
     pull_request_review_id: str | None = None
     review_thread_root_id: str | None = None
+    review_state: str | None = None
     issue_labels: tuple[str, ...] = ()
 
     @property
@@ -170,6 +173,16 @@ def format_source_context(
                 "line number is authoritative.",
             )
         return "\n".join(lines)
+    if surface == OriginSurface.PR_REVIEW.value:
+        return "\n".join(
+            [
+                f"[GitHub PR #{number} submitted review by {author}]",
+                f"Review state: {get('review_state') or '(unknown)'}",
+                f"Review anchor commit: {get('commit_id') or '(unknown)'}",
+                "User request:",
+                task[:4_000],
+            ]
+        )
     label = "ISSUE" if surface == OriginSurface.ISSUE.value else "PR"
     kind = "issue" if label == "ISSUE" else "PR conversation"
     return f"[GitHub {kind} #{number} comment by {author}]\n{task[:4_000]}"
