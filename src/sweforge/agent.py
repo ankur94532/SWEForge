@@ -30,7 +30,7 @@ from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.store.base import BaseStore
 from langgraph.types import Command, interrupt
 
-from .agent_trace import observable_message_text
+from .agent_trace import AgentTracer, observable_message_text
 from .capabilities import RepoCapabilityRegistry, load_repo_mcp_tools
 from .context import RepoAgentContext
 from .execution_evidence import RecordingSandboxBackend
@@ -117,14 +117,15 @@ def build_durable_workflow_agent(
     memory: list[str] | None = None,
     permissions: list[FilesystemPermission] | None = None,
     middleware: list[AgentMiddleware] | None = None,
+    tracer: AgentTracer | None = None,
 ):
     """Build the one durable root agent with a bounded investigator below it."""
     extra_tools = capability_tools or []
     research = [
         tool for tool in extra_tools if getattr(tool, "name", "") in RESEARCH_TOOLS
     ]
-    delegated_policy = DelegatedWorkflowPolicyMiddleware(authority)
-    delegated_skills = WorkflowSkillsMiddleware(authority, read_skill)
+    delegated_policy = DelegatedWorkflowPolicyMiddleware(authority, tracer=tracer)
+    delegated_skills = WorkflowSkillsMiddleware(authority, read_skill, tracer=tracer)
     subagents = [
         {
             # This explicit bounded override prevents Deep Agents from adding
@@ -149,6 +150,7 @@ def build_durable_workflow_agent(
             TaskPhase.EXECUTING: execution_model,
             TaskPhase.VALIDATING: validation_model,
         },
+        tracer=tracer,
     )
     return build_workflow_agent(
         model=planning_model,
@@ -160,8 +162,9 @@ def build_durable_workflow_agent(
             "when complete. Never infer or perform a workflow transition yourself."
         ),
         memory=memory,
-        # Dynamic skill middleware discloses one phase skill. Passing the broad
-        # /skills source here would advertise inactive operational authority.
+        # Dynamic skill middleware eagerly discloses one exact phase skill or a
+        # bounded catalog. Passing the broad /skills source here would advertise
+        # inactive operational authority.
         skills=None,
         permissions=permissions,
         store=store,
@@ -169,7 +172,7 @@ def build_durable_workflow_agent(
         checkpointer=checkpointer,
         middleware=[
             policy,
-            WorkflowSkillsMiddleware(authority, read_skill),
+            WorkflowSkillsMiddleware(authority, read_skill, tracer=tracer),
             *(middleware or []),
         ],
         subagents=subagents,

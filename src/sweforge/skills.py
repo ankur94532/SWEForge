@@ -1,14 +1,154 @@
 """Trusted repository-scoped Deep Agents skill management."""
 
+from __future__ import annotations
+
+import re
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+import yaml
 from langgraph.store.base import BaseStore
 
 from .repo_memory import repo_skills_namespace
 
 SKILLS_VIRTUAL_PATH = "/skills/"
 MAX_SKILL_FILE_BYTES = 200_000
+MAX_SKILL_DESCRIPTION_CHARS = 300
 SKILL_LIST_PAGE_SIZE = 100
+_SKILL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
+
+DEFAULT_WORKFLOW_SKILLS = {
+    "implementation-planning": """---
+name: implementation-planning
+description: >-
+  Plan repository changes within the approved scope using concrete codebase
+  evidence.
+---
+
+# Implementation planning
+
+Inspect the repository carefully, keep the plan within the approved scope, and
+identify concrete validation for the intended changes. Use only the tools
+authorized for the current planning phase.
+""",
+    "implementation-execution": """---
+name: implementation-execution
+description: >-
+  Implement the approved repository change and record concrete execution
+  evidence.
+---
+
+# Implementation execution
+
+Follow the approved plan, preserve unrelated work, and implement the scoped
+repository changes. Use only the tools authorized for the current execution
+phase and record concrete execution evidence.
+""",
+    "implementation-validation": """---
+name: implementation-validation
+description: >-
+  Validate the implementation against the approved plan and report concrete
+  evidence.
+---
+
+# Implementation validation
+
+Inspect the resulting changes, validate them against the approved plan, and
+report concrete evidence. Use only the tools authorized for the current
+validation phase.
+""",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class SkillMetadata:
+    """Bounded operator-owned metadata for one authorized workflow skill."""
+
+    name: str
+    description: str
+    path: str
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects duplicate frontmatter keys."""
+
+
+def _construct_unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            hash(key)
+        except TypeError as exc:
+            raise yaml.constructor.ConstructorError(
+                "while constructing skill metadata",
+                node.start_mark,
+                "metadata keys must be scalar values",
+                key_node.start_mark,
+            ) from exc
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing skill metadata",
+                node.start_mark,
+                f"duplicate metadata key: {key}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping
+)
+
+
+def canonical_skill_path(name: str) -> str:
+    """Return the only advertised read path for a trusted skill identity."""
+    if not isinstance(name, str) or not _SKILL_NAME.fullmatch(name):
+        raise ValueError("skill name is malformed")
+    return f"/skills/{name}/SKILL.md"
+
+
+def parse_skill_metadata(name: str, content: str) -> SkillMetadata:
+    """Parse bounded Agent Skills-compatible frontmatter, or a safe fallback.
+
+    Existing operator skills without frontmatter remain usable through a
+    deterministic description. Once a file starts a frontmatter block, that
+    metadata is authoritative and any malformed value fails closed.
+    """
+    path = canonical_skill_path(name)
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError(f"required workflow skill is missing: {name}")
+    if not content.startswith("---"):
+        return SkillMetadata(
+            name=name,
+            description=f"Trusted skill {name}; load for full instructions.",
+            path=path,
+        )
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError(f"skill metadata is malformed: {name}")
+    try:
+        end = next(index for index, line in enumerate(lines[1:], 1) if line == "---")
+    except StopIteration as exc:
+        raise ValueError(f"skill metadata is malformed: {name}") from exc
+    try:
+        metadata = yaml.load("\n".join(lines[1:end]), Loader=_UniqueKeyLoader)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"skill metadata is malformed: {name}") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError(f"skill metadata must be a mapping: {name}")
+    metadata_name = metadata.get("name")
+    description = metadata.get("description")
+    if not isinstance(metadata_name, str) or metadata_name != name:
+        raise ValueError(f"skill metadata name does not match directory: {name}")
+    if not isinstance(description, str) or not description.strip():
+        raise ValueError(f"skill metadata description is required: {name}")
+    normalized_description = " ".join(description.split())
+    if len(normalized_description) > MAX_SKILL_DESCRIPTION_CHARS:
+        raise ValueError(f"skill metadata description is too long: {name}")
+    return SkillMetadata(name=name, description=normalized_description, path=path)
 
 
 def _skill_key(path: str) -> str:
@@ -67,6 +207,24 @@ def show_repo_skill(store: BaseStore, repo_id: int, relative_path: str) -> str |
         return None
     content = item.value.get("content")
     return content if isinstance(content, str) else None
+
+
+def ensure_default_repo_skills(
+    store: BaseStore, repo_id: int, names: Iterable[str]
+) -> int:
+    """Seed missing application-owned default skills without replacing content."""
+    count = 0
+    for name in dict.fromkeys(names):
+        content = DEFAULT_WORKFLOW_SKILLS.get(name)
+        if content is None:
+            continue
+        relative_path = f"{name}/SKILL.md"
+        key = _skill_key(relative_path)
+        if store.get(repo_skills_namespace(repo_id), key) is not None:
+            continue
+        put_repo_skill(store, repo_id, relative_path, content)
+        count += 1
+    return count
 
 
 def seed_repo_skills(store: BaseStore, repo_id: int, root: str | Path) -> int:

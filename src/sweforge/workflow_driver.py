@@ -29,7 +29,11 @@ from .github_store import (
 )
 from .memory_learning import candidate_from_proposal
 from .repo_memory import MEMORY_VIRTUAL_PATH, ensure_repo_memory, repo_memory_namespace
-from .skills import show_repo_skill
+from .skills import (
+    DEFAULT_WORKFLOW_SKILLS,
+    ensure_default_repo_skills,
+    show_repo_skill,
+)
 from .workflow_agent_runtime import invoke_workflow_phase
 from .workflow_comment_delivery import deliver_pending_workflow_comments
 from .workflow_messages import PLAN_FOOTER, RESULT_FOOTER
@@ -40,7 +44,7 @@ from .workflow_runtime import (
     WorkflowCycleKind,
     WorkflowRuntime,
 )
-from .workflow_spec import DEFAULT_WORKFLOW, WorkflowSpec
+from .workflow_spec import WorkflowSpec
 from .workflow_tools import build_lifecycle_tools
 
 
@@ -180,6 +184,20 @@ class DeepAgentWorkflowDriver:
         else:
             isolated = None
         ensure_repo_memory(self.memory_store, repo_memory_namespace(context.repo_id))
+        ensure_default_repo_skills(
+            self.memory_store,
+            context.repo_id,
+            (
+                skill
+                for task_spec in self.spec.tasks
+                for phase in (
+                    task_spec.planning,
+                    task_spec.execution,
+                    task_spec.validation,
+                )
+                for skill in phase.skills
+            ),
+        )
         observations: list[dict[str, Any]] = []
 
         def capture_execution_evidence(**observation: Any) -> None:
@@ -259,6 +277,7 @@ class DeepAgentWorkflowDriver:
             context_schema=RepoAgentContext,
             memory=[MEMORY_VIRTUAL_PATH],
             permissions=permissions,
+            tracer=self.tracer,
         )
         return agent, authority, context
 
@@ -438,17 +457,8 @@ class DeepAgentWorkflowDriver:
         content = show_repo_skill(self.memory_store, repo_id, f"{skill}/SKILL.md")
         if content:
             return content
-        default_skills = {
-            skill
-            for task in DEFAULT_WORKFLOW.tasks
-            for phase in (task.planning, task.execution, task.validation)
-            for skill in phase.skills
-        }
-        if self.spec.digest == DEFAULT_WORKFLOW.digest or skill in default_skills:
-            return (
-                "Inspect the repository carefully, follow the approved scope, use "
-                "the current phase tools, and provide concrete validation evidence."
-            )
+        if skill in DEFAULT_WORKFLOW_SKILLS:
+            return DEFAULT_WORKFLOW_SKILLS[skill]
         raise PermissionError(f"required operator skill is missing: {skill}")
 
     def _validation_tool(self, cycle: WorkflowCycle, validations: list[dict[str, Any]]):

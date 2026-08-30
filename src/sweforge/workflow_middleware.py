@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any
 
 from deepagents._models import resolve_model
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import SystemMessage
 
+from .agent_trace import AgentTracer, TraceContext
+from .skills import canonical_skill_path, parse_skill_metadata
 from .workflow_runtime import TaskPhase, WorkflowRuntime
 from .workflow_spec import WorkflowSpec
 
@@ -159,8 +162,10 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
         authority: WorkflowAuthority,
         *,
         phase_models: Mapping[TaskPhase, Any] | None = None,
+        tracer: AgentTracer | None = None,
     ) -> None:
         self.authority = authority
+        self.tracer = tracer
         self.phase_models = {
             phase: resolve_model(model) for phase, model in (phase_models or {}).items()
         }
@@ -203,7 +208,8 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
             f"cycle={snapshot.cycle_id} active_task={snapshot.active_task_id} "
             f"task_run={snapshot.task_run_id} phase={snapshot.phase.value}. "
             f"Only the application lifecycle gateway may finish this phase. "
-            f"Active procedural skill: {snapshot.skill}."
+            "Authorized procedural skills: "
+            f"{', '.join(snapshot.skills or (snapshot.skill,))}."
         )
         if snapshot.feedback_review_status == "REVIEWING":
             prompt += (
@@ -250,33 +256,65 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
             # Re-authorize every root execution-phase call, including custom
             # MCP tools whose mutability cannot be inferred from their names.
             self.authority.runtime.assert_execution_authorized(snapshot.task_run_id)
-        self._reject_inactive_skill_path(request, snapshot)
-        return handler(request)
+        skill_read = self._reject_inactive_skill_path(request, snapshot)
+        result = handler(request)
+        if self.tracer is not None and skill_read is not None:
+            self.tracer.emit(
+                "SKILL READ",
+                f"skill={skill_read}",
+                self._trace_context(snapshot),
+            )
+        return result
 
     @staticmethod
     def _reject_inactive_skill_path(
         request: Any, snapshot: WorkflowPolicySnapshot
-    ) -> None:
+    ) -> str | None:
         if _call_name(request) != "read_file":
-            return
+            return None
         args = _call_args(request)
         path = str(args.get("file_path") or args.get("path") or "")
         if not path.startswith("/skills/"):
-            return
-        skills = snapshot.skills or (snapshot.skill,)
-        allowed_prefixes = tuple(f"/skills/{skill}/" for skill in skills)
-        if not any(
-            path == prefix + "SKILL.md" or path.startswith(prefix)
-            for prefix in allowed_prefixes
+            return None
+        raw_parts = path.split("/")
+        if (
+            "\\" in path
+            or "%" in path
+            or "\x00" in path
+            or any(part in {"", ".", ".."} for part in raw_parts[1:])
+            or str(PurePosixPath(path)) != path
         ):
+            raise PermissionError("non-canonical skill path is forbidden")
+        parts = PurePosixPath(path).parts
+        if len(parts) < 4 or parts[1] != "skills":
+            raise PermissionError("non-canonical skill path is forbidden")
+        requested_skill = parts[2]
+        skills = snapshot.skills or (snapshot.skill,)
+        if requested_skill not in skills:
             raise PermissionError("inactive task/phase skill access is forbidden")
+        return (
+            requested_skill if path == canonical_skill_path(requested_skill) else None
+        )
+
+    @staticmethod
+    def _trace_context(snapshot: WorkflowPolicySnapshot) -> TraceContext:
+        return TraceContext(
+            workflow_cycle_id=snapshot.workflow_cycle_id,
+            cycle_id=snapshot.cycle_id,
+            task_id=snapshot.active_task_id,
+            task_run_id=snapshot.task_run_id,
+            phase=snapshot.phase.value,
+        )
 
 
 class DelegatedWorkflowPolicyMiddleware(AgentMiddleware):
     """A strict subset policy for the explicit read-only investigator."""
 
-    def __init__(self, authority: WorkflowAuthority) -> None:
+    def __init__(
+        self, authority: WorkflowAuthority, *, tracer: AgentTracer | None = None
+    ) -> None:
         self.authority = authority
+        self.tracer = tracer
 
     def wrap_model_call(self, request, handler):
         snapshot = self.authority.snapshot()
@@ -300,8 +338,17 @@ class DelegatedWorkflowPolicyMiddleware(AgentMiddleware):
         name = _call_name(request)
         if name not in (snapshot.configured_tools & RESEARCH_TOOLS):
             raise PermissionError(f"delegated tool {name!r} is forbidden")
-        WorkflowPolicyMiddleware._reject_inactive_skill_path(request, snapshot)
-        return handler(request)
+        skill_read = WorkflowPolicyMiddleware._reject_inactive_skill_path(
+            request, snapshot
+        )
+        result = handler(request)
+        if self.tracer is not None and skill_read is not None:
+            self.tracer.emit(
+                "SKILL READ",
+                f"skill={skill_read}",
+                WorkflowPolicyMiddleware._trace_context(snapshot),
+            )
+        return result
 
 
 class ReadOnlyInvestigatorMiddleware(AgentMiddleware):
@@ -321,24 +368,71 @@ class ReadOnlyInvestigatorMiddleware(AgentMiddleware):
 
 
 class WorkflowSkillsMiddleware(AgentMiddleware):
-    """Progressively disclose exactly one operator-controlled phase skill."""
+    """Eagerly load one exact skill or catalog multiple authorized skills."""
 
     def __init__(
         self,
         authority: WorkflowAuthority,
         read_skill: Callable[[int, str], str],
+        *,
+        tracer: AgentTracer | None = None,
     ) -> None:
         self.authority = authority
         self.read_skill = read_skill
+        self.tracer = tracer
 
     def wrap_model_call(self, request, handler):
         snapshot = self.authority.snapshot()
-        rendered = []
-        for skill in snapshot.skills or (snapshot.skill,):
+        skills = snapshot.skills or (snapshot.skill,)
+        if len(skills) == 1:
+            skill = skills[0]
             content = self.read_skill(snapshot.cycle_id, skill)
             if not isinstance(content, str) or not content.strip():
                 raise PermissionError(f"required workflow skill is missing: {skill}")
-            rendered.append(f"[Trusted skill: {skill}]\n{content}")
+            rendered = f"[Trusted skill: {skill}]\n{content}"
+        else:
+            if "read_file" not in snapshot.configured_tools:
+                raise PermissionError(
+                    "multi-skill discovery requires phase-authorized read_file"
+                )
+            metadata = []
+            seen: set[str] = set()
+            for skill in skills:
+                try:
+                    content = self.read_skill(snapshot.cycle_id, skill)
+                    item = parse_skill_metadata(skill, content)
+                except PermissionError:
+                    raise
+                except (TypeError, ValueError) as exc:
+                    raise PermissionError(
+                        f"required workflow skill metadata is invalid: {skill}"
+                    ) from exc
+                if item.name in seen:
+                    raise PermissionError("duplicate active skill metadata")
+                seen.add(item.name)
+                metadata.append(item)
+            catalog = ["Trusted skills available for this task/phase:"]
+            for item in metadata:
+                catalog.extend(
+                    [
+                        f"- {item.name}: {item.description}",
+                        f"  Load: {item.path}",
+                    ]
+                )
+            catalog.extend(
+                [
+                    "Read the SKILL.md for skills relevant to the current work "
+                    "before using their procedural guidance. Do not load unrelated "
+                    "skills merely because they are available."
+                ]
+            )
+            rendered = "\n".join(catalog)
+            if self.tracer is not None:
+                self.tracer.emit(
+                    "SKILL CATALOG",
+                    f"count={len(metadata)}",
+                    WorkflowPolicyMiddleware._trace_context(snapshot),
+                )
         prefix = getattr(request.system_message, "content", "")
-        prompt = f"{prefix}\n\n" + "\n\n".join(rendered)
+        prompt = f"{prefix}\n\n{rendered}"
         return handler(request.override(system_message=SystemMessage(content=prompt)))
