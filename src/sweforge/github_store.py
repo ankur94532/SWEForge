@@ -8184,6 +8184,14 @@ class SQLiteGitHubStore:
             return True
         if task["phase"] in {"PLANNING", "EXECUTING", "VALIDATING"}:
             return True
+        if self.feedback_review_for_task(task["task_run_id"]) is not None:
+            # A semantic feedback review is still in flight. Beginning one
+            # consumes its triggering input, so no unconsumed input remains to
+            # select this thread; without this clause a review interrupted by a
+            # restart or tick boundary is stranded and the user's feedback is
+            # silently lost. The controller already reconstructs the exact
+            # resume payload from the stored review.
+            return True
         if (
             task["phase"]
             in {

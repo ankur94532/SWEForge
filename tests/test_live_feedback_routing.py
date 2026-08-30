@@ -872,3 +872,54 @@ def test_controller_traces_exact_feedback_review_start(tmp_path):
     assert trace.context.origin_surface == OriginSurface.ISSUE.value
     assert payload["occurrence_key"] == plan.approval_occurrence_key
     store.close()
+
+
+@pytest.mark.parametrize("kind", ["PLAN", "RESULT"])
+def test_in_flight_feedback_review_keeps_its_thread_runnable(tmp_path, kind):
+    """An interrupted semantic review must survive a restart.
+
+    ``begin_feedback_review`` consumes the triggering input, so after a
+    restart no unconsumed input remains to make the thread runnable. Without
+    an explicit resumability clause the review is stranded forever and the
+    user's feedback is silently lost.
+    """
+    store, repo, runtime, cycle, task = setup_runtime(tmp_path)
+    # The live controller consumes the cycle root when it opens the cycle.
+    store.record_input_disposition(
+        cycle.root_input_id,
+        thread_id=cycle.thread_id,
+        cycle_id=1,
+        status="CYCLE_ROOT",
+        recorded_at=NOW,
+    )
+    plan = submit_plan(runtime, task)
+    if kind == "RESULT":
+        approve_plan(runtime, task, plan)
+        result = publish_result(runtime, task)
+        occurrence = result.result_occurrence_key
+    else:
+        occurrence = plan.approval_occurrence_key
+    feedback = source(
+        repo,
+        f"stranded-{kind}",
+        body="@agent Preserve the current wire format.",
+        created_at="2026-01-01T00:15:00Z",
+    )
+    record(store, feedback)
+    store.begin_feedback_review(
+        event_key=feedback.event_key,
+        task_run_id=task.task_run_id,
+        feedback_kind=kind,
+        occurrence_key=occurrence,
+        feedback_text=feedback.body,
+        now=NOW,
+    )
+
+    # The review claimed the only input that could re-dispatch this thread.
+    assert store.unconsumed_inputs(cycle.thread_id) == []
+
+    reopened = SQLiteGitHubStore(tmp_path / "state.db")
+    assert reopened.is_thread_runnable(cycle.thread_id, now="2026-01-01T00:30:00Z")
+    assert reopened.runnable_thread_ids(now="2026-01-01T00:30:00Z") == [cycle.thread_id]
+    reopened.close()
+    store.close()
