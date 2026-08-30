@@ -18,6 +18,7 @@ from .config import MODEL_TRANSIENT_RETRIES
 
 MAX_SUMMARY_CHARS = 2_000
 MAX_ISSUE_BODY_CHARS = 6_000
+MAX_TASK_TEXT_CHARS = 12_000
 MAX_DIFF_CHARS = 20_000
 MAX_CHANGED_FILES = 60
 MAX_COMPONENTS = 12
@@ -84,7 +85,7 @@ def curate_issue_resolution(
             CURATOR_PROMPT,
             f"Issue #{evidence.issue_number}: {evidence.issue_title}",
             f"Issue description:\n{evidence.issue_description[:MAX_ISSUE_BODY_CHARS]}",
-            f"Requested task:\n{evidence.task_text[:MAX_SUMMARY_CHARS]}",
+            f"Requested task:\n{evidence.task_text[:MAX_TASK_TEXT_CHARS]}",
             f"Approved plan:\n{evidence.plan_text[:MAX_ISSUE_BODY_CHARS]}",
             f"Execution result:\n{evidence.execution_response[:MAX_ISSUE_BODY_CHARS]}",
             "Changed files:\n" + "\n".join(evidence.changed_files[:MAX_CHANGED_FILES]),

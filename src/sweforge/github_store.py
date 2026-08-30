@@ -1072,6 +1072,37 @@ class PublicationRecord:
 
 
 @dataclass(frozen=True)
+class AcceptedTaskLifecycle:
+    """One task's exact, final, result-approved lifecycle material."""
+
+    cycle_id: int
+    workflow_cycle_id: str
+    cycle_kind: str
+    revision_sequence: int | None
+    task_id: str
+    declaration_index: int
+    plan_id: str
+    plan_text: str
+    execution_id: str
+    execution_summary: str
+    validation_id: str
+    validation_summary: str
+
+
+@dataclass(frozen=True)
+class PublicationGeneration:
+    """Accepted declarative cycles since the previous finalized publication."""
+
+    publication_id: str
+    thread_id: str
+    first_cycle_id: int
+    last_cycle_id: int
+    cycle_ids: tuple[int, ...]
+    previous_publication_id: str | None
+    previous_commit_sha: str | None
+
+
+@dataclass(frozen=True)
 class PublicationTarget:
     """The exact lifecycle a publication is authorized to act for."""
 
@@ -5154,6 +5185,347 @@ class SQLiteGitHubStore:
             now=now,
             error_message=None,
         )
+
+    @staticmethod
+    def _accepted_cycle_material(
+        db: sqlite3.Connection, cycle: sqlite3.Row
+    ) -> tuple[AcceptedTaskLifecycle, ...] | None:
+        """Return a cycle only when every declared task has exact acceptance proof."""
+        if cycle["status"] not in {"AWAITING_PUBLICATION", "PUBLISHED"}:
+            return None
+        try:
+            document = json.loads(cycle["workflow_spec_json"])
+            canonical = json.dumps(document, sort_keys=True, separators=(",", ":"))
+            declared = document["tasks"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            document.get("workflow_id") != cycle["workflow_id"]
+            or document.get("version") != cycle["workflow_version"]
+            or hashlib.sha256(canonical.encode()).hexdigest()
+            != cycle["workflow_digest"]
+            or not declared
+        ):
+            return None
+        tasks = db.execute(
+            """SELECT * FROM workflow_task_runs_v1
+               WHERE workflow_cycle_id=? ORDER BY declaration_index""",
+            (cycle["workflow_cycle_id"],),
+        ).fetchall()
+        if len(tasks) != len(declared):
+            return None
+        accepted: list[AcceptedTaskLifecycle] = []
+        for index, (task, declaration) in enumerate(zip(tasks, declared)):
+            try:
+                dependencies = json.loads(task["dependencies_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if (
+                task["declaration_index"] != index
+                or task["task_id"] != declaration.get("id")
+                or dependencies != declaration.get("depends_on", [])
+                or task["thread_id"] != cycle["thread_id"]
+                or task["cycle_id"] != cycle["cycle_id"]
+                or task["workflow_id"] != cycle["workflow_id"]
+                or task["status"] != "DONE"
+                or task["phase"] != "DONE"
+                or not task["current_plan_id"]
+                or task["waiting_from_phase"] is not None
+                or task["clarification_occurrence_key"] is not None
+            ):
+                return None
+            plan = db.execute(
+                "SELECT * FROM workflow_task_plans_v1 WHERE plan_id=?",
+                (task["current_plan_id"],),
+            ).fetchone()
+            if (
+                plan is None
+                or plan["task_run_id"] != task["task_run_id"]
+                or plan["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or plan["task_id"] != task["task_id"]
+                or plan["status"] != "APPROVED"
+                or plan["version"] < 1
+                or plan["posted_comment_id"] <= 0
+                or not plan["approved_at"]
+                or not plan["approved_by"]
+                or not plan["approval_event_key"]
+                or hashlib.sha256(plan["plan_text"].strip().encode()).hexdigest()
+                != plan["plan_digest"]
+            ):
+                return None
+            execution = db.execute(
+                """SELECT * FROM workflow_task_executions_v1
+                   WHERE task_run_id=? AND plan_id=? AND attempt=?""",
+                (task["task_run_id"], plan["plan_id"], task["execution_attempt"]),
+            ).fetchone()
+            validation = db.execute(
+                """SELECT * FROM workflow_task_validations_v1
+                   WHERE task_run_id=? AND plan_id=? AND execution_attempt=?
+                     AND validation_round=?""",
+                (
+                    task["task_run_id"],
+                    plan["plan_id"],
+                    task["execution_attempt"],
+                    task["validation_round"],
+                ),
+            ).fetchone()
+            if execution is None or validation is None:
+                return None
+            permit = db.execute(
+                """SELECT * FROM workflow_task_permits_v1
+                   WHERE permit_id=? AND invalidated_at IS NULL""",
+                (execution["permit_id"],),
+            ).fetchone()
+            result = db.execute(
+                """SELECT * FROM workflow_task_results_v1
+                   WHERE task_run_id=? AND plan_id=? AND execution_id=?
+                     AND validation_id=?""",
+                (
+                    task["task_run_id"],
+                    plan["plan_id"],
+                    execution["execution_id"],
+                    validation["validation_id"],
+                ),
+            ).fetchone()
+            result_approval = (
+                db.execute(
+                    """SELECT * FROM workflow_task_result_approvals_v1
+                       WHERE result_id=? AND invalidated_at IS NULL""",
+                    (result["result_id"],),
+                ).fetchone()
+                if result is not None
+                else None
+            )
+            try:
+                execution_evidence = json.loads(execution["evidence_json"])
+                validation_evidence = json.loads(validation["evidence_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            if (
+                permit is None
+                or permit["task_run_id"] != task["task_run_id"]
+                or permit["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or permit["plan_id"] != plan["plan_id"]
+                or permit["plan_version"] != plan["version"]
+                or permit["plan_digest"] != plan["plan_digest"]
+                or permit["approval_mode"] not in {"HUMAN", "AUTO"}
+                or execution["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or execution["status"] != "SUCCEEDED"
+                or not isinstance(execution_evidence, dict)
+                or not isinstance(execution_evidence.get("tool_observations"), list)
+                or validation["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or validation["verdict"] != "ACCEPT"
+                or not isinstance(validation_evidence, dict)
+                or not isinstance(validation_evidence.get("validation_runs"), list)
+                or not validation_evidence["validation_runs"]
+                or result is None
+                or result["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or result["posted_comment_id"] <= 0
+                or result["result_occurrence_key"].startswith("plan-approval:")
+                or result_approval is None
+                or result_approval["task_run_id"] != task["task_run_id"]
+                or result_approval["workflow_cycle_id"] != cycle["workflow_cycle_id"]
+                or result_approval["plan_id"] != plan["plan_id"]
+                or result_approval["execution_id"] != execution["execution_id"]
+                or result_approval["validation_id"] != validation["validation_id"]
+                or result_approval["result_occurrence_key"]
+                != result["result_occurrence_key"]
+                or result_approval["mode"] != permit["approval_mode"]
+                or (
+                    result_approval["mode"] == "AUTO"
+                    and (
+                        result_approval["approval_event_key"] is not None
+                        or result_approval["approved_by"] != "sweforge:auto-policy"
+                        or permit["approved_by"] != "sweforge:auto-policy"
+                        or not permit["approval_event_key"].startswith(
+                            "auto-plan-authority:plan-approval:"
+                        )
+                    )
+                )
+                or (
+                    result_approval["mode"] == "HUMAN"
+                    and not result_approval["approval_event_key"]
+                )
+            ):
+                return None
+            accepted.append(
+                AcceptedTaskLifecycle(
+                    cycle_id=cycle["cycle_id"],
+                    workflow_cycle_id=cycle["workflow_cycle_id"],
+                    cycle_kind=cycle["cycle_kind"],
+                    revision_sequence=cycle["revision_sequence"],
+                    task_id=task["task_id"],
+                    declaration_index=task["declaration_index"],
+                    plan_id=plan["plan_id"],
+                    plan_text=plan["plan_text"],
+                    execution_id=execution["execution_id"],
+                    execution_summary=execution["summary"],
+                    validation_id=validation["validation_id"],
+                    validation_summary=validation["summary"],
+                )
+            )
+        return tuple(accepted)
+
+    def accepted_lifecycle_material(
+        self,
+        thread_id: str,
+        *,
+        first_cycle_id: int = 1,
+        last_cycle_id: int | None = None,
+    ) -> list[AcceptedTaskLifecycle]:
+        """Read bounded-input lifecycle facts without replaying agent messages."""
+        clauses = ["thread_id=?", "cycle_id>=?"]
+        values: list[object] = [thread_id, first_cycle_id]
+        if last_cycle_id is not None:
+            clauses.append("cycle_id<=?")
+            values.append(last_cycle_id)
+        cycles = self.connection.execute(
+            "SELECT * FROM workflow_cycles_v1 WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY cycle_id",
+            values,
+        ).fetchall()
+        material: list[AcceptedTaskLifecycle] = []
+        for cycle in cycles:
+            accepted = self._accepted_cycle_material(self.connection, cycle)
+            if accepted is not None:
+                material.extend(accepted)
+        return material
+
+    def publication_generation(self, publication_id: str) -> PublicationGeneration:
+        """Derive exact cycle membership from durable finalization records."""
+        publication = self.publication_for_id(publication_id)
+        if publication is None:
+            raise ValueError("publication does not exist")
+        finalized = self.connection.execute(
+            """SELECT 1 FROM repo_memory_learning
+               WHERE thread_id=? AND cycle_id=? AND root_input_id=?""",
+            (
+                publication.thread_id,
+                publication.cycle_id,
+                publication.root_input_id,
+            ),
+        ).fetchone()
+        if finalized is None:
+            raise ValueError("publication has not been finalized")
+        previous = self.connection.execute(
+            """SELECT p.publication_id,p.cycle_id,p.remote_commit_sha
+               FROM logical_publications AS p
+               JOIN repo_memory_learning AS learning
+                 ON learning.thread_id=p.thread_id
+                AND learning.cycle_id=p.cycle_id
+                AND learning.root_input_id=p.root_input_id
+               WHERE p.thread_id=? AND p.cycle_id<?
+                 AND p.status IN ('COMPLETED','NO_CHANGES')
+               ORDER BY p.cycle_id DESC LIMIT 1""",
+            (publication.thread_id, publication.cycle_id),
+        ).fetchone()
+        boundary = int(previous["cycle_id"]) if previous is not None else 0
+        previous_commit_sha = (
+            str(previous["remote_commit_sha"])
+            if previous is not None and previous["remote_commit_sha"]
+            else None
+        )
+        if previous is not None and previous_commit_sha is None:
+            prior_commit = self.connection.execute(
+                """SELECT p.remote_commit_sha
+                   FROM logical_publications AS p
+                   JOIN repo_memory_learning AS learning
+                     ON learning.thread_id=p.thread_id
+                    AND learning.cycle_id=p.cycle_id
+                    AND learning.root_input_id=p.root_input_id
+                   WHERE p.thread_id=? AND p.cycle_id<?
+                     AND p.remote_commit_sha IS NOT NULL
+                   ORDER BY p.cycle_id DESC LIMIT 1""",
+                (publication.thread_id, publication.cycle_id),
+            ).fetchone()
+            previous_commit_sha = (
+                str(prior_commit["remote_commit_sha"])
+                if prior_commit is not None
+                else None
+            )
+        cycles = self.connection.execute(
+            """SELECT * FROM workflow_cycles_v1
+               WHERE thread_id=? AND cycle_id>? AND cycle_id<=?
+               ORDER BY cycle_id""",
+            (publication.thread_id, boundary, publication.cycle_id),
+        ).fetchall()
+        if cycles:
+            cycle_ids = tuple(int(cycle["cycle_id"]) for cycle in cycles)
+            expected = tuple(range(boundary + 1, publication.cycle_id + 1))
+            if cycle_ids != expected:
+                raise ValueError("publication generation has a cycle gap")
+            for cycle in cycles:
+                if self._accepted_cycle_material(self.connection, cycle) is None:
+                    raise ValueError(
+                        "publication generation contains an unaccepted cycle"
+                    )
+        else:
+            # Compatibility lifecycles predate the declarative cycle tables.
+            cycle_ids = (publication.cycle_id,)
+        return PublicationGeneration(
+            publication_id=publication_id,
+            thread_id=publication.thread_id,
+            first_cycle_id=boundary + 1,
+            last_cycle_id=publication.cycle_id,
+            cycle_ids=cycle_ids,
+            previous_publication_id=(
+                str(previous["publication_id"]) if previous is not None else None
+            ),
+            previous_commit_sha=previous_commit_sha,
+        )
+
+    def repo_memory_candidates_for_generation(
+        self, generation: PublicationGeneration, *, repo_id: int
+    ) -> list[RepoMemoryCandidateRecord]:
+        """Return only unsettled candidates belonging to this generation."""
+        rows = self.connection.execute(
+            """SELECT candidate.* FROM repo_memory_candidates AS candidate
+               JOIN workflow_cycles_v1 AS cycle
+                 ON cycle.thread_id=candidate.thread_id
+                AND cycle.cycle_id=candidate.cycle_id
+                AND cycle.root_input_id=candidate.root_input_id
+               WHERE candidate.repo_id=? AND candidate.thread_id=?
+                 AND candidate.cycle_id>=? AND candidate.cycle_id<=?
+                 AND candidate.status='PROPOSED'
+               ORDER BY candidate.cycle_id,candidate.created_at,
+                        candidate.candidate_id""",
+            (
+                repo_id,
+                generation.thread_id,
+                generation.first_cycle_id,
+                generation.last_cycle_id,
+            ),
+        ).fetchall()
+        return [RepoMemoryCandidateRecord(**dict(row)) for row in rows]
+
+    def revision_inputs_for_generation(
+        self, generation: PublicationGeneration
+    ) -> list[sqlite3.Row]:
+        """Return exact consumed steering incorporated into this publication."""
+        return self.connection.execute(
+            """SELECT r.*,se.repo_full_name,se.source_kind,se.source_id,
+                      se.source_updated_at,se.source_created_at,se.subject_kind,
+                      se.subject_number,se.author_login,se.body AS source_body,
+                      se.html_url,se.origin_surface,se.path,se.line,se.start_line,
+                      se.side,se.start_side,se.diff_hunk,se.commit_id,
+                      se.original_commit_id,se.in_reply_to_id,
+                      se.pull_request_review_id,se.review_thread_root_id,
+                      cycle.cycle_id
+               FROM revision_inputs_v1 AS r
+               JOIN workflow_cycles_v1 AS cycle
+                 ON cycle.workflow_cycle_id=r.revision_workflow_cycle_id
+               JOIN source_events AS se ON se.event_key=r.source_event_key
+               WHERE r.thread_id=? AND r.status='CONSUMED'
+                 AND cycle.cycle_id>=? AND cycle.cycle_id<=?
+               ORDER BY cycle.cycle_id,se.source_updated_at,r.queued_at,
+                        r.revision_input_id""",
+            (
+                generation.thread_id,
+                generation.first_cycle_id,
+                generation.last_cycle_id,
+            ),
+        ).fetchall()
 
     def finalize_publication(
         self, publication_id: str, *, now: str

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import inspect
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
+
+from langgraph.store.memory import InMemoryStore
 
 from sweforge.github_models import (
     OriginSurface,
@@ -13,8 +16,18 @@ from sweforge.github_models import (
     SourceKind,
     SubjectKind,
 )
-from sweforge.github_store import PublicationStatus, SQLiteGitHubStore
+from sweforge.github_store import (
+    PublicationStatus,
+    RepoMemoryCandidateRecord,
+    RepoMemoryCandidateStatus,
+    SQLiteGitHubStore,
+    repo_memory_candidate_id_for,
+)
+from sweforge.issue_resolution import IssueResolutionCase
+from sweforge.memory_learning import CuratorOutput
+from sweforge.repo_memory import read_repo_memory, repo_memory_namespace
 from sweforge.server import ServerConfig, SWEForgeServer
+from sweforge.workflow_learning import WorkflowLearningService
 from sweforge.workflow_runtime import TaskPhase, ValidationVerdict
 
 
@@ -66,6 +79,7 @@ class FakePublisher:
 class FakeDriver:
     events = []
     specs = []
+    prompts = []
     verdicts = {}
     clarify_once = False
     clarified = False
@@ -81,6 +95,7 @@ class FakeDriver:
         return None
 
     def drive(self, *, cycle, task, prompt, resume=None):
+        self.prompts.append((cycle.cycle_id, task.task_id, task.phase.value, prompt))
         if resume is not None:
             if resume["kind"] == "PLAN_APPROVAL":
                 self.runtime.approve_plan(
@@ -476,6 +491,11 @@ def test_auto_issue_completes_both_barriers_without_human_events(tmp_path):
         == "PUBLISHED"
     )
     assert len(FakePublisher.calls) == 1
+    generation = store.publication_generation(FakePublisher.calls[0])
+    assert generation.cycle_ids == (1,)
+    assert [
+        item.task_id for item in store.accepted_lifecycle_material("github:41:issue:9")
+    ] == ["implementation"]
     store.close()
 
 
@@ -733,7 +753,7 @@ def test_queued_deferred_followup_becomes_generic_revision_cycle(tmp_path):
 
 
 def test_unsolicited_inputs_batch_before_first_publication_and_run_generic_revision(
-    tmp_path,
+    tmp_path, monkeypatch
 ):
     FakeDriver.events = []
     FakeDriver.specs = []
@@ -741,15 +761,16 @@ def test_unsolicited_inputs_batch_before_first_publication_and_run_generic_revis
     FakePublisher.calls = []
     server = _server(tmp_path, max_ticks=1)
     thread_id = "github:41:issue:9"
+    root = _event(
+        SourceKind.ISSUE,
+        "root",
+        "@agent implement the original request",
+        "2026-01-01T00:00:00Z",
+    )
     _record(
         server.config.db,
         "issues",
-        _event(
-            SourceKind.ISSUE,
-            "root",
-            "@agent implement the original request",
-            "2026-01-01T00:00:00Z",
-        ),
+        root,
     )
     server._worker_entry(thread_id)
     _record(
@@ -791,7 +812,6 @@ def test_unsolicited_inputs_batch_before_first_publication_and_run_generic_revis
     ]
     assert FakePublisher.calls == []
     store.close()
-
     _record(
         server.config.db,
         "issue_comments",
@@ -846,6 +866,294 @@ def test_unsolicited_inputs_batch_before_first_publication_and_run_generic_revis
         "default",
         f"revision-{server.workflow_spec.digest[:16]}",
     }
+    publication = store.publication_for_id(FakePublisher.calls[0])
+    generation = store.publication_generation(publication.publication_id)
+    assert generation.cycle_ids == (1, 2)
+
+    records = []
+    for cycle, fact in zip(cycles, ("Initial fact.", "Revision fact.")):
+        source_key = (
+            root.event_key
+            if cycle["cycle_kind"] == "INITIAL"
+            else batched[0]["source_event_key"]
+        )
+        candidate_id = repo_memory_candidate_id_for(
+            repo_id=41,
+            thread_id=thread_id,
+            cycle_id=cycle["cycle_id"],
+            root_input_id=cycle["root_input_id"],
+            fact=fact,
+            evidence_path="README.md",
+            evidence_start_line=1,
+            evidence_end_line=1,
+        )
+        record = RepoMemoryCandidateRecord(
+            candidate_id=candidate_id,
+            repo_id=41,
+            thread_id=thread_id,
+            cycle_id=cycle["cycle_id"],
+            root_input_id=cycle["root_input_id"],
+            source_event_key=source_key,
+            category="convention",
+            fact=fact,
+            durability_reason="README evidence",
+            evidence_path="README.md",
+            evidence_start_line=1,
+            evidence_end_line=1,
+            status=RepoMemoryCandidateStatus.PROPOSED.value,
+            created_at="2026-01-01T01:00:00Z",
+            updated_at="2026-01-01T01:00:00Z",
+        )
+        store.save_repo_memory_candidate(record)
+        records.append(record)
+    stale = RepoMemoryCandidateRecord(
+        candidate_id=repo_memory_candidate_id_for(
+            repo_id=41,
+            thread_id=thread_id,
+            cycle_id=1,
+            root_input_id=cycles[0]["root_input_id"],
+            fact="Stale line range.",
+            evidence_path="README.md",
+            evidence_start_line=99,
+            evidence_end_line=99,
+        ),
+        repo_id=41,
+        thread_id=thread_id,
+        cycle_id=1,
+        root_input_id=cycles[0]["root_input_id"],
+        source_event_key=root.event_key,
+        category="convention",
+        fact="Stale line range.",
+        durability_reason="the cited line was removed",
+        evidence_path="README.md",
+        evidence_start_line=99,
+        evidence_end_line=99,
+        status="PROPOSED",
+        created_at="2026-01-01T01:00:00Z",
+        updated_at="2026-01-01T01:00:00Z",
+    )
+    store.save_repo_memory_candidate(stale)
+    store.close()
+
+    # Generation membership and pending proposals are restart-derived, not
+    # process-local state.
+    store = SQLiteGitHubStore(server.config.db)
+    assert store.publication_generation(publication.publication_id).cycle_ids == (1, 2)
+    captured = {}
+
+    def curate_memory(**kwargs):
+        captured["memory"] = kwargs
+        return CuratorOutput(candidates=[], proposal_json="[]")
+
+    def curate(*, model, evidence):
+        del model
+        captured["evidence"] = evidence
+        return IssueResolutionCase(useful=False)
+
+    monkeypatch.setattr(
+        "sweforge.workflow_learning.curate_repository_memory", curate_memory
+    )
+    monkeypatch.setattr("sweforge.workflow_learning.curate_issue_resolution", curate)
+    memory = InMemoryStore()
+    learner = WorkflowLearningService(
+        store=store,
+        memory_store=memory,
+        memory_model="offline-memory",
+        resolution_model="offline-resolution",
+        lock_root=tmp_path / "locks",
+        clock=lambda: "2026-01-01T01:01:00Z",
+    )
+    assert learner.process_one(thread_id)
+    learned = read_repo_memory(memory, repo_memory_namespace(41)) or ""
+    assert "Initial fact." in learned
+    assert "Revision fact." in learned
+    lifecycle_text = captured["memory"]["lifecycle_text"]
+    assert "Initial workflow (cycle 1)" in lifecycle_text
+    assert "Accepted revision #1 (cycle 2)" in lifecycle_text
+    assert "Executed implementation" in lifecycle_text
+    assert "Validated revision: ACCEPT" in lifecycle_text
+    assert [
+        store.repo_memory_candidate(item.candidate_id).status for item in records
+    ] == [
+        "ACCEPTED",
+        "ACCEPTED",
+    ]
+    assert store.repo_memory_candidate(stale.candidate_id).status == "REJECTED"
+    assert learner.process_one(thread_id)
+    evidence = captured["evidence"]
+    assert "Initial workflow / implementation" in evidence.plan_text
+    assert "Accepted revision #1 / revision" in evidence.plan_text
+    assert "Executed implementation" in evidence.execution_response
+    assert "Executed revision" in evidence.execution_response
+    assert "preserve old configuration compatibility" in evidence.task_text
+    assert "keep the legacy error shape" in evidence.task_text
+    store.close()
+
+
+def test_later_revision_prompt_uses_only_durable_accepted_history(tmp_path):
+    FakeDriver.events = []
+    FakeDriver.specs = []
+    FakeDriver.prompts = []
+    FakeDriver.verdicts = {
+        "implementation": [ValidationVerdict.NEEDS_FIXES, ValidationVerdict.ACCEPT]
+    }
+    FakePublisher.calls = []
+    server = _server(tmp_path)
+    thread_id = "github:41:issue:9"
+    root = _event(
+        SourceKind.ISSUE,
+        "root",
+        "@agent implement the original behavior",
+        "2026-01-01T00:00:00Z",
+    )
+    _record(
+        server.config.db,
+        "issues",
+        root,
+    )
+    server._worker_entry(thread_id)
+    _approve(server, "initial-plan", 12)
+    _approve(server, "initial-result", 14)
+
+    store = SQLiteGitHubStore(server.config.db)
+    initial_task = store.connection.execute(
+        """SELECT * FROM workflow_task_runs_v1
+           WHERE cycle_id=1 AND task_id='implementation'"""
+    ).fetchone()
+    sentinel = "SUPERSEDED PLAN MUST NOT APPEAR"
+    store.connection.execute(
+        """INSERT INTO workflow_task_plans_v1(
+           plan_id,task_run_id,workflow_cycle_id,task_id,version,plan_text,
+           plan_digest,status,posted_at,posted_comment_id,
+           approval_occurrence_key,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            "superseded-plan-sentinel",
+            initial_task["task_run_id"],
+            initial_task["workflow_cycle_id"],
+            initial_task["task_id"],
+            0,
+            sentinel,
+            hashlib.sha256(sentinel.encode()).hexdigest(),
+            "SUPERSEDED",
+            "2026-01-01T00:09:00Z",
+            99,
+            "superseded-plan-occurrence",
+            "2026-01-01T00:09:00Z",
+        ),
+    )
+    store.connection.commit()
+    store.update_publication(
+        FakePublisher.calls[-1],
+        status=PublicationStatus.NO_CHANGES,
+        now="2026-01-01T00:15:00Z",
+        remote_commit_sha="a" * 40,
+    )
+    store.close()
+
+    first = _event(
+        SourceKind.ISSUE_COMMENT,
+        "revision-one",
+        "@agent preserve legacy configuration behavior",
+        "2026-01-01T00:20:00Z",
+    )
+    _record(server.config.db, "issue_comments", first)
+    server._worker_entry(thread_id)
+    first_prompt = next(
+        prompt
+        for cycle_id, task_id, phase, prompt in FakeDriver.prompts
+        if cycle_id == 2 and task_id == "revision" and phase == "PLANNING"
+    )
+    assert "Original issue request (untrusted): implement the original behavior" in (
+        first_prompt
+    )
+    assert "Initial workflow (cycle 1):" in first_prompt
+    assert "Accepted plan" in first_prompt
+    assert "Plan for implementation version next" in first_prompt
+    assert "Final execution" in first_prompt
+    assert "Executed implementation" in first_prompt
+    assert "Final ACCEPT validation" in first_prompt
+    assert "Validated implementation: ACCEPT" in first_prompt
+    assert sentinel not in first_prompt
+    assert "Validated implementation: NEEDS_FIXES" not in first_prompt
+    assert "preserve legacy configuration behavior" in first_prompt
+
+    _approve(server, "revision-one-plan", 21)
+    _approve(server, "revision-one-result", 22)
+    store = SQLiteGitHubStore(server.config.db)
+    second_publication = store.publication_for_id(FakePublisher.calls[-1])
+    second_generation = store.publication_generation(second_publication.publication_id)
+    assert second_generation.cycle_ids == (2,)
+    initial_cycle = store.connection.execute(
+        "SELECT * FROM workflow_cycles_v1 WHERE cycle_id=1"
+    ).fetchone()
+    old_candidate = RepoMemoryCandidateRecord(
+        candidate_id=repo_memory_candidate_id_for(
+            repo_id=41,
+            thread_id=thread_id,
+            cycle_id=1,
+            root_input_id=initial_cycle["root_input_id"],
+            fact="Old published candidate.",
+            evidence_path="README.md",
+            evidence_start_line=1,
+            evidence_end_line=1,
+        ),
+        repo_id=41,
+        thread_id=thread_id,
+        cycle_id=1,
+        root_input_id=initial_cycle["root_input_id"],
+        source_event_key=root.event_key,
+        category="convention",
+        fact="Old published candidate.",
+        durability_reason="old generation",
+        evidence_path="README.md",
+        evidence_start_line=1,
+        evidence_end_line=1,
+        status="PROPOSED",
+        created_at="2026-01-01T00:23:00Z",
+        updated_at="2026-01-01T00:23:00Z",
+    )
+    store.save_repo_memory_candidate(old_candidate)
+    assert (
+        store.repo_memory_candidates_for_generation(second_generation, repo_id=41) == []
+    )
+    store.close()
+
+    store = SQLiteGitHubStore(server.config.db)
+    assert store.publication_generation(
+        second_publication.publication_id
+    ).cycle_ids == (2,)
+    store.close()
+    second = _event(
+        SourceKind.ISSUE_COMMENT,
+        "revision-two",
+        "@agent also support empty arrays",
+        "2026-01-01T00:30:00Z",
+    )
+    _record(server.config.db, "issue_comments", second)
+    server._worker_entry(thread_id)
+    second_prompt = next(
+        prompt
+        for cycle_id, task_id, phase, prompt in FakeDriver.prompts
+        if cycle_id == 3 and task_id == "revision" and phase == "PLANNING"
+    )
+    assert "Initial workflow (cycle 1):" in second_prompt
+    assert "Accepted revision #1 (cycle 2):" in second_prompt
+    assert "Executed revision" in second_prompt
+    assert "Validated revision: ACCEPT" in second_prompt
+    assert "also support empty arrays" in second_prompt
+    assert "Accepted revision #2 (cycle 3)" not in second_prompt
+    assert "Current revision repair/replan history" in second_prompt
+
+    FakeDriver.verdicts["revision"] = [ValidationVerdict.ACCEPT]
+    _approve(server, "revision-two-plan", 31)
+    _approve(server, "revision-two-result", 32)
+    store = SQLiteGitHubStore(server.config.db)
+    third_generation = store.publication_generation(FakePublisher.calls[-1])
+    assert third_generation.cycle_ids == (3,)
+    # The immediately previous publication had no commit; the effective diff
+    # baseline remains the latest finalized publication that did push one.
+    assert third_generation.previous_commit_sha == "a" * 40
     store.close()
 
 

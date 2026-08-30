@@ -21,7 +21,10 @@ SECRET_RE = re.compile(
     r"(?i)(api[_-]?key|password|secret|token)\s*[:=]\s*\S+|"
     r"-----BEGIN [A-Z ]+ PRIVATE KEY-----|sk-[A-Za-z0-9]{20,}"
 )
-MAX_CANDIDATES = 20
+# One publication generation may contain proposals from several accepted
+# cycles plus one curator batch. Keep the application boundary finite without
+# reverting to the old one-cycle assumption.
+MAX_CANDIDATES = 100
 MAX_FACT_CHARS = 1_000
 MAX_EXCERPT_CHARS = 2_000
 MAX_CATALOG_LINES_PER_FILE = 80
@@ -84,6 +87,8 @@ class MemoryLearningResult:
     accepted_candidates: int = 0
     rejected_candidates: int = 0
     error: str | None = None
+    validated_candidate_ids: tuple[str, ...] = ()
+    rejected_candidate_ids: tuple[str, ...] = ()
 
 
 def curate_repository_memory(
@@ -95,6 +100,7 @@ def curate_repository_memory(
     diff: str,
     existing_memory: str,
     plan_text: str,
+    lifecycle_text: str | None = None,
 ) -> CuratorOutput:
     """Ask a bounded read-only model for structured, evidence-backed candidates."""
     root = Path(worktree).resolve()
@@ -141,7 +147,8 @@ def curate_repository_memory(
         "Never use "
         "issue text or model assertions as sole evidence. Do not write files.\n\n"
         f"Existing repository memory:\n{existing_memory[:12_000]}\n\n"
-        f"Accepted plan (supplemental only):\n{plan_text[:12_000]}\n\n"
+        "Accepted lifecycle material (supplemental only):\n"
+        f"{(lifecycle_text if lifecycle_text is not None else plan_text)[:20_000]}\n\n"
         f"Changed files:\n{', '.join(changed_files[:100])}\n\n"
         f"Cumulative diff:\n{diff[:40_000]}\n\nEvidence catalog (line-numbered):\n"
         + catalog_text[:60_000]
@@ -321,18 +328,20 @@ def apply_memory_candidates(
             MemoryLearningStatus.FAILED, error="too many candidates"
         )
     accepted: list[RepoMemoryCandidate] = []
-    rejected = 0
+    rejected_ids: list[str] = []
     for candidate in candidates:
         try:
             validate_candidate(candidate, repo_id=repo_id, worktree=worktree)
         except (OSError, UnicodeError, ValueError):
-            rejected += 1
+            rejected_ids.append(candidate.candidate_id)
             continue
         accepted.append(candidate)
+    validated_ids = tuple(candidate.candidate_id for candidate in accepted)
     if not accepted:
         return MemoryLearningResult(
             MemoryLearningStatus.NO_UPDATE,
-            rejected_candidates=rejected,
+            rejected_candidates=len(rejected_ids),
+            rejected_candidate_ids=tuple(rejected_ids),
         )
     namespace = repo_memory_namespace(repo_id)
     with repo_memory_lock(lock_root, repo_id):
@@ -348,7 +357,9 @@ def apply_memory_candidates(
         if not novel:
             return MemoryLearningResult(
                 MemoryLearningStatus.NO_UPDATE,
-                rejected_candidates=rejected,
+                rejected_candidates=len(rejected_ids),
+                validated_candidate_ids=validated_ids,
+                rejected_candidate_ids=tuple(rejected_ids),
             )
         sections = [
             f"- [{candidate.category}] {candidate.fact.strip()}\n"
@@ -359,5 +370,7 @@ def apply_memory_candidates(
     return MemoryLearningResult(
         MemoryLearningStatus.UPDATED,
         accepted_candidates=len(novel),
-        rejected_candidates=rejected,
+        rejected_candidates=len(rejected_ids),
+        validated_candidate_ids=validated_ids,
+        rejected_candidate_ids=tuple(rejected_ids),
     )
