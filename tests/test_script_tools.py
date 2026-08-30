@@ -19,6 +19,10 @@ def resolve_test_secrets(spec):
     }
 
 
+def script_named(bundle, name):
+    return next(item for item in bundle.scripts if item.name == name)
+
+
 def configured(tmp_path):
     bundle = tmp_path / "bundle"
     shutil.copytree(EXAMPLE, bundle)
@@ -37,7 +41,8 @@ def configured(tmp_path):
     tools, effects = build_script_tools(
         registry.script_specs(1, generation.generation_id), executor
     )
-    return bundle, worktree, tools[0], effects
+    by_name = {tool.name: tool for tool in tools}
+    return bundle, worktree, by_name["validate_release"], effects
 
 
 def test_registered_script_exposes_only_declared_schema_and_fixed_effect(tmp_path):
@@ -47,7 +52,10 @@ def test_registered_script_exposes_only_declared_schema_and_fixed_effect(tmp_pat
     assert "entrypoint" not in tool.args
     assert "timeout" not in tool.args
     assert "env" not in tool.args
-    assert effects == {"validate_release": "read"}
+    assert effects == {
+        "validate_release": "read",
+        "write_readiness_report": "mutate",
+    }
 
 
 def test_registered_script_executes_fixed_entrypoint_in_current_worktree(tmp_path):
@@ -84,7 +92,7 @@ def test_nonzero_stderr_and_output_are_bounded(tmp_path):
         "raise SystemExit(3)\n"
     )
     validated = validate_repo_bundle(bundle)
-    spec = validated.scripts[0]
+    spec = script_named(validated, "validate_release")
     worktree = tmp_path / "other-worktree"
     worktree.mkdir()
     executor = ScriptToolExecutor(
@@ -127,7 +135,9 @@ def test_timeout_is_enforced(tmp_path):
         unsafe_local_shell=True,
     )
     with pytest.raises(TimeoutError, match="timeout"):
-        executor.invoke(validated.scripts[0], {"config_path": "unused"})
+        executor.invoke(
+            script_named(validated, "validate_release"), {"config_path": "unused"}
+        )
 
 
 def test_shell_runtime_uses_json_stdin_and_fixed_entrypoint(tmp_path):
@@ -153,7 +163,53 @@ def test_shell_runtime_uses_json_stdin_and_fixed_entrypoint(tmp_path):
     )
 
     result = executor.invoke(
-        validated.scripts[0], {"config_path": "release-policy.json"}
+        script_named(validated, "validate_release"),
+        {"config_path": "release-policy.json"},
     )
 
     assert json.loads(result) == {"config_path": "release-policy.json"}
+
+
+def test_reference_mutating_shell_tool_writes_into_the_current_worktree(tmp_path):
+    bundle = tmp_path / "bundle"
+    shutil.copytree(EXAMPLE, bundle)
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    store.upsert_repository(1, "owner/repo", "now")
+    registry = RepoConfigRegistry(store)
+    generation = registry.install(1, bundle, now="now")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    executor = ScriptToolExecutor(
+        worktree=worktree,
+        files_for=lambda spec: registry.script_files(1, generation.generation_id, spec),
+        secret_resolver=resolve_test_secrets,
+        unsafe_local_shell=True,
+    )
+    tools, effects = build_script_tools(
+        registry.script_specs(1, generation.generation_id), executor
+    )
+    tool = {item.name: item for item in tools}["write_readiness_report"]
+
+    assert effects["write_readiness_report"] == "mutate"
+    assert set(tool.args) == {"report_path", "release_id", "ready"}
+
+    result = tool.invoke(
+        {
+            "report_path": "reports/readiness.md",
+            "release_id": "2026.08.1",
+            "ready": True,
+        }
+    )
+
+    assert result.strip() == "wrote reports/readiness.md"
+    written = (worktree / "reports" / "readiness.md").read_text()
+    assert "# Release readiness: 2026.08.1" in written
+    assert "- format: markdown" in written
+    assert "- ready: true" in written
+
+    refused = tool.invoke(
+        {"report_path": "../escape.md", "release_id": "2026.08.1", "ready": False}
+    )
+    assert "exit code 2" in refused
+    assert "must be a relative path" in refused
+    assert not (tmp_path / "escape.md").exists()

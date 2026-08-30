@@ -13,9 +13,13 @@ from sweforge.repo_secrets import RepoSecretStore
 
 EXAMPLE = Path(__file__).parents[1] / "examples" / "repo-config"
 
-REMOTE_MCP = """version: 1
-servers:
-  release-service:
+# `mcp set` replaces the whole file, so a valid replacement must still satisfy
+# every MCP tool the installed workflow references.
+BASE_MCP = (EXAMPLE / "tools" / "mcp" / "servers.yaml").read_text()
+
+REMOTE_MCP = (
+    BASE_MCP
+    + """  extra_service:
     connection:
       transport: streamable_http
       url: https://mcp.example.invalid/mcp
@@ -25,6 +29,7 @@ servers:
       Authorization: RELEASE_MCP_AUTH
     tools: [lookup_release]
 """
+)
 
 NEW_TOOL = """version: 1
 name: publish_report
@@ -296,6 +301,7 @@ def test_tool_add_duplicate_replace_and_remove(tmp_path, capsys):
     added = current(state)
     assert {item["name"] for item in added.manifest["scripts"]} == {
         "validate_release",
+        "write_readiness_report",
         "publish_report",
     }
 
@@ -321,7 +327,8 @@ def test_tool_add_duplicate_replace_and_remove(tmp_path, capsys):
     assert run(state, "tool", "remove", "owner/repo", "publish_report") == 0
     assert "Removed tool: publish_report" in capsys.readouterr().out
     assert {item["name"] for item in current(state).manifest["scripts"]} == {
-        "validate_release"
+        "validate_release",
+        "write_readiness_report",
     }
 
 
@@ -330,7 +337,7 @@ def test_tool_remove_is_refused_while_the_workflow_references_it(tmp_path, capsy
     first = current(state)
     assert run(state, "tool", "remove", "owner/repo", "validate_release") == 2
     assert (
-        'cannot remove tool "validate_release": workflow task "readiness" still '
+        'cannot remove tool "validate_release": workflow task "config" still '
         "references it" in capsys.readouterr().err
     )
     assert current(state) == first
@@ -377,19 +384,19 @@ def test_mcp_set_installs_remote_secret_headers_without_exposing_values(
     assert "RELEASE_MCP_AUTH" not in output
 
     generation = current(state)
-    assert generation.manifest["mcp"] == [
-        {
-            "server_id": "release-service",
-            "connection": {
-                "transport": "streamable_http",
-                "url": "https://mcp.example.invalid/mcp",
-                "headers": {"X-Client-Version": "sweforge"},
-            },
-            "tools": ["lookup_release"],
-            "secret_env": {},
-            "secret_headers": {"Authorization": "RELEASE_MCP_AUTH"},
-        }
-    ]
+    installed = {item["server_id"]: item for item in generation.manifest["mcp"]}
+    assert set(installed) == {"release_catalog", "release_service", "extra_service"}
+    assert installed["extra_service"] == {
+        "server_id": "extra_service",
+        "connection": {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.invalid/mcp",
+            "headers": {"X-Client-Version": "sweforge"},
+        },
+        "tools": ["lookup_release"],
+        "secret_env": {},
+        "secret_headers": {"Authorization": "RELEASE_MCP_AUTH"},
+    }
 
     assert root_main(["repo", "--state-db", str(state), "show", "owner/repo"]) == 0
     shown = capsys.readouterr().out
@@ -431,8 +438,15 @@ def test_unrelated_mutations_preserve_secret_references_and_values(tmp_path, cap
     assert scripts["validate_release"]["secret_env"] == {
         "RELEASE_POLICY_TOKEN": "RELEASE_POLICY_TOKEN"
     }
-    assert generation.manifest["mcp"][0]["secret_headers"] == {
-        "Authorization": "RELEASE_MCP_AUTH"
+    assert {
+        item["server_id"]: item["secret_headers"] for item in generation.manifest["mcp"]
+    } == {
+        "release_catalog": {},
+        "release_service": {
+            "Authorization": "RELEASE_SERVICE_AUTH",
+            "X-Internal-Token": "RELEASE_SERVICE_INTERNAL_TOKEN",
+        },
+        "extra_service": {"Authorization": "RELEASE_MCP_AUTH"},
     }
     store = SQLiteGitHubStore(state)
     reopened = RepoSecretStore(store, master_key)
@@ -516,4 +530,38 @@ def test_missing_source_paths_fail_before_any_generation_is_created(
     first = current(state)
     assert run(state, *argv) == 2
     assert capsys.readouterr().err
+    assert current(state) == first
+
+
+def test_mcp_set_that_drops_a_referenced_tool_fails_atomically(tmp_path, capsys):
+    state, _bundle = configured(tmp_path)
+    first = current(state)
+    servers = tmp_path / "servers.yaml"
+    servers.write_text(
+        """version: 1
+servers:
+  release_catalog:
+    connection: {transport: stdio, command: server, args: []}
+    tools: [lookup_release]
+"""
+    )
+
+    assert run(state, "mcp", "set", "owner/repo", str(servers)) == 2
+    error = capsys.readouterr().err
+    assert "unknown tools" in error
+    assert "release_catalog_list_release_windows" in error
+    assert current(state) == first
+
+
+def test_skill_remove_is_refused_for_a_progressive_discovery_reference(
+    tmp_path, capsys
+):
+    state, _bundle = configured(tmp_path)
+    first = current(state)
+
+    assert run(state, "skill", "remove", "owner/repo", "release-catalog") == 2
+    assert (
+        'cannot remove skill "release-catalog": workflow task "readiness" still '
+        "references it" in capsys.readouterr().err
+    )
     assert current(state) == first

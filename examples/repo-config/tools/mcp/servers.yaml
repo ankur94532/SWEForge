@@ -1,0 +1,51 @@
+# Trusted operator-owned MCP capability allowlist.
+#
+# Server definitions and per-repository tool allowlists are frozen into the
+# configuration generation. The model never chooses a server, a URL, a header,
+# or a credential; it may only call the tools listed here, and every call is
+# re-authorized against this allowlist at invocation time.
+#
+# A tool listed below is reachable from the workflow as
+# `<server_id>_<tool_name>` - for example `release_catalog_lookup_release`.
+# Listing a tool here makes it *available* to be granted; a workflow phase
+# still has to name it before the model can see it.
+version: 1
+servers:
+  # Local stdio server. SWEForge spawns the process itself, so the credential
+  # channel is the process environment. The child receives a minimal
+  # environment: PATH, LANG, the fixed `env` below, and the resolved
+  # `secret_env` values - nothing else from the SWEForge process.
+  release_catalog:
+    connection:
+      transport: stdio
+      command: python
+      args: [/opt/sweforge/mcp/release_catalog_server.py]
+      env:
+        RELEASE_CATALOG_REGION: example-region
+    secret_env:
+      # process environment name -> repository secret name
+      RELEASE_CATALOG_TOKEN: RELEASE_CATALOG_TOKEN
+    tools:
+      - lookup_release
+      - list_release_windows
+
+  # Remote HTTP server. The credential channel is HTTP headers, split into two
+  # deliberately separate maps so a secret can never be typed inline:
+  #
+  #   headers         fixed, non-secret, frozen in this bundle and its digest
+  #   secret_headers  header name -> repository secret name; only the *name* is
+  #                   frozen, so rotating the value never creates a generation
+  #
+  # A server declaring `secret_headers` must use an https:// URL, and SWEForge
+  # connects with redirects disabled so credentials stay on this origin.
+  release_service:
+    connection:
+      transport: streamable_http
+      url: https://mcp.releases.example.com/mcp
+    headers:
+      X-Client-Version: sweforge-example
+    secret_headers:
+      Authorization: RELEASE_SERVICE_AUTH
+      X-Internal-Token: RELEASE_SERVICE_INTERNAL_TOKEN
+    tools:
+      - validate_release_window

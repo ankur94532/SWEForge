@@ -3,6 +3,13 @@
 Repository authority comes from an operator-installed bundle, never from files
 inside the target checkout.
 
+[`examples/repo-config`](../examples/repo-config) is a complete working bundle
+covering every element described here - a four-task workflow, five skills, two
+registered script tools, and two MCP servers - with
+[`examples/README.md`](../examples/README.md) explaining what each part
+demonstrates. Reading it alongside these steps is usually faster than starting
+from the blank template.
+
 ## Initial installation
 
 1. Create a starter bundle:
@@ -18,7 +25,9 @@ inside the target checkout.
    `tools/scripts/<tool>/`. Registered tools receive JSON arguments on standard
    input, have a fixed entrypoint and timeout, and declare `effect: read` or
    `effect: mutate`.
-5. Optionally add trusted MCP definitions in `tools/mcp/servers.yaml`.
+5. Optionally add trusted MCP definitions in `tools/mcp/servers.yaml`. Local
+   `stdio` servers and remote HTTP servers are both supported; approved tools
+   are reachable from the workflow as `<server_id>_<tool_name>`.
 6. Validate the candidate:
 
    ```console

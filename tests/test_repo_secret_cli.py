@@ -12,6 +12,14 @@ from sweforge.repo_secret_cli import main
 
 EXAMPLE = Path(__file__).parents[1] / "examples" / "repo-config"
 
+# Every credential the reference bundle references besides the script tool's
+# own RELEASE_POLICY_TOKEN: one stdio MCP server and one remote HTTP server.
+REMAINING_REFERENCES = (
+    "RELEASE_CATALOG_TOKEN",
+    "RELEASE_SERVICE_AUTH",
+    "RELEASE_SERVICE_INTERNAL_TOKEN",
+)
+
 
 def configured(tmp_path):
     state_path = tmp_path / "state.db"
@@ -32,7 +40,10 @@ def test_secret_cli_set_list_check_delete_never_displays_values(
     monkeypatch.setenv("SWEFORGE_SECRET_MASTER_KEY", Fernet.generate_key().decode())
 
     assert main(["--state-db", str(state), "check", "owner/repo"]) == 1
-    assert "RELEASE_POLICY_TOKEN\tmissing" in capsys.readouterr().out
+    missing = capsys.readouterr().out
+    assert "RELEASE_POLICY_TOKEN\tmissing" in missing
+    assert "RELEASE_CATALOG_TOKEN\tmissing" in missing
+    assert "RELEASE_SERVICE_AUTH\tmissing" in missing
     monkeypatch.setattr("sys.stdin", io.StringIO(value + "\n"))
     assert (
         root_main(
@@ -56,6 +67,13 @@ def test_secret_cli_set_list_check_delete_never_displays_values(
     output = capsys.readouterr().out
     assert output == "RELEASE_POLICY_TOKEN\tconfigured\n"
     assert value not in output
+
+    for name in REMAINING_REFERENCES:
+        monkeypatch.setattr("sys.stdin", io.StringIO(value + "\n"))
+        assert (
+            main(["--state-db", str(state), "set", "owner/repo", name, "--stdin"]) == 0
+        )
+    capsys.readouterr()
     assert main(["--state-db", str(state), "check", "owner/repo"]) == 0
     assert "All required" in capsys.readouterr().out
 
@@ -83,31 +101,13 @@ def test_secret_cli_set_list_check_delete_never_displays_values(
     assert value not in capsys.readouterr().out
 
 
-def test_secret_check_reports_missing_remote_mcp_header_credentials(
+def test_secret_check_covers_script_stdio_and_remote_mcp_references(
     tmp_path, monkeypatch, capsys
 ):
-    state_path = tmp_path / "state.db"
-    state = SQLiteGitHubStore(state_path)
-    state.upsert_repository(1, "owner/repo", "now")
-    bundle = tmp_path / "bundle"
-    shutil.copytree(EXAMPLE, bundle)
-    (bundle / "tools" / "mcp" / "servers.yaml").write_text(
-        """version: 1
-servers:
-  release-service:
-    connection:
-      transport: streamable_http
-      url: https://mcp.example.invalid/mcp
-    secret_headers:
-      Authorization: RELEASE_MCP_AUTH
-    tools: [lookup_release]
-"""
-    )
-    RepoConfigRegistry(state).install(1, bundle, now="now")
-    state.close()
+    state = configured(tmp_path)
     monkeypatch.setenv("SWEFORGE_SECRET_MASTER_KEY", Fernet.generate_key().decode())
 
-    assert main(["--state-db", str(state_path), "check", "owner/repo"]) == 1
-    output = capsys.readouterr().out
-    assert "RELEASE_MCP_AUTH\tmissing" in output
-    assert "RELEASE_POLICY_TOKEN\tmissing" in output
+    assert main(["--state-db", str(state), "check", "owner/repo"]) == 1
+    reported = {line.split("\t")[0] for line in capsys.readouterr().out.splitlines()}
+
+    assert reported == {"RELEASE_POLICY_TOKEN", *REMAINING_REFERENCES}

@@ -416,9 +416,7 @@ def test_missing_mcp_secret_fails_before_client_start(monkeypatch, tmp_path):
     assert "required_missing=1" in sink.events[0].message
 
 
-REMOTE_MCP_YAML = """version: 1
-servers:
-  release-service:
+REMOTE_MCP_YAML = """  release-service:
     connection:
       transport: streamable_http
       url: https://mcp.example.invalid/mcp
@@ -650,10 +648,22 @@ def test_repo_b_remote_server_is_invisible_to_repo_a(monkeypatch, tmp_path):
 
 
 def install_remote_bundle(tmp_path, name="remote-bundle"):
+    """Add one secret-authenticated remote server to the reference bundle."""
     bundle = tmp_path / name
     shutil.copytree(EXAMPLE, bundle)
-    (bundle / "tools" / "mcp" / "servers.yaml").write_text(REMOTE_MCP_YAML)
+    servers = bundle / "tools" / "mcp" / "servers.yaml"
+    servers.write_text(servers.read_text() + REMOTE_MCP_YAML)
     return bundle
+
+
+def configure_reference_credentials(secrets, repo_id, suffix=""):
+    """Configure the credentials the reference bundle's own servers require."""
+    for name in (
+        "RELEASE_CATALOG_TOKEN",
+        "RELEASE_SERVICE_AUTH",
+        "RELEASE_SERVICE_INTERNAL_TOKEN",
+    ):
+        secrets.set(repo_id, name, f"reference-value-{name.lower()}{suffix}")
 
 
 def test_installed_remote_generation_freezes_references_and_hides_values(tmp_path):
@@ -664,14 +674,16 @@ def test_installed_remote_generation_freezes_references_and_hides_values(tmp_pat
     first = registry.install(1, bundle, now="one")
     secrets = RepoSecretStore(state, Fernet.generate_key())
     secrets.set(1, "RELEASE_MCP_AUTH", "Bearer never-shown-value")
+    configure_reference_credentials(secrets, 1)
 
     capabilities = registry.capability_registry(1, first.generation_id)
     spec = capabilities.approved_servers(1)["release-service"]
     assert spec.secret_headers == {"Authorization": "RELEASE_MCP_AUTH"}
     assert spec.connection["headers"] == {"X-Client-Version": "sweforge"}
 
-    (bundle / "tools" / "mcp" / "servers.yaml").write_text(
-        REMOTE_MCP_YAML.replace("RELEASE_MCP_AUTH", "NEXT_RELEASE_MCP_AUTH")
+    servers = bundle / "tools" / "mcp" / "servers.yaml"
+    servers.write_text(
+        servers.read_text().replace("RELEASE_MCP_AUTH", "NEXT_RELEASE_MCP_AUTH")
     )
     second = registry.install(1, bundle, now="two")
     assert second.digest != first.digest
@@ -702,6 +714,7 @@ def test_installed_remote_generation_resolves_current_rotated_values(
     secrets = RepoSecretStore(state, Fernet.generate_key())
     secrets.set(1, "RELEASE_MCP_AUTH", "Bearer installed-value-one")
     secrets.set(2, "RELEASE_MCP_AUTH", "Bearer other-repo-value")
+    configure_reference_credentials(secrets, 1)
     calls = []
     monkeypatch.setattr(
         "sweforge.capabilities.MultiServerMCPClient", recording_client(calls)

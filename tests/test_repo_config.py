@@ -106,8 +106,8 @@ def test_behavioral_bundle_content_changes_digest(tmp_path, changed):
         )
         path.write_text(path.read_text() + "\n# version two\n")
     else:
-        source = second_path / "tools" / "mcp" / "servers.example.yaml"
-        (second_path / "tools" / "mcp" / "servers.yaml").write_text(source.read_text())
+        path = second_path / "tools" / "mcp" / "servers.yaml"
+        path.write_text(path.read_text() + MCP_ENTRY)
     assert (
         validate_repo_bundle(first_path).digest
         != validate_repo_bundle(second_path).digest
@@ -154,9 +154,6 @@ def test_repo_isolation_covers_workflow_skills_scripts_and_mcp(tmp_path):
         bundle_b / "tools" / "scripts" / "validate-release" / "validate_release.py"
     )
     script_b.write_text(script_b.read_text() + "\n# REPO B SCRIPT\n")
-    for bundle in (bundle_a, bundle_b):
-        example = bundle / "tools" / "mcp" / "servers.example.yaml"
-        (bundle / "tools" / "mcp" / "servers.yaml").write_text(example.read_text())
     generation_a = registry.install(1, bundle_a, now="a")
     generation_b = registry.install(2, bundle_b, now="b")
 
@@ -183,7 +180,7 @@ def test_cross_repo_or_unknown_authority_references_fail_install(tmp_path):
     workflow = bundle / "workflow.yaml"
     workflow.write_text(
         workflow.read_text().replace(
-            "tools: [ls, read_file, glob, grep]",
+            "tools: [ls, read_file, glob, grep, edit_file, execute]",
             "tools: [ls, read_file, repo_b_deploy]",
             1,
         )
@@ -249,9 +246,24 @@ def test_reference_bundle_is_valid_and_complete():
         "domain-model",
         "config-loading",
         "readiness-rules",
+        "release-catalog",
         "reporting",
     }
-    assert [item.name for item in bundle.scripts] == ["validate_release"]
+    assert [(item.name, item.runtime, item.effect) for item in bundle.scripts] == [
+        ("validate_release", "python", "read"),
+        ("write_readiness_report", "shell", "mutate"),
+    ]
+    assert {item.server_id: list(item.tools) for item in bundle.mcp_servers} == {
+        "release_catalog": ["lookup_release", "list_release_windows"],
+        "release_service": ["validate_release_window"],
+    }
+    readiness = bundle.workflow.task_map["readiness"]
+    assert "release-catalog" in readiness.planning.skills
+    assert "release_catalog_lookup_release" in readiness.planning.tools
+    assert (
+        "write_readiness_report"
+        in bundle.workflow.task_map["reporting"].execution.tools
+    )
 
 
 def test_secret_env_collision_and_invalid_secret_names_are_rejected(tmp_path):
@@ -278,15 +290,12 @@ def test_secret_env_collision_and_invalid_secret_names_are_rejected(tmp_path):
         validate_repo_bundle(invalid)
 
 
-def write_mcp(tmp_path: Path, name: str, document: str) -> Path:
-    bundle = bundle_copy(tmp_path, name)
-    (bundle / "tools" / "mcp" / "servers.yaml").write_text(document)
-    return bundle
+MCP_ENTRY = """  extra:
+    connection: {transport: stdio, command: server, args: []}
+    tools: [inspect]
+"""
 
-
-REMOTE_MCP = """version: 1
-servers:
-  remote:
+REMOTE_MCP = """  remote:
     connection: {transport: streamable_http, url: https://example.invalid/mcp}
     tools: [lookup]
     headers: {X-Client-Version: sweforge}
@@ -294,21 +303,33 @@ servers:
 """
 
 
+def write_mcp(tmp_path: Path, name: str, entry: str) -> Path:
+    """Add one server to the reference bundle's own MCP configuration."""
+    bundle = bundle_copy(tmp_path, name)
+    path = bundle / "tools" / "mcp" / "servers.yaml"
+    path.write_text(path.read_text() + entry)
+    return bundle
+
+
+def server_named(bundle, server_id: str):
+    return next(item for item in bundle.mcp_servers if item.server_id == server_id)
+
+
 def test_remote_mcp_secret_headers_are_accepted_and_frozen(tmp_path):
     bundle = validate_repo_bundle(write_mcp(tmp_path, "remote-ok", REMOTE_MCP))
-    server = bundle.mcp_servers[0]
+    server = server_named(bundle, "remote")
     assert server.secret_headers == {"Authorization": "REMOTE_TOKEN"}
     assert server.connection["headers"] == {"X-Client-Version": "sweforge"}
     assert server.secret_env == {}
-    assert bundle.manifest["mcp"][0]["secret_headers"] == {
-        "Authorization": "REMOTE_TOKEN"
-    }
+    assert [
+        item["secret_headers"]
+        for item in bundle.manifest["mcp"]
+        if item["server_id"] == "remote"
+    ] == [{"Authorization": "REMOTE_TOKEN"}]
 
 
 def test_remote_mcp_secret_env_is_still_rejected(tmp_path):
-    document = """version: 1
-servers:
-  remote:
+    document = """  remote:
     connection: {transport: http, url: https://example.invalid/mcp}
     tools: [lookup]
     secret_env: {TOKEN: REMOTE_TOKEN}
@@ -349,9 +370,7 @@ def test_secret_headers_require_https_and_a_remote_transport(tmp_path):
     with pytest.raises(ValueError, match="HTTPS"):
         validate_repo_bundle(write_mcp(tmp_path, "remote-plain", plaintext))
 
-    document = """version: 1
-servers:
-  local:
+    document = """  local:
     connection: {transport: stdio, command: server, args: []}
     tools: [lookup]
     secret_headers: {Authorization: REMOTE_TOKEN}

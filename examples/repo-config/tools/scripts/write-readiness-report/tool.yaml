@@ -1,0 +1,23 @@
+# A mutating shell tool. `effect: mutate` is enforced by bundle validation:
+# naming this tool in a planning or validation phase is a validation error, so
+# only an execution phase can reach it.
+version: 1
+name: write_readiness_report
+description: Render the readiness report into the worktree at a relative path.
+runtime: shell
+entrypoint: write_report.sh
+effect: mutate
+timeout_seconds: 60
+env:
+  REPORT_FORMAT: markdown
+args_schema:
+  type: object
+  properties:
+    report_path:
+      type: string
+    release_id:
+      type: string
+    ready:
+      type: boolean
+  required: [report_path, release_id, ready]
+  additionalProperties: false

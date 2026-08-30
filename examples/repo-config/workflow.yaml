@@ -1,47 +1,111 @@
+# Trusted operator-owned workflow for the release-readiness example repository.
+#
+# This file is authority. It is installed by an operator with
+# `sweforge repo configure`, frozen into an immutable configuration generation,
+# and never read from the target repository's checkout.
+#
+# Scheduling is deterministic: a task becomes ready when every task in its
+# `depends_on` list is accepted, and among ready tasks the earliest declared
+# one runs first. Exactly one task is active at a time.
+#
+# Every task runs planning -> execution -> validation. Within a phase:
+#   skill   the primary skill loaded into the phase prompt
+#   skills  additional skills the model may discover and load on demand
+#   tools   the complete capability set for the phase; anything absent here is
+#           unreachable, whatever the model asks for
+#
+# Tool names come from three namespaces:
+#   built-ins            ls, read_file, glob, grep, write_file, edit_file,
+#                        execute, run_validation, request_clarification,
+#                        search_issue_memory, propose_repo_memory
+#   registered scripts   the `name` in tools/scripts/<dir>/tool.yaml
+#   approved MCP tools   <server_id>_<tool_name> from tools/mcp/servers.yaml
+#
+# Script tools declaring `effect: mutate` are rejected in planning and
+# validation phases, so a read-only phase cannot be given a writing capability.
 version: 1
 workflow_id: release-readiness
 tasks:
+  # Establish the shared vocabulary the later tasks depend on. Nothing depends
+  # on external state yet, so this task is deliberately narrow.
   - id: model
     depends_on: []
     planning:
       skill: domain-model
-      tools: [ls, read_file, glob, grep]
+      tools: [ls, read_file, glob, grep, search_issue_memory]
     execution:
       skill: domain-model
       tools: [ls, read_file, glob, grep, edit_file, execute]
     validation:
       skill: domain-model
       tools: [read_file, glob, grep, run_validation]
+
+  # Configuration parsing. `request_clarification` is offered during planning
+  # because ambiguous compatibility requirements are worth one question before
+  # any code is written.
   - id: config
     depends_on: [model]
     planning:
       skill: config-loading
-      tools: [ls, read_file, glob, grep]
+      skills: [domain-model]
+      tools: [ls, read_file, glob, grep, request_clarification]
     execution:
       skill: config-loading
       tools: [ls, read_file, glob, grep, edit_file, execute]
     validation:
       skill: config-loading
-      tools: [read_file, glob, grep, run_validation]
+      tools: [read_file, glob, grep, run_validation, validate_release]
+
+  # Readiness rules. This task reaches outside the repository: the release
+  # catalog MCP server answers which release the rules are being evaluated
+  # against, and the registered `validate_release` script checks the policy
+  # file. Both are read-only, so both are available while planning.
   - id: readiness
     depends_on: [model]
     planning:
       skill: readiness-rules
-      tools: [ls, read_file, glob, grep]
+      skills: [domain-model, release-catalog]
+      tools:
+        - ls
+        - read_file
+        - glob
+        - grep
+        - release_catalog_lookup_release
+        - release_catalog_list_release_windows
     execution:
       skill: readiness-rules
+      skills: [release-catalog]
       tools: [ls, read_file, glob, grep, edit_file, execute]
     validation:
       skill: readiness-rules
-      tools: [read_file, glob, grep, run_validation, validate_release]
+      tools:
+        - read_file
+        - glob
+        - grep
+        - run_validation
+        - validate_release
+        - release_catalog_lookup_release
+
+  # Reporting depends on both branches above. Its execution phase is the only
+  # place a mutating registered script is reachable, and the only place the
+  # remote release service may be called.
   - id: reporting
     depends_on: [config, readiness]
     planning:
       skill: reporting
-      tools: [ls, read_file, glob, grep]
+      skills: [domain-model, readiness-rules]
+      tools: [ls, read_file, glob, grep, search_issue_memory]
     execution:
       skill: reporting
-      tools: [ls, read_file, glob, grep, edit_file, execute]
+      tools:
+        - ls
+        - read_file
+        - glob
+        - grep
+        - edit_file
+        - execute
+        - write_readiness_report
+        - release_service_validate_release_window
     validation:
       skill: reporting
-      tools: [read_file, glob, grep, run_validation]
+      tools: [read_file, glob, grep, run_validation, propose_repo_memory]

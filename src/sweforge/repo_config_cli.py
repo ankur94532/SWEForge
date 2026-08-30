@@ -40,7 +40,8 @@ provide concrete validation evidence.
 MCP_README = """# Repository MCP tools
 
 Add `servers.yaml` only when this repository uses trusted MCP capabilities.
-See `examples/repo-config/tools/mcp/servers.example.yaml` for the schema.
+See `examples/repo-config/tools/mcp/` for the schema, a local stdio server, a
+remote HTTP server, and how credentials are referenced.
 """
 
 
