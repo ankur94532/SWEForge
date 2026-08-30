@@ -122,7 +122,8 @@ def _mapping(value: object, label: str) -> dict[str, Any]:
     return value
 
 
-def _load_yaml(content: str, label: str) -> dict[str, Any]:
+def load_bundle_yaml(content: str, label: str) -> dict[str, Any]:
+    """Parse one trusted bundle document with duplicate keys rejected."""
     try:
         value = yaml.load(content, Loader=_UniqueKeyLoader)
     except yaml.YAMLError as exc:
@@ -198,6 +199,13 @@ def _header_collision(left: Mapping[str, str], right: Mapping[str, str]) -> bool
     )
 
 
+def _is_bundle_path(relative: str) -> bool:
+    """Only these trusted bundle locations may exist in a generation."""
+    return relative == "workflow.yaml" or relative.startswith(
+        ("skills/", "tools/scripts/", "tools/mcp/")
+    )
+
+
 def _read_bundle_files(root: Path) -> dict[str, str]:
     if not root.is_dir():
         raise ValueError("repository configuration bundle is not a directory")
@@ -228,12 +236,7 @@ def _read_bundle_files(root: Path) -> dict[str, str]:
                 f"bundle file is not UTF-8: {path.relative_to(root)}"
             ) from exc
         relative = path.relative_to(root).as_posix()
-        if not (
-            relative == "workflow.yaml"
-            or relative.startswith("skills/")
-            or relative.startswith("tools/scripts/")
-            or relative.startswith("tools/mcp/")
-        ):
+        if not _is_bundle_path(relative):
             raise ValueError(f"unexpected bundle path: {relative}")
         files[relative] = content
     return files
@@ -271,7 +274,7 @@ def _parse_scripts(root: Path, files: Mapping[str, str]) -> tuple[ScriptToolSpec
         content = files.get(tool_path)
         if content is None:
             raise ValueError(f"{label} is missing tool.yaml")
-        item = _load_yaml(content, label)
+        item = load_bundle_yaml(content, label)
         allowed = {
             "version",
             "name",
@@ -360,7 +363,7 @@ def _parse_mcp(files: Mapping[str, str]) -> tuple[MCPBundleServer, ...]:
     content = files.get("tools/mcp/servers.yaml")
     if content is None:
         return ()
-    root = _load_yaml(content, "MCP configuration")
+    root = load_bundle_yaml(content, "MCP configuration")
     if set(root) - {"version", "servers"} or root.get("version") != 1:
         raise ValueError("MCP configuration must contain version 1 and servers")
     servers = _mapping(root.get("servers", {}), "MCP servers")
@@ -473,7 +476,7 @@ def validate_repo_bundle(path: str | Path) -> ValidatedRepoBundle:
     )
     if collisions:
         raise ValueError(f"tool name collision: {sorted(collisions)}")
-    workflow_document = _load_yaml(workflow_content, "workflow")
+    workflow_document = load_bundle_yaml(workflow_content, "workflow")
     known_tools = set(BUILTIN_WORKFLOW_TOOLS) | script_names | mcp_names
     skill_names = {item.name for item in skills}
     workflow = parse_workflow_spec(
@@ -684,6 +687,40 @@ class RepoConfigRegistry:
         if content is None:
             raise PermissionError("required bound-generation skill is missing")
         return content
+
+    def generation_files(self, repo_id: int, generation_id: str) -> dict[str, str]:
+        """Return every immutable file installed for one configuration generation."""
+        self.generation(repo_id, generation_id)
+        rows = self.store.connection.execute(
+            "SELECT path,content FROM repo_config_files_v1 "
+            "WHERE generation_id=? ORDER BY path",
+            (generation_id,),
+        ).fetchall()
+        return {row["path"]: row["content"] for row in rows}
+
+    def materialize(self, repo_id: int, generation_id: str, target: str | Path) -> Path:
+        """Write an installed generation into staging as the canonical bundle.
+
+        The installed generation is the authority; the operator source directory
+        that produced it may have changed or disappeared.
+        """
+        root = Path(target).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        for path, content in self.generation_files(repo_id, generation_id).items():
+            relative = PurePosixPath(path)
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or not _is_bundle_path(path)
+            ):
+                raise ValueError(f"installed generation path is unsafe: {path}")
+            destination = root.joinpath(*relative.parts)
+            resolved = destination.resolve()
+            if resolved != root and root not in resolved.parents:
+                raise ValueError(f"installed generation path escapes staging: {path}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(content, encoding="utf-8")
+        return root
 
     def skill_files(self, repo_id: int, generation_id: str) -> dict[str, str]:
         self.generation(repo_id, generation_id)

@@ -32,6 +32,10 @@ def main(argv: list[str] | None = None) -> int:
         from .repo_secret_cli import main as secret_main
 
         return secret_main(selected[1:])
+    if selected[:1] in (["workflow"], ["skill"], ["tool"], ["mcp"]):
+        from .repo_admin_cli import main as admin_main
+
+        return admin_main(selected)
     args = build_parser().parse_args(selected)
     workspace = None
     try:

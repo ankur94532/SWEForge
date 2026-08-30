@@ -110,6 +110,39 @@ def canonical_skill_path(name: str) -> str:
     return f"/skills/{name}/SKILL.md"
 
 
+def _skill_frontmatter(content: str, label: str) -> dict | None:
+    """Return the authoritative frontmatter mapping, or None when absent."""
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError(f"required workflow skill is missing: {label}")
+    if not content.startswith("---"):
+        return None
+    lines = content.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError(f"skill metadata is malformed: {label}")
+    try:
+        end = next(index for index, line in enumerate(lines[1:], 1) if line == "---")
+    except StopIteration as exc:
+        raise ValueError(f"skill metadata is malformed: {label}") from exc
+    try:
+        metadata = yaml.load("\n".join(lines[1:end]), Loader=_UniqueKeyLoader)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"skill metadata is malformed: {label}") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError(f"skill metadata must be a mapping: {label}")
+    return metadata
+
+
+def declared_skill_name(content: str, label: str) -> str | None:
+    """Return the trusted name a skill file declares for itself, if any."""
+    metadata = _skill_frontmatter(content, label)
+    if metadata is None:
+        return None
+    name = metadata.get("name")
+    if not isinstance(name, str) or not _SKILL_NAME.fullmatch(name):
+        raise ValueError(f"skill metadata name is malformed: {label}")
+    return name
+
+
 def parse_skill_metadata(name: str, content: str) -> SkillMetadata:
     """Parse bounded Agent Skills-compatible frontmatter, or a safe fallback.
 
@@ -118,27 +151,13 @@ def parse_skill_metadata(name: str, content: str) -> SkillMetadata:
     metadata is authoritative and any malformed value fails closed.
     """
     path = canonical_skill_path(name)
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError(f"required workflow skill is missing: {name}")
-    if not content.startswith("---"):
+    metadata = _skill_frontmatter(content, name)
+    if metadata is None:
         return SkillMetadata(
             name=name,
             description=f"Trusted skill {name}; load for full instructions.",
             path=path,
         )
-    lines = content.splitlines()
-    if not lines or lines[0].strip() != "---":
-        raise ValueError(f"skill metadata is malformed: {name}")
-    try:
-        end = next(index for index, line in enumerate(lines[1:], 1) if line == "---")
-    except StopIteration as exc:
-        raise ValueError(f"skill metadata is malformed: {name}") from exc
-    try:
-        metadata = yaml.load("\n".join(lines[1:end]), Loader=_UniqueKeyLoader)
-    except yaml.YAMLError as exc:
-        raise ValueError(f"skill metadata is malformed: {name}") from exc
-    if not isinstance(metadata, dict):
-        raise ValueError(f"skill metadata must be a mapping: {name}")
     metadata_name = metadata.get("name")
     description = metadata.get("description")
     if not isinstance(metadata_name, str) or metadata_name != name:
