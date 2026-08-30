@@ -1,670 +1,796 @@
 # SWEForge
 
-Trusted per-repository workflows, skills, registered tools, and MCP allowlists
-can be installed as immutable bundles. See
-[Adding a repository to SWEForge](docs/adding-a-repository.md) and the complete
-[`examples/repo-config`](examples/repo-config) bundle, which is documented in
-[`examples/README.md`](examples/README.md).
+SWEForge is a GitHub-native software-engineering agent. An engineer files an
+issue that mentions `@agent`; SWEForge plans the change, gets it approved,
+implements it in an isolated per-issue worktree, validates it, publishes a
+commit and pull request, and then keeps handling follow-up feedback on the same
+issue — all under deterministic application control.
 
-SWEForge V0 is a small local walking skeleton for software-engineering agents.
-Its flow is: task → temporary Git worktree → Deep Agent → inspect/edit/test →
-diff/result.
+**Core principle: the model chooses what to do inside a state; application code
+chooses which states and which capabilities are reachable.** Phases, task
+scheduling, approvals, permits, validation evidence, publication and
+configuration are owned by SQLite transactions in SWEForge. Nothing the model
+emits — plan prose, a tool argument, or issue text — can move the workflow,
+widen a capability set, or authorize an output.
 
-## Setup
+## What SWEForge is
+
+- **One durable `IssueThread` per GitHub issue.** `github:{repo_id}:issue:{n}`
+  is the stable identity for every plan, execution, validation, publication and
+  revision belonging to that issue.
+- **A persistent per-issue branch and worktree.** `sweforge/issue-{n}`, created
+  once from a frozen base commit and reused by every later task and revision.
+- **[Deep Agents](https://github.com/langchain-ai/deepagents) as the inner agent
+  harness**, with SWEForge middleware supplying the phase-scoped tool set,
+  phase model and phase skills before every model call.
+- **LangGraph checkpoints for durable model continuation.** Conversation state,
+  summarization and native interrupts live in a checkpointer keyed by the
+  IssueThread. Checkpoints are not a second workflow state machine.
+- **A deterministic, application-owned workflow lifecycle** expressed as a
+  declarative task/phase specification the operator installs.
+- **Repo-scoped skills, registered script tools, MCP allowlists, secrets and
+  memory**, all installed by an operator as immutable configuration
+  generations — never read from the target repository's own files.
+- **GitHub App integration.** Polling for input; short-lived, repository-scoped
+  installation tokens for output. The model never holds a credential.
+- **Two interaction modes.** `MANUAL` requires a human `@agent approve` at the
+  plan and at the result. `AUTO` performs the same work and records the same
+  durable authority records automatically.
+
+## Architecture
+
+```
+GitHub issue / issue comments / PR conversation / inline review / submitted review
+        │  polling (no webhooks)
+        ▼
+GitHubPoller ──► durable SourceEvents ──► routing (issue number, or PR→thread map)
+        ▼
+IssueThread  (github:{repo_id}:issue:{n})     ← durable identity
+        ▼
+DeclarativeWorkflowController                  ← application authority
+        │   selects exactly one active task, owns every transition
+        ▼
+WorkflowRuntime (SQLite: cycles, task runs, plans, permits,
+                 executions, validations, results, approvals)
+        ▼
+DeepAgentWorkflowDriver ──► root Deep Agent (one per cycle, checkpointed)
+        │        WorkflowPolicyMiddleware: phase tools, phase model, phase skills
+        │        WorkflowSkillsMiddleware: one eager skill, or a catalog
+        ▼
+skills / built-in tools / registered scripts / MCP / sandbox / bounded investigator
+        ▼
+run_validation (deterministic diff + execution evidence) ──► finish_validation ACCEPT
+        ▼
+GitHubPublisher: one commit, one push, one PR, one publication comment
+        ▼
+post-publication learning  ·  revision feedback loops (same thread/branch/PR)
+```
+
+Deterministic application authority: which task is active, which phase it is
+in, which tools exist in that phase, whether a plan is authorized, whether
+execution may run, whether validation evidence is sufficient, whether
+publication is eligible, and what gets posted to GitHub.
+
+Model reasoning: how to investigate the repository, what the plan says, how the
+code is changed, what the validation report says, and whether a piece of user
+feedback concerns the current approval scope.
+
+## Core invariants
+
+1. Only an application-owned lifecycle gateway (`submit_plan`,
+   `finish_execution`, `finish_validation`) ends a phase. Plan-shaped prose is
+   not phase completion; the driver nudges twice and then fails closed.
+2. Exactly one task is active per cycle. Dependencies decide eligibility;
+   `active_task_id` decides ownership. Waiting states retain ownership, so no
+   peer task starts while a task waits for approval or input.
+3. Planning and validation are structurally read-only. Built-in mutation and
+   `effect: mutate` script tools are filtered out of the model's tool list and
+   rejected again at call time, even if a stale specification lists them.
+4. Every execution-phase root tool call revalidates the exact uninvalidated
+   permit for the current plan version.
+5. `@agent approve`, exactly and alone, is the only deterministic approval. It
+   must target the current pending occurrence and come from a user with proven
+   `admin`, `maintain` or `write` permission.
+6. Repository authority comes from operator-installed configuration
+   generations. Files inside the target repository are never treated as
+   workflow, skill, tool, MCP or credential configuration.
+7. A cycle is bound to one immutable workflow specification digest (and, when
+   configured, one repository configuration generation). Restart rehydrates
+   that exact specification.
+8. Fail closed. Missing sandbox, missing skill, missing credential, missing
+   evidence, stale approval, ambiguous GitHub comment match — all stop the
+   work rather than degrade it.
+
+## Quick start
 
 ```bash
 uv sync
-export SWEFORGE_MODEL=anthropic:claude-sonnet-4-6
-export ANTHROPIC_API_KEY=...
 ```
 
-Other provider model strings supported by LangChain can be used, for example
-`openai:gpt-5.5` or `google_genai:gemini-3.6-flash` or `anthropic:claude-sonnet-5`, with the corresponding
-provider package and credentials installed.
+Requires Python 3.12. Models are LangChain provider strings —
+`anthropic:claude-sonnet-5`, `openai:gpt-5`, `google_genai:gemini-3-pro` — with
+the corresponding provider package and credentials installed.
 
-## Run
+### GitHub App setup
+
+A GitHub App is the supported production credential. Install it on each
+repository you will name explicitly; SWEForge never discovers repositories.
+
+| Variable | Purpose |
+| --- | --- |
+| `SWEFORGE_GITHUB_APP_ID` | App ID (used as the JWT issuer when no Client ID is set) |
+| `SWEFORGE_GITHUB_APP_CLIENT_ID` | Optional Client ID; preferred JWT issuer when present |
+| `SWEFORGE_GITHUB_CLIENT_ID` | Legacy alias for the Client ID |
+| `SWEFORGE_GITHUB_APP_PRIVATE_KEY_PATH` | Path to the private key, kept outside any repository |
+| `SWEFORGE_GITHUB_API_URL` | REST base URL (default `https://api.github.com`) |
+| `SWEFORGE_GITHUB_API_VERSION` | `X-GitHub-Api-Version` override |
+| `SWEFORGE_GITHUB_TOKEN` | Legacy PAT fallback, used only when no App credentials are present |
+
+Authentication flow: SWEForge signs a short-lived App JWT (RS256, 9-minute
+expiry), looks up the repository's installation, and mints a repository-scoped
+installation token for a named permission profile — `contents/issues/pull_requests:
+read` for polling, and a separate `contents/issues/pull_requests: write` profile
+for writeback. JWTs and installation tokens live only in process memory and are
+refreshed before expiry. The private key is never accepted on a command line,
+logged, or written to SQLite. Both App credentials are required together; App
+credentials and the legacy token are never combined.
+
+### Run the server
+
+`sweforge-serve` runs polling and workflow advancement in one process, behind a
+host-local singleton lock on the state database.
 
 ```bash
-uv run sweforge /path/to/git/repository "Fix the failing tests"
-```
-
-The temporary worktree is preserved by default and its path is printed for
-human inspection. Use `--discard-worktree` to explicitly remove it after the
-run. Failed runs also retain their worktree for debugging.
-
-## Safety boundary
-
-The worktree isolates changes from the primary checkout, but it is not a
-security sandbox. Deep Agents' `LocalShellBackend` executes commands directly
-on the host with the process user's permissions. Do not use this V0 CLI with
-untrusted tasks or repositories.
-
-## Conceptual boundaries
-
-- TOOLS are programmatic capabilities, including approved LangChain MCP tools.
-- SKILLS are repo-scoped procedural knowledge loaded natively by Deep Agents.
-- MEMORY is repo-scoped durable knowledge in the LangGraph Store.
-- STATE is IssueThread-local workflow history and checkpoints.
-- CONTEXT is immutable invocation authority, including repository identity.
-- MODEL is the reasoning engine.
-- DEEP AGENTS is the inner agent harness.
-- LANGGRAPH is the durable orchestration/runtime.
-- SWEFORGE owns the SWE-specific lifecycle and composition.
-
-Every strict GitHub-triggered agent invocation receives its repository authority from
-the persisted IssueThread/SourceEvent, never from model text or repository
-configuration. Memory and skills use separate namespaces derived from the
-stable GitHub repository ID. MCP discovery is filtered by a trusted
-`RepoCapabilityRegistry`, and every MCP call is re-authorized by an interceptor.
-The bounded investigator inherits the same runtime context and stricter
-read-only filesystem permissions. Strict GitHub execution requires a configured provider-neutral
-sandbox backend and fails closed when none is available. Repository A therefore
-cannot discover or access repository B's memory, skills, MCP tools, workspace,
-or credentials in strict mode.
-
-`LocalShellBackend` is retained only for the standalone development harness and
-the explicit workflow `--unsafe-local-shell` escape hatch. It executes with
-host permissions and does not enforce cross-repository isolation.
-
-Shared memory and skills are read-only to ordinary task agents. Trusted
-operator APIs/CLIs and the application-controlled post-publication learning
-pass are the only mutation paths. Learning is evidence-backed and records
-`UPDATED`, `NO_UPDATE`, or `FAILED` without invalidating an already successful
-publication.
-
-## GitHub ingestion foundation
-
-The next milestone polls GitHub repositories for `@agent` mentions; it is
-polling-based rather than webhook-based and records durable `SourceEvent` and
-`IssueThread` state without executing an agent.
-
-```bash
-SWEFORGE_GITHUB_APP_ID=... \
-SWEFORGE_GITHUB_APP_PRIVATE_KEY_PATH=~/.sweforge/credentials/sweforge-dev.pem \
-uv run sweforge-github-poll \
-  --repo owner/repository \
-  --repo owner/another-repository \
-  --db ~/.sweforge/state.db
-```
-
-GitHub App authentication is the preferred model. Configure the App ID with
-`SWEFORGE_GITHUB_APP_ID` and keep its private key outside repositories at the
-path in `SWEFORGE_GITHUB_APP_PRIVATE_KEY_PATH`. A Client ID may optionally be
-set with `SWEFORGE_GITHUB_APP_CLIENT_ID`; when present it is used as the JWT
-issuer, otherwise the App ID is used. The legacy
-`SWEFORGE_GITHUB_CLIENT_ID` name is accepted as a compatibility alias. The
-private key contents are never accepted on a CLI argument, logged, or stored
-in SQLite.
-
-The App must be installed on each explicitly selected repository. Polling first
-discovers that repository's installation, then mints a short-lived,
-repository-scoped installation token with only `contents: read`, `issues: read`,
-and `pull_requests: read`. JWTs and installation tokens are held only in
-process memory and refreshed before expiry. Webhooks are not used; polling
-remains the ingestion mechanism. Writeback uses a separate narrowed
-`contents/issues/pull_requests: write` permission profile.
-
-The REST API URL can be overridden with `SWEFORGE_GITHUB_API_URL`; the version
-header can be overridden with `SWEFORGE_GITHUB_API_VERSION` or `--api-version`.
-The default is the current documented GitHub REST API version. The default
-SQLite database path can be overridden with `--db`. Do not commit keys, tokens,
-or the state database.
-
-For local development only, `SWEFORGE_GITHUB_TOKEN` remains a legacy fallback
-when App credentials are absent. App credentials always take precedence, and
-the two authentication modes are never combined.
-
-The boundary is: GitHub → poller → durable `SourceEvent`/`IssueThread`;
-execution comes later.
-
-On the first routed observation of a GitHub issue, SWEForge captures its
-interaction policy once. An `AUTO` label at that moment persists
-`interaction_mode=AUTO`; otherwise the thread is `MANUAL`. Later label changes,
-process restarts, and follow-up workflow cycles cannot change that IssueThread
-policy. Databases created before this field existed migrate safely to `MANUAL`.
-
-## One-agent declarative workflow
-
-The durable GitHub architecture has one workflow-owning root Deep Agent and an
-application-owned generic task lifecycle. The model chooses how to work within
-the current phase; SQLite transactions decide which task and phase are legally
-reachable. LangGraph checkpoints remain authoritative for conversation,
-model/tool continuation, summarization, and native interrupts. They are not a
-second workflow state machine.
-
-The production path is direct: `SWEForgeServer._worker_entry` constructs a
-`DeclarativeWorkflowController`, which uses `WorkflowRuntime` to select one
-task and `DeepAgentWorkflowDriver` to invoke the same checkpointed root graph
-under the current phase policy. Once every declared task is `DONE`, the
-existing crash-safe publisher creates one cumulative publication and
-finalization enqueues repository-memory and resolved-issue learning. The
-historical `WorkflowEngine` tables and helpers remain readable for database
-migration and offline regression fixtures, but the server and workflow CLI do
-not import or invoke that state machine.
-
-In `MANUAL` mode every task follows `PENDING -> PLANNING ->
-WAITING_FOR_PLAN_APPROVAL -> EXECUTING -> VALIDATING ->
-WAITING_FOR_RESULT_APPROVAL -> DONE`. `NEEDS_FIXES` returns the same task to
-execution; scope-changing validation invalidates its permit and returns it to
-planning. Validation `ACCEPT` publishes the exact validated result but does not
-finish a manual task. Only exact result approval makes it `DONE`.
-
-`AUTO` follows the same planning, plan publication, execution, validation, and
-validated-result publication path. Application policy records an exact AUTO
-plan permit and exact AUTO result acceptance, so it skips both human waits
-without skipping either durable authority record or any work phase.
-
-The root can delegate research to one explicitly configured read-only
-investigator. That worker inherits repository, worktree, workflow, cycle,
-active-task, phase, MCP, filesystem, and skill boundaries. It never receives
-lifecycle, mutation, permit, or scheduling gateways. This explicit worker
-overrides Deep Agents' unrestricted automatically-added worker, so delegation
-cannot bypass approval.
-
-### Trusted workflow specifications
-
-Pass `--workflow-spec /operator/path/workflow.yaml` to `sweforge-serve`. The
-path is explicit operator configuration and is never discovered in a target
-repository. Specifications are schema-versioned, canonicalized, hashed, and
-rejected before execution for malformed or duplicate IDs, missing
-dependencies, cycles, unknown tools, or malformed values. Phase skills are
-loaded from repository-scoped operator memory and fail closed when that phase
-starts if one is missing. The canonical document and digest are persisted with
-the cycle; restart rehydrates that exact specification rather than silently
-switching an in-progress cycle to newly configured policy. If omitted,
-SWEForge uses a built-in one-task `implementation` workflow through the same
-controller, approval, validation, and publication path.
-
-```yaml
-version: 1
-workflow_id: release-change
-tasks:
-  - id: api
-    depends_on: []
-    planning:
-      skill: api-planning
-      tools: [read_file, glob, grep]
-    execution:
-      skill: api-execution
-      tools: [read_file, write_file, edit_file, execute]
-    validation:
-      skill: api-validation
-      tools: [read_file, glob, grep, run_validation]
-  - id: docs
-    depends_on: [api]
-    planning:
-      skill: docs-planning
-      tools: [read_file, glob, grep]
-    execution:
-      skill: docs-execution
-      tools: [read_file, write_file, edit_file, execute]
-    validation:
-      skill: docs-validation
-      tools: [read_file, glob, grep, run_validation]
-```
-
-Task declaration order is the deterministic tie-breaker. Exactly one
-`active_task_id` is persisted. A task retains ownership while waiting for
-plan approval, result approval, or input, executing, validating, repairing, or
-replanning; no eligible peer starts. When it reaches `DONE`, ownership is
-released and the first
-declaration-order pending task whose dependencies are all `DONE` is selected.
-All tasks share the IssueThread worktree and cumulative branch. One final
-commit/push/PR publication is authorized only after every task is `DONE`, no
-task is active, and every final plan, permit, execution, validation, and result
-approval identity still matches.
-
-### Plan and phase authorization
-
-The root agent must call `submit_plan`; plan-like prose is not phase
-completion. SWEForge first publishes or reconciles the versioned plan comment
-and binds its digest to the thread/cycle/workflow/task run. In `MANUAL`, a
-native LangGraph plan-approval interrupt then requires exact `@agent approve`
-on the correct conversation after the visible plan, from a user whose `admin`,
-`maintain`, or `write` permission can be proven. In `AUTO`, application policy
-immediately records equivalent exact-plan authorization with AUTO provenance.
-Plan feedback replans the same task, supersedes the old plan, and requires a
-new exact permit.
-
-Planning is structurally read-only. Before each model call middleware re-reads
-the authoritative task, filters the registered union of tools to the phase
-allowlist, selects the configured phase model, and discloses only the active
-phase skill. Every tool call is checked again immediately before execution;
-every execution-phase root call also revalidates the exact permit. Planning
-and validation filter built-in mutation even if a stale specification lists
-it. Waiting phases run neither root nor delegated model work.
-
-`finish_execution` records the model report together with application-captured
-sandbox command observations and enters `VALIDATING`, never `DONE`. Validation
-must call the application-owned `run_validation` tool, which captures the
-cumulative Git diff and durable task execution records. `finish_validation`
-cannot accept without that record. On `ACCEPT`, SWEForge publishes one bounded,
-idempotently marked result comment tied to the exact execution and validation.
-Manual result feedback keeps the same task and cumulative worktree, preserves
-the previous plan/execution/validation context, invalidates stale authority,
-and produces a complete superseding plan version rather than resetting work.
-
-Final publication independently rechecks the plan digest, provenance-correct
-uninvalidated permit, matching successful execution observations, latest exact
-`ACCEPT` validation, result-comment identity, and non-stale exact result
-approval for every declared task. A validated task still waiting for result
-approval cannot unlock a dependency or authorize publication.
-
-Comments must start with `@agent` to be actionable. The controller routes
-plan approval, result approval, plan/result feedback, and clarification replies
-only to the exact pending interrupt occurrence. Other follow-ups remain durable inputs for a later
-cycle; queued legacy deferred inputs are consumed by the same declarative
-controller after migration. Control comments cannot later become independent
-coding executions. Plan comments, validated-result comments, and cumulative
-publication use deterministic identities so retries do not duplicate them.
-Repository memory remains read-only to the root and delegated agents.
-
-## Repository-scoped long-term memory
-
-IssueThread conversation state and repository memory have separate lifetimes:
-
-- Short-term/thread memory is the LangGraph checkpoint in
-  `~/.sweforge/checkpoints.sqlite` and belongs to one IssueThread.
-- Long-term/repository memory is the LangGraph SQLite Store in
-  `~/.sweforge/memory.sqlite` and is shared by all IssueThreads for one
-  repository.
-
-Memory is keyed by the stable GitHub `repo_id`, not by an issue number, thread
-ID, workspace path, or repository display name. IssueThreads in one repository
-share `("sweforge", "repo", repo_id)`; another repository receives a separate
-namespace.
-
-The canonical file is `/memories/AGENTS.md`. It is initialized with a minimal
-header when a repository first executes. Task agents can read it through
-Deep Agents' native `memory=["/memories/AGENTS.md"]` loading, but native
-filesystem permissions deny agent writes to `/memories/**`. Repository memory
-is currently operator-managed; SWEForge does not automatically extract task
-summaries or let untrusted issue text update shared memory.
-
-Use the trusted operator CLI to inspect or seed memory. The repository must
-already have been observed by the GitHub poller so its stable ID can be
-resolved from `state.db`:
-
-```bash
-uv run sweforge-repo-memory \
-  --state-db ~/.sweforge/state.db \
-  --memory-db ~/.sweforge/memory.sqlite \
-  --repo owner/repository show
-
-uv run sweforge-repo-memory \
-  --state-db ~/.sweforge/state.db \
-  --repo owner/repository replace --file /tmp/repository-memory.md
-
-uv run sweforge-repo-memory \
-  --state-db ~/.sweforge/state.db \
-  --repo owner/repository append --text "Run tests with mvn test."
-```
-
-Trusted repository skills are managed separately and are mounted at
-`/skills/` through the repo-scoped Store namespace:
-
-```bash
-uv run sweforge-repo-skills --state-db ~/.sweforge/state.db \
-  --repo owner/repository list
-uv run sweforge-repo-skills --state-db ~/.sweforge/state.db \
-  --repo owner/repository put build/SKILL.md --file /secure/operator/path/SKILL.md
-```
-
-The memory database is separate from `state.db` and the checkpoint database,
-is never placed in a worktree, and is not exposed through the task shell
-environment. Operator writes are trusted inputs and should not contain
-credentials, secrets, conversation history, chain-of-thought, or temporary
-debug output.
-
-## Development-stage IssueThread execution
-
-The one-shot executor extends that boundary to:
-
-GitHub poll → `SourceEvent` → `IssueThread` → persistent local worktree →
-Deep Agent + LangGraph thread checkpoint.
-
-```bash
-uv run sweforge-github-execute \
+SWEFORGE_GITHUB_APP_ID=123456 \
+SWEFORGE_GITHUB_APP_PRIVATE_KEY_PATH=~/.sweforge/credentials/sweforge.pem \
+SWEFORGE_SECRET_MASTER_KEY_FILE=~/.sweforge/credentials/secret.key \
+uv run sweforge-serve \
+  --repo-path owner/repository=/srv/checkouts/repository \
+  --planning-model anthropic:claude-opus-4-5 \
+  --execution-model anthropic:claude-sonnet-5 \
+  --review-model anthropic:claude-opus-4-5 \
   --db ~/.sweforge/state.db \
   --checkpoints ~/.sweforge/checkpoints.sqlite \
   --memory-db ~/.sweforge/memory.sqlite \
   --workspace-root ~/.sweforge/workspaces \
   --lock-root ~/.sweforge/locks \
-  --repo-path owner/repository=/Users/me/repository \
-  --model provider:model
+  --sandbox-provider my-sandbox \
+  --workers 4 \
+  --poll-interval 30
 ```
 
-Execution is explicitly one-shot: one invocation claims at most one routed
-event. `--repo-path` mappings are trusted local checkouts. Worktrees
-remain under `~/.sweforge/workspaces/{repo_id}/issue-{number}/`, while
-checkpoints live in their separate SQLite file. The same deterministic
-`IssueThread.thread_id` is the LangGraph `thread_id`, so follow-up events reuse
-both the worktree and checkpointed conversation. On first initialization,
-SWEForge holds the repository Git lock, fetches `origin main`, resolves
-`refs/remotes/origin/main`, and creates `sweforge/issue-{number}` at that exact
-commit without switching or pulling the source checkout. The persisted
-`base_commit` is then frozen: reopening the issue never rebases or resets its
-cumulative worktree, while a later issue may begin at a newer remote main.
-Fetch or worktree failure fails closed. Per-thread locks allow
-different issues to execute independently; this SQLite checkpointer is for the
-local milestone, not final production scale.
+| Option | Meaning |
+| --- | --- |
+| `--repo-path OWNER/REPO=PATH` | Required, repeatable. Trusted local checkout for one repository. |
+| `--model` | Default for planning/execution/review when a role model is not given. |
+| `--planning-model` / `--execution-model` / `--review-model` | Per-phase models. All three must resolve, directly or through `--model`. |
+| `--memory-model` / `--resolution-model` / `--clarification-model` | Learning and clarification models; default to review / memory / execution respectively. |
+| `--db`, `--checkpoints`, `--memory-db`, `--workspace-root`, `--lock-root` | Durable state locations (all default under `~/.sweforge/`). |
+| `--sandbox-provider NAME` | Selects a backend registered under the `sweforge.sandbox_backends` entry-point group. |
+| `--unsafe-local-shell` | Development escape hatch: run commands directly on the host instead of a sandbox. |
+| `--workflow-spec PATH` | Operator YAML workflow used for repositories that have no installed configuration. |
+| `--capabilities-config PATH` | Operator JSON MCP registry used the same way. |
+| `--once` | Poll once, drain discovered work, exit. |
+| `--workers`, `--max-ticks`, `--poll-interval`, `--initial-lookback-minutes` | Dispatch bounds (defaults 4, 20, 30s, 10 minutes). |
+| `--ready-file PATH` | Written after the singleton lock is held and the first poll ran. |
+| `--debug-agent`, `--debug-agent-tools` | Bounded, redacted tracing (see below). |
 
-### Crash recovery
+Worker failures are persisted with bounded exponential backoff, so restarting
+does not create a retry storm. After three consecutive dispatcher failures for
+a thread, its active task is terminally failed rather than retried forever.
 
-If a process dies after claiming an event, its `RUNNING` row can be recovered
-only after the configured age threshold and only when the same host-local
-`fcntl` lock is free. `recover-stale` marks it `INTERRUPTED`; it never retries
-automatically. Operators may explicitly `retry` or `skip` failed/interrupted
-events. Retries preserve the worktree and LangGraph thread/checkpoint, while
-skipped events are resolved for per-thread ordering. LangGraph owns graph state;
-the outer SQLite database owns SourceEvents and execution status. Tool side
-effects remain potentially ambiguous if a process dies mid-operation, so
-distributed workers require a different lease/lock mechanism.
+## Repository onboarding
+
+Everything SWEForge trusts for a repository — its workflow, skills, registered
+tools, MCP allowlist and credential references — is installed by an operator as
+an immutable **configuration generation**. Nothing is read from the target
+repository's checkout. See
+[Adding a repository to SWEForge](docs/adding-a-repository.md) for the full
+guide and [`examples/repo-config`](examples/repo-config) for a complete working
+bundle, explained in [`examples/README.md`](examples/README.md).
+
+The repository must already have been observed by the poller (so its stable
+GitHub `repo_id` is known) before configuration can be installed.
+
+### Initial configuration
 
 ```bash
-uv run sweforge-github-execution --db ~/.sweforge/state.db status
-uv run sweforge-github-execution --db ~/.sweforge/state.db recover-stale
-uv run sweforge-github-execution --db ~/.sweforge/state.db retry EVENT_KEY
-uv run sweforge-github-execution --db ~/.sweforge/state.db skip EVENT_KEY
+sweforge repo init owner/repo                              # writes ./owner-repo-sweforge
+sweforge repo validate owner/repo ./owner-repo-sweforge    # validate a candidate bundle
+sweforge repo configure owner/repo ./owner-repo-sweforge   # install atomically
+sweforge repo show owner/repo                              # safe metadata only
 ```
 
-### Crash-safe GitHub writeback
+`repo init` writes a starter template and installs no authority. `repo validate`
+with a path checks a candidate directory; with no path it re-validates the
+currently installed generation. `repo configure` validates the entire bundle and
+installs the next generation in one transaction. `repo show` prints generation
+number, digest, workflow id and task ids, skill names and descriptions, script
+names/effects/credential status, and MCP servers — never skill bodies, script
+sources or secret values. All commands take `--state-db` (default
+`~/.sweforge/state.db`).
 
-### Execution review and repair
+### Bundle layout
 
-The single root agent can select provider-neutral models by phase:
+```
+owner-repo-sweforge/
+  workflow.yaml            declarative tasks, phases, capability grants
+  skills/
+    <name>/SKILL.md        YAML frontmatter (name, description) + procedural body
+    <name>/*.md            optional supporting files, loaded on demand
+  tools/
+    scripts/<dir>/tool.yaml     registered script definition
+    scripts/<dir>/<entrypoint>  python or shell entrypoint
+    mcp/servers.yaml            trusted MCP servers and per-tool allowlist
+```
 
-- `planning_model`: use a high-quality model for planning and replanning.
-- `execution_model`: a lower-cost model may perform the approved implementation.
-- `review_model`: use a high-quality model during `VALIDATING`.
+### Incremental workflow / skill / tool / MCP updates
 
-Model selection does not construct separate planner/executor/reviewer workflow
-owners. The durable flow is `plan -> approve -> execute -> validate ->
-repair/validate loop -> ACCEPT`; after all tasks accept, SWEForge publishes
-once. Validation is structurally read-only, and publication is unavailable
-until every task's latest successful attempt has exact matching `ACCEPT`
-evidence.
-
-After a successful execution, publish one result with the App credentials:
+Rebuilding a whole bundle to change one file is unnecessary:
 
 ```bash
-uv run sweforge-github-publish --db ~/.sweforge/state.db \
-  --lock-root ~/.sweforge/locks
+sweforge workflow set owner/repo ./workflow.yaml
+
+sweforge skill add owner/repo ./skills/reporting
+sweforge skill add owner/repo ./skills/reporting --replace
+sweforge skill remove owner/repo reporting
+
+sweforge tool add owner/repo ./tools/scripts/deploy
+sweforge tool add owner/repo ./tools/scripts/deploy --replace
+sweforge tool remove owner/repo prod_deploy
+
+sweforge mcp set owner/repo ./tools/mcp/servers.yaml
 ```
 
-Writeback durably records commit, push, pull request, comment, and completion
-states. It commits only non-empty IssueThread changes using the deterministic
-message `sweforge: address issue #N`, pushes only the IssueThread branch, and
-refuses divergent remote branches. Existing pull requests and comments are
-reconciled by repository/branch/base and the stable marker
-`<!-- sweforge:publication:<event-key> -->`; ambiguous matches fail safely.
-Use `--retry EVENT_KEY` for a publication recorded as `FAILED`.
+Each command materializes the complete current bundle **from the installed
+immutable generation** — not from the operator source directory, which may have
+changed or disappeared — applies exactly one staged change, validates the whole
+resulting bundle, and installs the next generation atomically. A validation
+failure leaves the current generation untouched.
 
-Git HTTP authentication uses a short-lived installation token through a
-temporary `GIT_ASKPASS` helper. The token is never placed in a remote URL,
-Git config, SQLite state, or command-line argument. The publisher derives the
-credential-free HTTPS remote from the configured GitHub API host and does not
-trust an arbitrary credential-bearing remote. Publication failures preserve
-the workspace and durable progress for retry.
-## Human-input routing
+Names are authoritative, not directory names: a skill's name comes from the
+`name:` in `SKILL.md` frontmatter and a script's from `tool.yaml`. Adding a name
+that already exists fails unless `--replace` is given. A skill or tool the
+workflow still references cannot be removed.
 
-An `IssueThread` is the durable conversation identity; each planning, execution,
-review, publication, and learning sequence is a cycle within that thread.
-Unsolicited `@agent` input is planning input while planning and is a durable
-next-cycle follow-up once execution, review, repair, or publication is active.
-It is never injected into execution or `REVIEW_EXECUTION`.
-
-An execution agent may instead use the application-owned clarification tool when
-specific missing information prevents safe continuation. The tool performs a
-native LangGraph checkpoint interrupt; no later tool/action in that run proceeds
-before the answer. SWEForge persists the request, enters `WAITING_FOR_INPUT`,
-and routes the question back to its issue, PR conversation, or inline review
-thread. A restart reconciles an open request with the interrupted execution and
-retries clarification posting idempotently. An unambiguous, provenance-matched
-answer resumes the same checkpoint and cycle.
-
-Resume is selected by interrupt occurrence, not by clarification ordering. Each
-`request_clarification` call carries its tool-call id as an `occurrence_key`,
-and the answer handed back to LangGraph is the one persisted for the occurrence
-that is actually pending in the checkpoint. Two clarifications in one cycle
-therefore each receive their own answer. When the pending occurrence has no
-answer, SWEForge does not invoke the graph at all: invoking a graph that holds
-a pending interrupt makes LangGraph reuse the previous `Command(resume=...)`
-value, so running would feed that interrupt a stale answer. Review repairs are
-not given the clarification sink, so the tool is never registered for a repair
-run and a repair cannot strand a pending interrupt on the shared checkpoint. A scope-changing or ambiguous
-answer does not reuse the old authorization. Mixed answers retain a distinct,
-durable residual follow-up identity for the next planning cycle. Repair runs do
-not expose the clarification tool; review findings remain internal repair input.
-
-`SourceEvent` is immutable external GitHub provenance, while a logical workflow
-input is the application-owned actionable unit consumed by planning and a
-cycle. Ordinary inputs use their event key as their logical identity; residual
-follow-ups use their durable `deferred_id`. One SourceEvent may therefore
-produce multiple logical inputs, such as a clarification answer and a residual
-task. Each cycle persists both the originating `root_event_key` and the
-selected logical root identity so restart and later execution retain the same
-provenance and input selection.
-
-## Lifecycle identity
-
-`SourceEvent` is provenance, not the unique identity of any work. Every layer
-below it is scoped to the exact lifecycle it belongs to:
-
-| Layer | Question it answers | Identity |
-| --- | --- | --- |
-| SourceEvent | Which GitHub event originated this? | `root_event_key` / `source_event_key` |
-| Logical input | What actionable task was this? | `root_input_id` (event key, or a durable `deferred_id`) |
-| Cycle | Which workflow lifecycle? | `thread_id` + `cycle_id` |
-| Execution | Which execution? | `execution_id` |
-| Publication | Which output/idempotency state? | `publication_id` |
-| Memory learning | Which post-publication learning? | `learning_id` |
-
-`execution_id`, `publication_id` and `learning_id` are all deterministic over
-`(thread_id, cycle_id, root_input_id)`, so a restart or retry recomputes the
-same identity and never invents a second one.
-
-One SourceEvent may back several cycles. A mixed human reply can answer an open
-clarification for the running cycle and leave a residual follow-up that becomes
-the next cycle, and one event can queue several residual tasks. Those cycles
-each get their own execution, publication, execution-summary comment and
-learning record, while all of them retain the same `source_event_key`:
-
-```
-SourceEvent S
-  ├── logical input D1 → cycle A → execution E1 → publication P1 → learning M1
-  └── logical input D2 → cycle B → execution E2 → publication P2 → learning M2
+```console
+$ sweforge skill add owner/repo ./skills/reporting
+Repository: owner/repo
+Generation: 4
+Digest: 9f2c...
+Added skill: reporting
 ```
 
-Publication is authorized from the current cycle only. Eligibility proves that
-this exact thread, cycle, logical input, plan version, execution, attempt and
-ACCEPT review all agree; an ACCEPT for `D1` therefore cannot authorize `D2`, and
-`D2` cannot reuse `D1`'s publication. Finalization is a single guarded
-mutation: it marks that cycle's plan `EXECUTED`, creates that cycle's learning
-record and returns the thread to `IDLE`, all under exact
-thread/cycle/logical-input predicates. A stale publication fails closed — it
-stays readable and reconcilable, but it can never finalize, publish for, or
-otherwise mutate a newer cycle. Queued sibling logical inputs stay queued and
-are discovered by `next_workflow_input`.
+**Generation binding.** An IssueThread binds the repository's current generation
+when it is first ingested. Later updates affect new issues only: existing
+IssueThreads — including their restarts, revisions, skills, scripts and MCP
+allowlists — keep the generation they were created with. Repositories with no
+installed configuration fall back to the server's `--workflow-spec` /
+`--capabilities-config`, or to a built-in single-task `implementation` workflow.
 
-The execution-summary comment marker is scoped to `publication_id`, so retrying
-one publication finds and reuses its own comment while a different lifecycle
-from the same SourceEvent legitimately posts its own. Publication comments use
-the same scoping. Repository-memory learning belongs to the completed
-lifecycle: it is only ever written through its own `learning_id`, and the
-`IDLE` retry finishes the oldest unfinished record for the thread before the
-next logical input is selected, so a stalled record from an earlier cycle can
-neither block nor overwrite a newer one and can never mutate workflow state.
+### Repository secrets
 
-## Locking and crash recovery
+Runtime credentials for registered scripts and MCP servers are encrypted at
+rest with Fernet, under an operator-owned master key:
 
-Three cross-process locks, all `flock`-based so a crashed holder releases them:
-
-| Lock | Key | Guards | Duration |
-| --- | --- | --- | --- |
-| IssueThread | `thread_id` | one thread's execution, review, repair, recovery and publication | a whole run, including model calls |
-| Repository Git | authoritative `repo_id` | shared Git administration: creating a thread's worktree and its branch | a few local Git commands |
-| Repository memory | authoritative `repo_id` | appending to one repository's `AGENTS.md` | one read-modify-write |
-
-**The one legal order is IssueThread lock → repository Git lock → release.** No
-path may take an IssueThread lock while holding a repository Git lock;
-`thread_lock` raises `LockOrderError` rather than deadlocking, so an inversion
-is a test failure instead of a hang.
-
-The repository Git lock is deliberately narrow. Per-worktree work — `status`,
-`diff`, `commit` on the thread's own branch — is not shared state, and each
-thread owns a distinct branch, so Git's own per-ref locking already covers it.
-Only `ThreadWorkspace.create` needs serialization, because it is check-then-
-create over the repository's worktree registry and branch namespace. Two
-workers racing the same thread's worktree used to leave *both* failed, with the
-loser's cleanup deleting the winner's directory and a branch surviving with no
-worktree — a permanently unusable thread. Creation now runs whole under the
-lock: one winner, and the loser gets the ordinary fail-closed error. A branch
-left behind by a crash mid-`worktree add` is reattached rather than recreated,
-so a crash no longer wedges the thread either.
-
-The lock never spans a model call, a test run, review, memory learning or
-GitHub API traffic, so long-running work in different IssueThreads of the same
-repository stays fully concurrent. Publication takes only the IssueThread lock —
-it performs no shared Git administration — so publishing is never serialized
-behind another thread's worktree setup and cannot participate in a lock cycle.
-
-### Orphaned executions
-
-If a worker dies mid-execution the thread is left `EXECUTING` with a `RUNNING`
-attempt. Recovery runs under the IssueThread lock, because holding it is the
-only trustworthy proof that no worker is still alive; if the lock is taken the
-answer is BUSY and nothing is mutated. With the lock held: a durably `SUCCEEDED`
-execution is reconstructed into review without re-running anything, and a
-genuine orphan is handed back for retry under the *same* cycle, plan, permit,
-branch, workspace and logical execution identity. Nothing ever infers success
-from a dirty worktree, and partial work is preserved rather than reset.
-
-Retries are bounded by the attempt's existing `retry_count`, which is committed
-immediately before each run — so a hard crash consumes budget instead of
-resetting it. After three executions of one INITIAL attempt the cycle fails
-closed to `REVIEW_BLOCKED` with the attempt `FAILED`: no publication, no plan
-completion, no solved-issue record, and no further model spend.
-
-## Two kinds of memory
-
-SWEForge keeps two deliberately separate forms of durable knowledge. They
-inform each other but never merge.
-
-**Repository memory** answers *what should future agents know about how this
-repository works?* It is compact, broadly loaded into every execution agent as
-`/memories/AGENTS.md`, and only ever written by the application's
-evidence-backed validator.
-
-> Integration tests run with `./gradlew integrationTest`.
-
-**Resolved-issue memory** answers *have we solved something like this before?*
-It is structured case history, repository-scoped, and retrieved rather than
-loaded.
-
-> #142 — bulk discount failed above $100 because subtotal cents were divided
-> before `DiscountPolicy`; removed the division; pricing tests passed.
-
-The distinction is a trust boundary. A case is what one lifecycle diagnosed at
-the time it was fixed; it is a clue for future work, never repository truth.
-"#88 was fixed by bypassing cache X" must never become "cache X should always
-be bypassed". A historical case may motivate a repository-memory proposal, but
-it is never sufficient evidence on its own: durable repository knowledge is
-admitted only when grounded in current repository lines that the application
-reads and verifies itself.
-
-### Nominating repository knowledge
-
-Curation after publication sees the cumulative diff, so on its own it can only
-cite files the task changed, and only their first window of lines. Knowledge
-found while *reading* — build and test commands, conventions, configuration
-locations, dependency relationships — used to be unreachable.
-
-Execution agents can now call `propose_repo_memory(category, fact,
-durability_reason, path, start_line, end_line)`. The tool writes nothing. The
-model nominates only *where* the evidence is; SWEForge reads those lines from
-the authoritative worktree and derives the excerpt and hash itself, so a model
-can never assert repository content it did not find. Paths that are absolute or
-escape the worktree, inverted or out-of-range line spans, empty spans and
-secret-looking evidence are all refused. Proposals are stored per lifecycle
-with a deterministic identity, then re-verified against the live worktree after
-publication and put through the same validator, deduplication and repository
-lock as diff-derived candidates. Because proposals are validated on their own,
-the gap closes even when no curator model is configured.
-
-Repository memory stays write-denied to the agent: `/memories/**` and
-`/skills/**` remain deny rules, and the validator is still the only writer.
-
-### How a case is created and used
-
-Historical cases are automatic, with no model discretion over whether the job
-exists. Finalization creates the record in the same transaction that marks the
-plan executed, so only genuinely finalized lifecycles produce one — failed,
-review-blocked, unapproved or incomplete work never claims to have solved
-anything. Identity is `stable(thread_id, cycle_id, root_input_id)`, matching
-execution, publication and learning, so one issue worked in three cycles yields
-three independent cases while `issue_number` and `thread_id` still group them.
-The issue's canonical title and body are snapshotted during ingestion from
-payloads the poller already holds, so learning never needs its own network call.
-
-Retrieval is local and deterministic: SQLite FTS5/BM25 over the case rows,
-always filtered by authoritative `repo_id`, so one repository can never read
-another's history. The index is derived and rebuildable; the rows are
-authoritative. The built-in workflow exposes `search_issue_memory` during
-planning, and custom specifications may explicitly expose it in a read-only
-phase. Results are capped at one per IssueThread so a single noisy issue cannot
-flood context. Cases are always framed as clues to verify against current code,
-and the approved plan remains the only thing that authorizes work.
-
-Both learning lanes are optimizations, never authorization inputs. Each claims
-its attempt durably *before* invoking a model, so a hard crash consumes budget
-instead of retrying forever; each is bounded at three attempts and then left
-FAILED with its error while the thread proceeds to its next logical input. A
-lifecycle that ran with no curator configured is recorded distinctly from one
-that curated and found nothing.
-
-Learning never gates delivery. Repository memory is an optimization, not an
-authorization input, so a curator that keeps failing is retried a bounded
-number of times and then left FAILED with its error for diagnosis while the
-thread proceeds to its next logical input. A lifecycle that completed with no
-curator configured is recorded explicitly rather than as an ordinary
-"nothing durable found" result.
-
-Databases written before this model are migrated in place. An event-keyed
-publication or learning row is an ordinary lifecycle, so its logical input is
-its event key; every field, status, SHA, PR, comment id and proposal is
-retained, the SourceEvent stays as provenance, and reopening is idempotent.
-Event-key lookups survive as diagnostics (`publication_for_event`,
-`repo_memory_learning`) and fail closed when a SourceEvent turns out to back
-more than one lifecycle.
-
-### Running the durable dispatcher
-
-`sweforge-serve` runs polling and workflow advancement in one process. It uses
-one SQLite state database, a bounded worker pool, a host-local singleton lock,
-and separate SQLite resources per worker. `--once` performs one poll, drains
-the discovered work, and exits; normal mode keeps polling until interrupted.
+- `SWEFORGE_SECRET_MASTER_KEY` — the key value directly, or
+- `SWEFORGE_SECRET_MASTER_KEY_FILE` — a path to the key; its permissions must be
+  `0600` or stricter, or loading fails.
 
 ```bash
-sweforge-serve --repo-path owner/repository=/path/to/checkout \
-  --model provider/model --once
+sweforge secret set owner/repo DEPLOY_API_TOKEN      # hidden prompt
+sweforge secret set owner/repo DEPLOY_API_TOKEN --stdin
+sweforge secret list owner/repo                      # names only
+sweforge secret delete owner/repo DEPLOY_API_TOKEN
+sweforge secret check owner/repo                     # exits 1 if a reference is unconfigured
 ```
 
-Use `--planning-model`, `--execution-model`, and `--review-model` to set role
-models independently. Worker failures are persisted with bounded exponential
-backoff, so restarting the process does not create a retry storm. GitHub
-credentials use the same App or legacy-token environment variables as the
-one-shot poll/workflow commands; secrets are never printed.
+Names must match `[A-Z_][A-Z0-9_]*` and values must be at least 8 characters.
+`secret check` compares the `secret_env` / `secret_headers` references in the
+installed generation's manifest against what is configured, and lists what is
+missing.
 
-Pass `--debug-agent` for optional live human-readable tracing on stderr. It is
-off by default and reports model start, newly completed assistant-visible text,
-model end, tool and bounded investigator boundaries, lifecycle gateways, phase
-transitions, validation verdicts, approval interrupts/resumes, AUTO or HUMAN
-authorization, and server dispatch activity. Every physical line carries
-thread, cycle, task, and phase identity where available, so concurrent workers
-remain distinguishable. For deeper tool debugging, `--debug-agent-tools` also
-includes sanitized, size-bounded arguments and results and implies
-`--debug-agent`.
+Configuration is referenced by name, so:
+
+- ciphertext, never plaintext, is stored in the state database;
+- **reference names are part of the configuration digest; values are not**, so
+  rotating a value takes effect on the next call from existing issues without
+  creating a new generation;
+- values are resolved only at the execution boundary — the registered script's
+  minimal process environment, or the MCP connection's env/headers;
+- a missing required value fails closed with a message naming the secret;
+- values are not placed in prompts, model tool schemas, skills, checkpoints,
+  memory, worktrees, the generic `execute` environment, or traces, and exact
+  values are redacted from script stdout/stderr and error text.
+
+Scripts and local stdio MCP servers use `secret_env` (process environment name →
+repository secret name). Remote MCP servers use fixed `headers` plus
+`secret_headers` (header name → secret name); a server declaring
+`secret_headers` must use `https://`, and SWEForge connects with redirects
+disabled so credentials stay on the configured origin.
+
+## Workflow model
+
+### Tasks, phases and deterministic scheduling
+
+A workflow specification is operator-owned YAML. It is schema-versioned,
+canonicalized, hashed, and rejected before any execution for unknown fields,
+malformed or duplicate ids, missing dependencies, dependency cycles, unknown
+tool names, or references to skills that do not exist in the bundle.
+
+```yaml
+version: 1
+workflow_id: release-readiness
+tasks:
+  - id: model
+    depends_on: []
+    planning:
+      skill: domain-model
+      tools: [ls, read_file, glob, grep, search_issue_memory]
+    execution:
+      skill: domain-model
+      tools: [ls, read_file, glob, grep, edit_file, execute]
+    validation:
+      skill: domain-model
+      tools: [read_file, glob, grep, run_validation]
+
+  - id: reporting
+    depends_on: [model]
+    planning:
+      skill: reporting
+      skills: [domain-model]                 # discoverable on demand
+      tools: [ls, read_file, glob, grep]
+    execution:
+      skill: reporting
+      tools: [ls, read_file, glob, grep, edit_file, execute, write_readiness_report]
+    validation:
+      skill: reporting
+      tools: [read_file, glob, grep, run_validation, propose_repo_memory]
+```
+
+Tool names come from three namespaces: built-ins (`ls`, `read_file`, `glob`,
+`grep`, `write_file`, `edit_file`, `execute`, `run_validation`,
+`request_clarification`, `search_issue_memory`, `propose_repo_memory`),
+registered script names from `tool.yaml`, and approved MCP tools as
+`<server_id>_<tool_name>`. A phase's `tools` list is the complete set of
+capabilities reachable in that phase; anything absent is unreachable.
+
+Scheduling is deterministic and serialized:
+
+- a task is eligible when every task in `depends_on` is `DONE`;
+- among eligible tasks, **declaration order** decides;
+- exactly one `active_task_id` is persisted per cycle;
+- the active task keeps ownership while planning, waiting for plan approval,
+  executing, validating, waiting for result approval, waiting for input,
+  repairing or replanning — a ready peer does not start;
+- tasks are serialized even when the dependency graph has several ready nodes.
+
+If the dispatcher fails a task terminally, the task and its cycle become
+`FAILED`: no publication, no plan completion, no further model spend.
+
+### MANUAL mode
+
+```
+PENDING
+  └─ PLANNING                    root agent calls submit_plan
+       └─ plan comment published (versioned, digest-bound marker)
+            └─ WAITING_FOR_PLAN_APPROVAL      native LangGraph interrupt
+                 └─ exact authorized `@agent approve`
+                      └─ EXECUTING            exact permit revalidated per call
+                           └─ VALIDATING      run_validation + finish_validation
+                                └─ ACCEPT → result comment published
+                                     └─ WAITING_FOR_RESULT_APPROVAL
+                                          └─ exact authorized `@agent approve`
+                                               └─ DONE
+```
+
+`NEEDS_FIXES` returns the same task to execution. A scope-changing validation
+verdict invalidates the permit and returns the task to planning. Validation
+`ACCEPT` publishes the exact validated result but does **not** finish a manual
+task — only exact result approval makes it `DONE`.
+
+### AUTO mode
+
+An `AUTO` label (case-insensitive) present on the issue **at the moment the
+IssueThread is first created** persists `interaction_mode=AUTO` on that thread.
+That is the only time the label is examined: adding or removing it later does
+not change the mode of an existing issue, and neither do restarts or later
+cycles. Databases predating this field migrate to `MANUAL`.
+
+AUTO runs the same lifecycle:
+
+- the plan is still built and still published as a comment;
+- application policy records an exact plan permit with `AUTO` provenance;
+- execution runs under the same revalidated permit;
+- validation runs and must still produce `run_validation` evidence and `ACCEPT`;
+- the validated result is still published as a comment;
+- application policy records exact result acceptance with `AUTO` provenance.
+
+AUTO comments say SWEForge will proceed automatically; they never instruct a
+user to type `@agent approve`. AUTO does not bypass validation, publication,
+lifecycle authority, deterministic task scheduling, or the publication
+eligibility proof — which independently checks that permit and result-approval
+provenance match the thread's recorded interaction mode.
+
+## Skills and capabilities
+
+Skills are repo-scoped, operator-installed **procedural knowledge**. They are
+not a security mechanism: what a phase can actually do is decided by middleware
+and the phase tool allowlist, never by skill text.
+
+`skills/<name>/SKILL.md` uses Agent Skills-compatible YAML frontmatter:
+
+```markdown
+---
+name: reporting
+description: Render backward-compatible readiness reports with stable field ordering.
+---
+
+# Reporting
+...
+```
+
+The `name` must match the installed skill directory and the `description` is
+bounded (300 characters after whitespace normalization). Malformed frontmatter
+fails closed; a legacy file with no frontmatter gets a deterministic fallback
+description.
+
+Disclosure is phase-authorized and progressive:
+
+- when a phase authorizes exactly one skill, its full body is loaded eagerly
+  into the system prompt;
+- when a phase authorizes several (`skill` plus `skills`), the model receives a
+  bounded **catalog** of names, descriptions and canonical load paths, and reads
+  full bodies on demand with `read_file` (which the phase must authorize);
+- only the canonical path `/skills/<name>/SKILL.md` of a skill authorized for
+  the current task and phase is readable. Non-canonical, encoded, traversal or
+  inactive-skill paths raise `PermissionError`.
+
+Skill and memory trees are write-denied to every agent (`/skills/**` and
+`/memories/**` deny rules).
+
+## Tools and MCP
+
+**Built-in tools** are Deep Agents filesystem/search tools plus SWEForge's own
+`run_validation`, `request_clarification`, `search_issue_memory` and
+`propose_repo_memory`.
+
+**Registered script tools** are trusted operator scripts declared in
+`tool.yaml`:
+
+```yaml
+version: 1
+name: validate_release
+description: Validate a release-policy JSON file and return structured diagnostics.
+runtime: python                 # python | shell
+entrypoint: validate_release.py # fixed; traversal and escape are rejected
+effect: read                    # read | mutate
+timeout_seconds: 30             # bounded (max 600)
+env:
+  RELEASE_REGION: example-region
+secret_env:
+  RELEASE_POLICY_TOKEN: RELEASE_POLICY_TOKEN
+args_schema:
+  type: object
+  properties:
+    config_path: {type: string}
+  required: [config_path]
+  additionalProperties: false
+```
+
+The model sees only the declared JSON schema. It cannot choose the entrypoint,
+the interpreter, the environment, the timeout or the credential. Files are
+staged from the installed generation into a temporary directory inside the
+worktree, arguments are validated against the bounded schema subset and passed
+as JSON on standard input, output is size-bounded, and the timeout is enforced.
+Under strict execution the script runs through the sandbox backend; without a
+sandbox and without `--unsafe-local-shell` it fails closed.
+
+**`effect: mutate` tools are rejected in planning and validation phases** —
+filtered out of the model's tool list and refused again at call time — so a
+read-only phase can never be handed a writing capability.
+
+**MCP capabilities** are repo-scoped and allowlisted in
+`tools/mcp/servers.yaml`. Both local `stdio` servers (SWEForge spawns the
+process with a minimal environment: `PATH`, `LANG`, the fixed `env`, and
+resolved `secret_env`) and remote HTTP/streamable-HTTP servers are supported.
+Remote servers carry fixed non-secret `headers` plus secret-backed
+`secret_headers`; credential-bearing remote connections require HTTPS and run
+with `follow_redirects=False`.
+
+Only servers approved for the authoritative `repo_id` are loaded, only
+allowlisted tool names are exposed (as `<server_id>_<tool_name>`), and an
+interceptor re-authorizes **every** MCP invocation against the registry —
+rejecting any call whose runtime context is missing or whose capability is not
+approved for that repository, and stripping caller-supplied `workspace_root`,
+`repo_path` and `tenant` fields. The model cannot invent a server, a URL, a
+header or a capability.
+
+## GitHub interaction model
+
+Ingestion is **polling**, not webhooks, over four streams: issues, issue
+comments, PR review comments, and submitted PR reviews. Each observation
+becomes an immutable `SourceEvent` with a deterministic event key.
+
+Supported surfaces: `ISSUE`, `PR_CONVERSATION`, `PR_INLINE_REVIEW` (with path,
+line, side, diff hunk and anchor commits preserved) and `PR_REVIEW` (submitted
+review body, with its review state recorded).
+
+Actionability differs by surface: an **issue body** is actionable if it contains
+a standalone `@agent` mention anywhere; every **comment or review body** must
+*begin* with `@agent`.
+
+Routing:
+
+- an issue event resolves to `github:{repo_id}:issue:{n}`, creating the
+  IssueThread on first sight;
+- a pull-request event resolves only through a **persisted PR→IssueThread
+  mapping**, which SWEForge writes itself when it creates or reconciles the
+  PR for that issue;
+- a human-created pull request that SWEForge did not map is not routed. Writing
+  `@agent` on an unmapped PR does not create a workflow — the durable identity
+  is the IssueThread, not the PR.
+
+Feedback that reaches a mapped PR (conversation, inline review thread, or
+submitted review body) is routed to the owning IssueThread. A GitHub `APPROVED`
+or `CHANGES_REQUESTED` review state is recorded as provenance and carries **no**
+SWEForge authority by itself.
+
+### Approval semantics
+
+- The only deterministic approval is the exact comment `@agent approve`
+  (leading/trailing whitespace and case are tolerated; nothing else may be
+  present). `@agent approve please`, `@agent approved` and `LGTM` are not
+  approvals.
+- It must arrive on the same surface and subject as the cycle's root input —
+  and, for an inline review thread, in the same thread — after the plan or
+  result comment was posted, and it must match the exact pending interrupt
+  occurrence for the current plan or result.
+- The approver's permission is checked against the repository: `admin`,
+  `maintain` or `write`. An unauthorized exact approval is consumed as `STALE`
+  and approves nothing.
+- An exact approval with no matching pending occurrence is recorded as
+  `STALE_APPROVAL`. It fails closed and never becomes new work.
+- Any other `@agent …` comment is semantic feedback, not approval.
+
+## Feedback and revision loops
+
+Input that arrives while a model call is running is never injected into that
+call. Every unsolicited actionable input is durably queued for a safe boundary
+and gets one deterministic acknowledgement comment, posted through a
+marker-reconciled outbox so retries cannot duplicate it.
+
+**Feedback on the current plan or result.** While a task waits for plan or
+result approval, an `@agent …` comment on the same surface opens a bounded
+*feedback review*. In that review the model has only research tools and two
+gateways, and decides one thing:
+
+- `replan_current_feedback` — the feedback materially concerns the current
+  approval scope. The same task replans, supersedes the old plan version, and
+  requires a fresh exact permit against the new occurrence.
+- `defer_current_feedback_to_revision` — the feedback is separate. The active
+  plan or result is left untouched, a deterministic pushback comment explains
+  that and repeats what approval would do, and the input is durably deferred to
+  the revision loop. The original approval occurrence is retained, so the
+  pending `@agent approve` still works.
+
+**Generic revision workflow.** The structured, operator-declared workflow runs
+**once** per issue. After the initial workflow completes, later independent
+steering is handled by a derived single-task `revision` workflow that reuses the
+same IssueThread, worktree, branch and pull request. Its planning phase is
+stripped of mutation tools; its skill set is the union of the initial
+workflow's skills, exposed through the same progressive catalog.
+
+Batching:
+
+- when a revision cycle starts, **all currently pending revision inputs are
+  batched into it** with their immutable provenance;
+- inputs that arrive after that wait for the next revision cycle;
+- one exception is deliberate: while a revision cycle is waiting for plan or
+  result approval, newly queued *unsolicited steering* is batched into that same
+  revision and triggers a replan. Deferred plan/result feedback is not, and
+  stays queued for the next cycle;
+- publication is blocked while a revision input is pending, so an issue
+  publishes once, cumulatively, rather than per revision.
+
+**Revision context** is assembled deterministically by the application, not
+inherited from the initial conversation:
+
+- the original issue request, marked untrusted;
+- previously accepted lifecycle material for every earlier cycle — accepted plan
+  text, final execution summary, and final `ACCEPT` validation summary per task
+  — rendered in cycle and declaration order and **deterministically truncated**
+  under a hard character bound (oldest summaries are dropped with an explicit
+  marker, the first accepted identity is always retained);
+- the current batched revision inputs with their immutable GitHub provenance,
+  marked untrusted;
+- the current revision's own repair/replan history;
+- the actual current code, because it is the same worktree.
+
+A revision does not simply inherit the raw initial model conversation: revision
+cycles run under their own LangGraph checkpoint identity
+(`{thread_id}:revision:{workflow_cycle_id}`).
+
+**Clarification.** During execution the agent may call `request_clarification`
+when specific missing information blocks safe continuation. That performs a
+native checkpoint interrupt, the task enters `WAITING_FOR_INPUT`, and the
+question is posted back to the originating surface. Resume is selected by
+interrupt occurrence, so two clarifications each receive their own answer, and
+an exact `@agent approve` is not accepted as an answer.
+
+### Untrusted input handling
+
+Every model-facing GitHub string is labelled as untrusted content in the prompt
+— "Root request (untrusted)", "Original issue request (untrusted)", "untrusted
+user requests", "untrusted user content" for feedback under review — and inline
+review comments carry bounded, immutable provenance (author, path, lines, side,
+diff hunk, anchor commits) rather than free-floating text.
+
+That labelling is defence in depth only. The actual enforcement is structural:
+application-owned workflow state, middleware phase allowlists, per-call tool
+reauthorization, permit revalidation, repository and worktree boundaries,
+root-only lifecycle gateways, and the sandbox boundary. Prompt-injected text
+cannot reach a capability the phase does not have.
+
+## Subagents and delegation
+
+There is exactly one workflow-owning root Deep Agent per cycle. It may delegate
+to a single explicitly configured **bounded read-only investigator**, which
+replaces Deep Agents' default unrestricted worker so delegation cannot be used
+to escape policy.
+
+The investigator inherits repository, worktree, workflow, cycle, active task,
+phase, MCP, filesystem and skill boundaries, and is restricted to research
+tools (`ls`, `read_file`, `glob`, `grep`, `search_issue_memory`, plus
+`effect: read` script tools) intersected with the phase's configured tools. It
+cannot own active task or workflow state, call any lifecycle gateway, approve
+anything, mutate the worktree, execute commands, broaden its authority, or
+delegate further.
+
+## Workspaces, validation and publication
+
+**Workspace.** On the IssueThread's first workspace creation, SWEForge takes the
+repository Git lock, fetches `origin main`, resolves
+`refs/remotes/origin/main` to a SHA, persists that SHA as the issue base, and
+creates `sweforge/issue-{n}` at exactly that commit under
+`{workspace-root}/{repo_id}/issue-{n}` — without switching or pulling the source
+checkout. That base is then **frozen for the life of the IssueThread**. Later
+movement on `main` never silently mutates an existing issue workspace;
+reopening, revising and restarting all reuse the same worktree, branch and pull
+request, and a later issue simply starts from a newer base. Every reopen
+verifies the persisted branch, path and that the frozen base is still an
+ancestor of `HEAD`; a mismatch fails closed. A crash mid-`worktree add` is
+recovered by reattaching the orphaned branch rather than refetching a new base.
+
+**Validation.** `finish_execution` records the model's report together with
+application-captured sandbox command observations and enters `VALIDATING` — it
+never means `DONE`. Validation must call the application-owned `run_validation`,
+which returns the cumulative Git diff against the frozen base plus the durable
+execution records; `finish_validation` cannot accept without that evidence, and
+its verdict is constrained to `ACCEPT` / `NEEDS_FIXES` / `REPLAN` / `BLOCKED` by
+the tool schema. On `ACCEPT` SWEForge publishes one bounded, idempotently marked
+result comment bound to the exact execution and validation ids. In `MANUAL`,
+`ACCEPT` still requires human result approval before the task is `DONE`.
+
+**Publication.** A final commit, push and pull request happen only after every
+declared task is `DONE`, no task is active, and an independent eligibility proof
+re-checks, for every task: the plan is `APPROVED` and its stored digest still
+matches its text; an uninvalidated permit exists for that exact plan version
+with provenance matching the thread's interaction mode; the recorded execution
+succeeded under that permit and carries tool observations; the latest validation
+is `ACCEPT` for that plan and attempt with `run_validation` evidence; a result
+row ties plan/execution/validation together; and a non-stale result approval
+matches all four identities and the recorded mode.
+
+Publication itself is a single cumulative output for the IssueThread: it commits
+only non-empty changes with the deterministic message
+`sweforge: address issue #N`, pushes only the IssueThread branch, refuses a
+diverged remote branch rather than force-pushing, reconciles existing pull
+requests and comments by repository/branch/base and stable markers
+(`<!-- sweforge:publication:<publication-id> -->`), and treats ambiguous matches
+as failures. Git HTTP auth uses a short-lived installation token through a
+temporary `GIT_ASKPASS` helper — never in a remote URL, Git config, SQLite, or a
+command-line argument — and the credential-free HTTPS remote is derived from the
+configured API host rather than trusted from the checkout. A failed publication
+preserves the workspace and durable progress for retry; each publication has a
+deterministic id, so a crash and retry reuse the same commit, PR and comment
+instead of creating a second one.
+
+### Locking
+
+Three `flock`-based cross-process locks, so a crashed holder releases them: the
+IssueThread lock (one thread's whole run, including model calls), the repository
+Git lock (only shared Git administration — creating a thread's worktree and
+branch), and the repository memory lock (one read-modify-write of `AGENTS.md`).
+The only legal order is IssueThread → repository Git → release; an inversion
+raises `LockOrderError` instead of deadlocking. The Git lock never spans a model
+call, test run, or GitHub request, so different issues in one repository stay
+fully concurrent.
+
+## Memory
+
+Two deliberately separate lifetimes:
+
+**Short-term / thread memory** is the LangGraph checkpoint in
+`~/.sweforge/checkpoints.sqlite`, keyed by IssueThread (and by revision cycle
+for revision work). It holds conversation, model/tool continuation,
+summarization and pending interrupts.
+
+**Long-term / repository memory** is the LangGraph SQLite Store in
+`~/.sweforge/memory.sqlite`, keyed by the stable GitHub `repo_id`. Namespaces:
+`("sweforge","repo",repo_id,"memory")` and
+`("sweforge","repo",repo_id,"skills"[,generation_id])`. One repository can never
+read another's memory, skills, workspace or credentials.
+
+The canonical file `/memories/AGENTS.md` is created with a minimal header on
+first execution and loaded into the agent through Deep Agents' native `memory=`
+mechanism. **Agents cannot write it**: `/memories/**` is a filesystem deny rule
+and the application's evidence-backed validator is the only writer.
+
+Repository memory is **not** operator-managed only. After a successful
+publication, an application-controlled learning pass runs automatically:
+
+- **Repository-memory curation.** Candidates come from the cumulative diff and
+  from `propose_repo_memory(category, fact, durability_reason, path,
+  start_line, end_line)`, which writes nothing — the model nominates only
+  *where* the evidence is, and SWEForge reads those lines from the authoritative
+  worktree and derives the excerpt and hash itself. Absolute or escaping paths,
+  inverted or out-of-range spans and secret-looking evidence are refused.
+  Candidates are re-verified against the live worktree after publication and put
+  through the same validator, deduplication and repository lock. The outcome is
+  recorded as `UPDATED`, `NO_UPDATE` or `FAILED`.
+- **Resolved-issue memory.** Finalization creates a structured case record in the
+  same transaction that marks the plan executed, so only genuinely finalized
+  lifecycles produce one. Retrieval is local and deterministic (SQLite
+  FTS5/BM25), always filtered by authoritative `repo_id` and capped at one
+  result per IssueThread, exposed to authorized phases as `search_issue_memory`.
+
+Both lanes are optimizations, never authorization inputs. Each claims its
+attempt durably before invoking a model, is bounded to three attempts, and is
+left `FAILED` with its error rather than blocking delivery. A case is what one
+lifecycle diagnosed at the time; it is a clue to verify against current code,
+never repository truth.
+
+For inspecting or seeding repository memory directly, the trusted operator CLI
+remains:
+
+```bash
+uv run sweforge-repo-memory --state-db ~/.sweforge/state.db \
+  --memory-db ~/.sweforge/memory.sqlite --repo owner/repository show
+uv run sweforge-repo-memory --state-db ~/.sweforge/state.db \
+  --repo owner/repository append --text "Run tests with mvn test."
+```
+
+## Debugging and observability
+
+```bash
+sweforge-serve ... --debug-agent
+sweforge-serve ... --debug-agent-tools    # implies --debug-agent
+```
+
+`--debug-agent` writes bounded, redacted, human-readable workflow/model/tool
+events to stderr: model start/end, newly completed assistant-visible text, tool
+and bounded-investigator boundaries, lifecycle gateways, phase transitions,
+scheduler selection, validation verdicts, approval interrupts and resumes, AUTO
+versus HUMAN authorization, skill catalog and skill reads, repo-config
+generation binding, secret resolution counts, revision queuing/batching/replan,
+publication blocks, and server dispatch. Every line carries thread, cycle, task
+and phase identity where available, so concurrent workers stay distinguishable.
+
+`--debug-agent-tools` additionally includes sanitized, size-bounded tool
+arguments and results.
+
+Bounds and redaction apply to all trace content: known credential environment
+values, `Authorization`/`Bearer` headers, authenticated URLs, private-key
+blocks and obvious token shapes are replaced with `[REDACTED]`, and payloads are
+truncated. The tracer emits only assistant-visible message text exposed by
+normal callbacks — it deliberately ignores reasoning blocks and never prints
+accumulated messages, graph state or hidden chain-of-thought.
+
+Tracing is observer-only. It rides the existing durable `invoke()` and
+`Command(resume=...)` path without adding model or tool calls, changing prompts,
+mutating workflow state or writing checkpoints, so it can never become workflow
+authority or a new failure mode.
 
 ```text
 [thread=github:1350417130:issue:12] [cycle=2] [task=A] [phase=PLANNING] [model=openai:gpt-5] MODEL START: planning_model=openai:gpt-5
@@ -672,48 +798,164 @@ includes sanitized, size-bounded arguments and results and implies
 [thread=github:1350417130:issue:12] [cycle=2] [task=A] [phase=PLANNING] WORKFLOW: A PLANNING -> WAITING_FOR_PLAN_APPROVAL
 ```
 
-All trace content uses one bounded redaction path for known API credentials,
-authorization headers, authenticated URLs, and private keys. The tracer emits
-only assistant-visible message text exposed by normal callbacks; it deliberately
-ignores reasoning blocks and never prints accumulated messages, graph state, or
-hidden chain-of-thought. It observes the existing durable `invoke()` and
-`Command(resume=...)` path without adding model/tool calls, changing prompts,
-mutating workflow state, or writing checkpoints.
+## Security model
 
-## Acceptance suite
+- **Issue, comment and review content is untrusted.** It is labelled as such in
+  prompts and, more importantly, cannot reach any capability the current phase
+  does not authorize.
+- **The model holds no GitHub credentials.** It invokes structured lifecycle
+  behaviour; SWEForge formats and persists the authorized output, and an
+  application-owned GitHub client posts comments and creates pull requests using
+  GitHub App installation credentials.
+- **Repository authority is immutable invocation context.** Every strict
+  GitHub-triggered invocation takes its `repo_id`/`repo_full_name` from the
+  persisted IssueThread and SourceEvent (`RepoAgentContext`), never from model
+  text or repository files.
+- **Isolated worktree per issue**, on a frozen base, under a repository-scoped
+  workspace root.
+- **Strict execution requires a configured sandbox provider** registered under
+  the `sweforge.sandbox_backends` entry-point group. With no provider and no
+  explicit opt-out, execution fails closed.
+  `--unsafe-local-shell` / `LocalShellBackend` runs with host permissions and
+  enforces no cross-repository isolation; it is a development escape hatch only.
+- **Capability filtering at three layers**: the phase tool allowlist in the
+  bound specification, middleware filtering before each model call, and
+  reauthorization immediately before each tool call (plus permit revalidation
+  for execution-phase calls and registry reauthorization for every MCP call).
+- **Lifecycle gateways are root-only.** The delegated investigator never
+  receives them.
+- **Repository secret isolation.** Values are encrypted at rest, resolved only
+  at the execution boundary for the exact declared reference mapping, audited,
+  and redacted from output and errors.
+- **No automatic cross-repository capability leakage.** Memory, skills, MCP
+  approvals, secrets, workspaces, locks and configuration generations are all
+  keyed by the authoritative `repo_id`.
+- **GitHub App installation-token scope.** Tokens are short-lived,
+  repository-scoped and split into read and write permission profiles.
+- **Fail closed everywhere** required authority or evidence is absent.
 
-Most of this repository is the evidence that it works. `tests/` and
-`acceptance/` hold three layers, and the split matters because each answers a
-question the others cannot.
+## Acceptance status
 
-**Deterministic scenarios.** 47 named scenarios under `tests/scenarios/`, run
-with scripted model doubles so they are fast, free and cannot flake on model
-output. A scenario declares which named invariants it requires, and a failure
-names the invariant rather than surfacing a traceback. An invariant that cannot
-observe its subject raises instead of passing, and one that holds only over an
-empty set reports `VACUOUS` rather than `PASS`, so absence of evidence is never
-recorded as evidence.
+SWEForge V1 was put through a live end-to-end acceptance campaign against a real
+GitHub repository, a real sandbox provider and real model calls. The full
+evidence — environment, per-feature results, the six product defects found and
+fixed, and every remaining gap — is in
+[`CAMPAIGN-FINAL-REPORT.md`](CAMPAIGN-FINAL-REPORT.md).
 
-**Frozen-fixture conformance.** `acceptance/fixtures/review/v1` holds review
-artifacts captured from real executions. `acceptance/runner/conformance.py`
-replays them against the live reviewer to measure how often it produces a
-correct verdict, separating a guard that rejected valid evidence from a model
-that emitted none. Because the fixtures are frozen, a guard change can be
-re-measured with no model calls at all.
+**Verdict: PASS WITH BLOCKED EXTERNAL COVERAGE.**
 
-**Live GitHub.** Twelve scenarios also run against a real repository, where
-events arrive by polling rather than by direct insertion. Live targets are
-fail-closed: a run is refused unless its repository is named in
-`SWEFORGE_ACCEPTANCE_REPOS`, and any repository in `SWEFORGE_PRIMARY_REPOS` is
-refused first and independently, so an allowlist mistake cannot expose it.
+Onboarding, generation binding, incremental configuration, skills, phase tool
+authority, registered scripts, secrets, stdio MCP, manual and AUTO workflows,
+approval security, feedback and revision loops, clarification, all GitHub input
+surfaces, base freezing, restart durability, publication, issue-resolution
+memory and root-versus-investigator boundaries passed live. The named blocked or
+integration-only items are:
+
+- cross-repository *live* isolation — BLOCKED, no second safe GitHub fixture was
+  available (the local integration matrix passed);
+- remote HTTPS MCP authentication — local-integration pass only, no disposable
+  trusted-TLS service was available (TLS was not weakened);
+- same-repository concurrent mutation at the exact `EXECUTING` instant;
+- a live *accepted* repository-memory candidate (the real curator returned
+  `NO_UPDATE`).
+
+The repository's own checks at campaign close: `uv run pytest -n auto` — 1195
+passed, 12 skipped; `uv run ruff check .` and `ruff format --check .` clean.
+
+### Test layers
 
 ```bash
-uv run pytest -q -n auto                          # every layer offline
+uv run pytest -q -n auto                          # every offline layer
 uv run python -m acceptance.runner.cli run S1 --layer L1
 uv run python -m acceptance.runner.cli campaign S1 S2 --repetitions 3
 uv run python -m acceptance.runner.cli check-exit  # campaign exit conditions
 ```
 
-`docs/acceptance/` carries the design (`PLAN.md`, `ROADMAP.md`), the gap
-analysis and the decisions taken against it (`COVERAGE-GAPS.md`), and the
-outcome including what was not certified and why (`FINAL-STATUS.md`).
+Deterministic scenarios under `tests/scenarios/` run with scripted model doubles
+and report the named invariant that failed rather than a traceback; an invariant
+that holds only over an empty set reports `VACUOUS` rather than `PASS`.
+Frozen-fixture conformance replays captured review artifacts against the live
+reviewer. Live GitHub targets are fail-closed: a run is refused unless the
+repository is named in `SWEFORGE_ACCEPTANCE_REPOS`, and anything in
+`SWEFORGE_PRIMARY_REPOS` is refused first and independently.
+
+## Single-step and standalone CLIs
+
+These predate `sweforge-serve` and remain available for development,
+diagnostics and migration. The server is the production path and does not use
+them.
+
+```bash
+# Poll only: record durable SourceEvents/IssueThreads without running an agent.
+uv run sweforge-github-poll --repo owner/repository --db ~/.sweforge/state.db
+
+# Inspect and recover execution records.
+uv run sweforge-github-execution --db ~/.sweforge/state.db status
+uv run sweforge-github-execution --db ~/.sweforge/state.db recover-stale
+uv run sweforge-github-execution --db ~/.sweforge/state.db retry EVENT_KEY
+uv run sweforge-github-execution --db ~/.sweforge/state.db skip EVENT_KEY
+
+# Publish one eligible publication, or retry a FAILED one.
+uv run sweforge-github-publish --db ~/.sweforge/state.db \
+  --lock-root ~/.sweforge/locks [--retry PUBLICATION_ID]
+
+# Advance one IssueThread's workflow a single step.
+uv run sweforge-github-workflow --help
+
+# Operator repository memory (see "Memory") and the pre-bundle skills CLI,
+# which `sweforge skill add/remove` supersedes for configured repositories.
+uv run sweforge-repo-memory --help
+uv run sweforge-repo-skills --help
+
+# Reviewer fixture capture/replay.
+uv run sweforge-review-freeze --help
+uv run sweforge-review-replay --help
+```
+
+`recover-stale` only marks a dead worker's `RUNNING` row `INTERRUPTED`, after an
+age threshold and only when the host-local lock is free; it never retries
+automatically. Retries preserve the worktree and LangGraph checkpoint.
+
+### Standalone local harness
+
+A single-process, non-GitHub harness also exists for local experimentation:
+
+```bash
+export SWEFORGE_MODEL=anthropic:claude-sonnet-5
+uv run sweforge /path/to/git/repository "Fix the failing tests"
+```
+
+It creates a temporary worktree, runs one Deep Agent task, and prints the
+response, changed files, base commit and diff. The worktree is retained by
+default (`--discard-worktree` removes it). **This harness has no sandbox, no
+workflow lifecycle, no approvals and no repository scoping** — Deep Agents'
+`LocalShellBackend` executes on the host with the process user's permissions.
+Do not point it at untrusted tasks or repositories.
+
+## Conceptual boundaries
+
+- **TOOLS** are programmatic capabilities, including approved MCP tools.
+- **SKILLS** are repo-scoped procedural knowledge, not security authority.
+- **MEMORY** is repo-scoped durable knowledge in the LangGraph Store.
+- **STATE** is IssueThread-local workflow history and checkpoints.
+- **CONTEXT** is immutable invocation authority, including repository identity.
+- **MODEL** is the reasoning engine.
+- **DEEP AGENTS** is the inner agent harness.
+- **LANGGRAPH** is the durable orchestration/runtime.
+- **SWEFORGE** owns the SWE-specific lifecycle, composition and authority.
+
+## Further documentation
+
+- [Adding a repository to SWEForge](docs/adding-a-repository.md) — onboarding,
+  incremental maintenance and credentials, in detail.
+- [`examples/README.md`](examples/README.md) — what the reference bundle
+  demonstrates and how to adapt it.
+- [`examples/repo-config`](examples/repo-config) — a complete, valid bundle:
+  four tasks, five skills, two registered scripts, stdio and remote MCP.
+- [`CAMPAIGN-FINAL-REPORT.md`](CAMPAIGN-FINAL-REPORT.md) — the V1 live
+  acceptance evidence and verdict.
+- [`docs/acceptance/`](docs/acceptance) — acceptance design
+  ([`PLAN.md`](docs/acceptance/PLAN.md),
+  [`ROADMAP.md`](docs/acceptance/ROADMAP.md)), gap analysis
+  ([`COVERAGE-GAPS.md`](docs/acceptance/COVERAGE-GAPS.md)) and outcome
+  ([`FINAL-STATUS.md`](docs/acceptance/FINAL-STATUS.md)).
