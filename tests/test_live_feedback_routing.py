@@ -191,7 +191,7 @@ class SurfaceClient:
     def comments(self, _repo, number):
         return list(self.conversation.get(number, []))
 
-    def review_comments(self, _repo, number):
+    def review_comments_for_pull_request(self, _repo, number):
         return list(self.inline.get(number, []))
 
     def create_comment(self, _repo, number, body):

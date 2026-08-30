@@ -499,7 +499,9 @@ class DeepAgentWorkflowDriver:
 
     def _conversation_comments(self, repo: Any, root: Any) -> list[dict[str, Any]]:
         if root["origin_surface"] == "PR_INLINE_REVIEW":
-            return self.client.review_comments(repo, root["subject_number"])
+            return self.client.review_comments_for_pull_request(
+                repo, root["subject_number"]
+            )
         return self.client.comments(repo, root["subject_number"])
 
     def _post_response(self, repo: Any, root: Any, body: str) -> dict[str, Any]:

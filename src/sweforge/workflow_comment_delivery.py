@@ -91,7 +91,9 @@ def _retry_at(now: str) -> str:
 def _reconcile_one(*, client: Any, record: WorkflowCommentOutboxRecord, event: Any):
     repo = client.repository(event["repo_full_name"])
     if event["origin_surface"] == "PR_INLINE_REVIEW":
-        comments = client.review_comments(repo, event["subject_number"])
+        comments = client.review_comments_for_pull_request(
+            repo, event["subject_number"]
+        )
     else:
         comments = client.comments(repo, event["subject_number"])
     matches = [
