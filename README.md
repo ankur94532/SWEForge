@@ -650,6 +650,30 @@ backoff, so restarting the process does not create a retry storm. GitHub
 credentials use the same App or legacy-token environment variables as the
 one-shot poll/workflow commands; secrets are never printed.
 
+Pass `--debug-agent` for optional live human-readable tracing on stderr. It is
+off by default and reports model start, newly completed assistant-visible text,
+model end, tool and bounded investigator boundaries, lifecycle gateways, phase
+transitions, validation verdicts, approval interrupts/resumes, AUTO or HUMAN
+authorization, and server dispatch activity. Every physical line carries
+thread, cycle, task, and phase identity where available, so concurrent workers
+remain distinguishable. For deeper tool debugging, `--debug-agent-tools` also
+includes sanitized, size-bounded arguments and results and implies
+`--debug-agent`.
+
+```text
+[thread=github:1350417130:issue:12] [cycle=2] [task=A] [phase=PLANNING] [model=openai:gpt-5] MODEL START: planning_model=openai:gpt-5
+[thread=github:1350417130:issue:12] [cycle=2] [task=A] [phase=PLANNING] LIFECYCLE START: submit_plan
+[thread=github:1350417130:issue:12] [cycle=2] [task=A] [phase=PLANNING] WORKFLOW: A PLANNING -> WAITING_FOR_PLAN_APPROVAL
+```
+
+All trace content uses one bounded redaction path for known API credentials,
+authorization headers, authenticated URLs, and private keys. The tracer emits
+only assistant-visible message text exposed by normal callbacks; it deliberately
+ignores reasoning blocks and never prints accumulated messages, graph state, or
+hidden chain-of-thought. It observes the existing durable `invoke()` and
+`Command(resume=...)` path without adding model/tool calls, changing prompts,
+mutating workflow state, or writing checkpoints.
+
 ## Acceptance suite
 
 Most of this repository is the evidence that it works. `tests/` and

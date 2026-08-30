@@ -30,6 +30,7 @@ from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.store.base import BaseStore
 from langgraph.types import Command, interrupt
 
+from .agent_trace import observable_message_text
 from .capabilities import RepoCapabilityRegistry, load_repo_mcp_tools
 from .context import RepoAgentContext
 from .execution_evidence import RecordingSandboxBackend
@@ -222,26 +223,7 @@ class LiveInputMiddleware(AgentMiddleware):
 
 def _normalize_response_text(message: Any) -> str:
     """Return user-facing text without serializing structured message content."""
-    content = getattr(message, "content", "")
-    if isinstance(content, str):
-        return content
-
-    # LangChain exposes normalized blocks through this stable accessor.  Fall
-    # back to raw content for lightweight test doubles and other message types.
-    blocks = getattr(message, "content_blocks", content)
-    if not isinstance(blocks, (list, tuple)):
-        return ""
-
-    text_blocks: list[str] = []
-    for block in blocks:
-        if isinstance(block, Mapping):
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                text_blocks.append(block["text"])
-        elif getattr(block, "type", None) == "text":
-            text = getattr(block, "text", None)
-            if isinstance(text, str):
-                text_blocks.append(text)
-    return "\n".join(text_blocks)
+    return observable_message_text(message)
 
 
 def pending_interrupt_values(agent, config) -> tuple[dict[str, Any], ...]:

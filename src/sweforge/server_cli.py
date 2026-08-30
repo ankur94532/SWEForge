@@ -66,6 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-ticks", type=int, default=20)
     parser.add_argument("--initial-lookback-minutes", type=int, default=10)
     parser.add_argument(
+        "--debug-agent",
+        action="store_true",
+        help="show bounded, redacted live agent/workflow events on stderr",
+    )
+    parser.add_argument(
+        "--debug-agent-tools",
+        action="store_true",
+        help="also show bounded, redacted tool arguments and results",
+    )
+    parser.add_argument(
         "--once",
         action="store_true",
         help="poll once, drain discovered work, then exit",
@@ -124,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
             max_ticks=args.max_ticks,
             initial_lookback_minutes=args.initial_lookback_minutes,
             once=args.once,
+            debug_agent=args.debug_agent or args.debug_agent_tools,
+            debug_agent_tools=args.debug_agent_tools,
         )
         server = SWEForgeServer(config)
         signal.signal(signal.SIGTERM, lambda *_: server.request_stop())

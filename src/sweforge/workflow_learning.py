@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from .agent_trace import AgentTracer, TraceContext
 from .github_store import (
     IssueResolutionStatus,
     RepoMemoryCandidateStatus,
@@ -44,6 +45,7 @@ class WorkflowLearningService:
         resolution_model: str | None,
         lock_root: str | Path,
         clock,
+        tracer: AgentTracer | None = None,
     ) -> None:
         self.store = store
         self.memory_store = memory_store
@@ -51,6 +53,58 @@ class WorkflowLearningService:
         self.resolution_model = resolution_model
         self.lock_root = lock_root
         self.clock = clock
+        self.tracer = tracer
+
+    def _trace_context(
+        self, thread_id: str, cycle_id: int, *, role: str, model: str
+    ) -> TraceContext:
+        try:
+            thread = self.store.issue_thread(thread_id)
+            cycle = self.store.connection.execute(
+                """SELECT workflow_cycle_id FROM workflow_cycles_v1
+                   WHERE thread_id=? AND cycle_id=?""",
+                (thread_id, cycle_id),
+            ).fetchone()
+        except Exception:
+            return TraceContext(
+                thread_id=thread_id,
+                cycle_id=cycle_id,
+                model_role=role,
+                model=model,
+            )
+        return TraceContext(
+            thread_id=thread_id,
+            repo=str(thread["repo_full_name"]) if thread is not None else "",
+            issue_number=int(thread["issue_number"]) if thread is not None else None,
+            workflow_cycle_id=str(cycle["workflow_cycle_id"]) if cycle else "",
+            cycle_id=cycle_id,
+            model_role=role,
+            model=model,
+        )
+
+    def _trace_model_call(
+        self,
+        *,
+        thread_id: str,
+        cycle_id: int,
+        role: str,
+        model: str,
+        callback,
+    ):
+        if self.tracer is None:
+            return callback()
+        context = self._trace_context(thread_id, cycle_id, role=role, model=model)
+        self.tracer.emit(
+            "MODEL START", f"{context.model_role}_model={context.model}", context
+        )
+        try:
+            result = callback()
+        except Exception as exc:
+            self.tracer.emit("MODEL ERROR", f"{type(exc).__name__}: {exc}", context)
+            self.tracer.emit("MODEL END", "failed", context)
+            raise
+        self.tracer.emit("MODEL END", "completed", context)
+        return result
 
     def process_one(self, thread_id: str) -> bool:
         learning = self.store.pending_memory_learning(thread_id)
@@ -129,17 +183,24 @@ class WorkflowLearningService:
                     plans, _, _ = self._task_material(
                         learning.thread_id, learning.cycle_id
                     )
-                    curated = curate_repository_memory(
+                    curated = self._trace_model_call(
+                        thread_id=learning.thread_id,
+                        cycle_id=learning.cycle_id,
+                        role="memory",
                         model=self.memory_model,
-                        repo_id=learning.repo_id,
-                        worktree=path,
-                        changed_files=workspace.changed_files()[:100],
-                        diff=workspace.diff()[:40_000],
-                        existing_memory=read_repo_memory(
-                            self.memory_store, repo_memory_namespace(learning.repo_id)
-                        )
-                        or "",
-                        plan_text=plans[:12_000],
+                        callback=lambda: curate_repository_memory(
+                            model=self.memory_model,
+                            repo_id=learning.repo_id,
+                            worktree=path,
+                            changed_files=workspace.changed_files()[:100],
+                            diff=workspace.diff()[:40_000],
+                            existing_memory=read_repo_memory(
+                                self.memory_store,
+                                repo_memory_namespace(learning.repo_id),
+                            )
+                            or "",
+                            plan_text=plans[:12_000],
+                        ),
                     )
                     proposal_json = curated.proposal_json
                     candidates.extend(curated.candidates)
@@ -226,8 +287,14 @@ class WorkflowLearningService:
                 pr_url=publication.pr_url if publication else None,
                 commit_sha=publication.remote_commit_sha if publication else None,
             )
-            case = curate_issue_resolution(
-                model=self.resolution_model, evidence=evidence
+            case = self._trace_model_call(
+                thread_id=resolution.thread_id,
+                cycle_id=resolution.cycle_id,
+                role="resolution",
+                model=self.resolution_model,
+                callback=lambda: curate_issue_resolution(
+                    model=self.resolution_model, evidence=evidence
+                ),
             )
         except Exception as exc:
             self.store.save_issue_resolution(

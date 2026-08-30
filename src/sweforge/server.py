@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import fcntl
 import os
-import re
 import threading
 import time
 from collections.abc import Callable
@@ -13,6 +12,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from .agent_trace import (
+    AgentTracer,
+    AgentTraceSink,
+    TerminalTraceSink,
+    TraceContext,
+    bounded_text,
+)
 from .capabilities import load_capability_registry
 from .execution import SQLiteCheckpointer
 from .execution_security import resolve_sandbox_provider
@@ -69,6 +75,8 @@ class ServerConfig:
     max_ticks: int = 20
     initial_lookback_minutes: int = 10
     once: bool = False
+    debug_agent: bool = False
+    debug_agent_tools: bool = False
 
     @property
     def planning(self) -> str:
@@ -168,24 +176,7 @@ def _credentials(config: ServerConfig):
 
 def _safe_dispatch_error(exc: BaseException) -> str:
     """Persist only a bounded, redacted diagnostic string."""
-    message = f"{type(exc).__name__}: {exc}"
-    for name in (
-        "SWEFORGE_GITHUB_TOKEN",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-    ):
-        value = os.getenv(name)
-        if value:
-            message = message.replace(value, "[REDACTED]")
-    message = re.sub(
-        r"-----BEGIN [A-Z ]+ PRIVATE KEY-----.*?-----END [A-Z ]+ PRIVATE KEY-----",
-        "[REDACTED_PRIVATE_KEY]",
-        message,
-        flags=re.DOTALL,
-    )
-    message = re.sub(r"(https?://)([^/\s:@]+):([^@\s]+)@", r"\1[REDACTED]@", message)
-    return message[:1000]
+    return bounded_text(f"{type(exc).__name__}: {exc}", 1_000)
 
 
 class SWEForgeServer:
@@ -203,6 +194,7 @@ class SWEForgeServer:
         publisher_factory: Callable[..., object] | None = None,
         learning_factory: Callable[..., object] | None = None,
         now: Callable[[], datetime] | None = None,
+        trace_sink: AgentTraceSink | None = None,
     ) -> None:
         if config.workers < 1 or config.max_ticks < 1 or config.poll_interval < 0:
             raise ValueError(
@@ -235,8 +227,18 @@ class SWEForgeServer:
         self.worker_runner = worker_runner
         self.driver_factory = driver_factory
         self.publisher_factory = publisher_factory or GitHubPublisher
+        self._production_learning = learning_factory is None
         self.learning_factory = learning_factory or WorkflowLearningService
         self.now = now or (lambda: datetime.now(UTC))
+        debug_enabled = config.debug_agent or config.debug_agent_tools
+        self.tracer = (
+            AgentTracer(
+                trace_sink or TerminalTraceSink(),
+                include_tool_payloads=config.debug_agent_tools,
+            )
+            if debug_enabled
+            else None
+        )
         self.stop_event = threading.Event()
         self._futures: dict[Future, str] = {}
         self._futures_lock = threading.Lock()
@@ -251,7 +253,23 @@ class SWEForgeServer:
             now=self.now,
             initial_lookback=timedelta(minutes=self.config.initial_lookback_minutes),
         )
-        poller.poll(self.config.repositories)
+        if self.tracer is not None:
+            self.tracer.emit(
+                "POLL",
+                f"start repositories={len(self.config.repositories)}",
+                TraceContext(),
+            )
+        result = poller.poll(self.config.repositories)
+        if self.tracer is not None:
+            self.tracer.emit(
+                "POLL",
+                (
+                    f"end discovered={getattr(result, 'events_discovered', '?')} "
+                    f"persisted={getattr(result, 'events_persisted', '?')} "
+                    f"routed={getattr(result, 'events_routed', '?')}"
+                ),
+                TraceContext(),
+            )
 
     def _submit(self, executor: ThreadPoolExecutor, store: SQLiteGitHubStore) -> None:
         now = self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
@@ -262,6 +280,10 @@ class SWEForgeServer:
                     break
                 if thread_id in active:
                     continue
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "DISPATCH", "queued", self._trace_context(store, thread_id)
+                    )
                 future = executor.submit(self._worker_entry, thread_id)
                 self._futures[future] = thread_id
 
@@ -278,6 +300,12 @@ class SWEForgeServer:
         store = SQLiteGitHubStore(self.config.db)
         client = authenticator = checkpoints = memory = None
         controller = None
+        trace_context = (
+            self._trace_context(store, thread_id) if self.tracer is not None else None
+        )
+        if self.tracer is not None:
+            assert trace_context is not None
+            self.tracer.emit("WORKER START", "running", trace_context)
         try:
             if self.worker_runner is not None:
                 self.worker_runner(thread_id)
@@ -307,6 +335,7 @@ class SWEForgeServer:
                     sandbox_backend_provider=sandbox,
                     secure_execution=not self.config.unsafe_local_shell,
                     unsafe_local_shell=self.config.unsafe_local_shell,
+                    tracer=self.tracer,
                 )
 
             controller = DeclarativeWorkflowController(
@@ -323,15 +352,19 @@ class SWEForgeServer:
                 lock_root=self.config.lock_root,
                 driver_factory=self.driver_factory or production_driver_factory,
                 clock=self._timestamp,
+                tracer=self.tracer,
             )
-            learning = self.learning_factory(
-                store=store,
-                memory_store=memory.store,
-                memory_model=self.config.memory,
-                resolution_model=self.config.resolution,
-                lock_root=self.config.lock_root,
-                clock=self._timestamp,
-            )
+            learning_kwargs = {
+                "store": store,
+                "memory_store": memory.store,
+                "memory_model": self.config.memory,
+                "resolution_model": self.config.resolution,
+                "lock_root": self.config.lock_root,
+                "clock": self._timestamp,
+            }
+            if self.tracer is not None and self._production_learning:
+                learning_kwargs["tracer"] = self.tracer
+            learning = self.learning_factory(**learning_kwargs)
             self._drain_workflow(
                 thread_id=thread_id,
                 store=store,
@@ -342,6 +375,11 @@ class SWEForgeServer:
             )
             store.clear_dispatcher_failure(thread_id)
         except Exception as exc:
+            if self.tracer is not None:
+                assert trace_context is not None
+                self.tracer.emit(
+                    "WORKER ERROR", _safe_dispatch_error(exc), trace_context
+                )
             now = self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
             store.record_dispatcher_failure(
                 thread_id, now=now, error=_safe_dispatch_error(exc)
@@ -360,6 +398,9 @@ class SWEForgeServer:
                     )
             raise
         finally:
+            if self.tracer is not None:
+                assert trace_context is not None
+                self.tracer.emit("WORKER END", "stopped", trace_context)
             for resource in (memory, checkpoints, store, client, authenticator):
                 if resource is not None and hasattr(resource, "close"):
                     resource.close()
@@ -407,6 +448,20 @@ class SWEForgeServer:
 
     def _timestamp(self) -> str:
         return self.now().astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _trace_context(store: SQLiteGitHubStore, thread_id: str) -> TraceContext:
+        try:
+            thread = store.issue_thread(thread_id)
+        except Exception:
+            return TraceContext(thread_id=thread_id)
+        if thread is None:
+            return TraceContext(thread_id=thread_id)
+        return TraceContext(
+            thread_id=thread_id,
+            repo=str(thread["repo_full_name"]),
+            issue_number=int(thread["issue_number"]),
+        )
 
     def _signal_ready(self) -> None:
         """Announce readiness only after the lock is held and polling ran once."""

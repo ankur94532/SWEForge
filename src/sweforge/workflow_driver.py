@@ -16,6 +16,7 @@ from .agent import (
     build_durable_workflow_agent,
     pending_interrupt_values,
 )
+from .agent_trace import AgentTraceCallbackHandler, AgentTracer, TraceContext
 from .capabilities import RepoCapabilityRegistry, load_repo_mcp_tools
 from .context import RepoAgentContext
 from .execution_security import SandboxBackendProvider, require_secure_backend
@@ -57,6 +58,7 @@ class DeepAgentWorkflowDriver:
         sandbox_backend_provider: SandboxBackendProvider | None,
         secure_execution: bool,
         unsafe_local_shell: bool,
+        tracer: AgentTracer | None = None,
     ) -> None:
         self.runtime = runtime
         self.workflow_cycle_id = workflow_cycle_id
@@ -73,6 +75,7 @@ class DeepAgentWorkflowDriver:
         self.sandbox_backend_provider = sandbox_backend_provider
         self.secure_execution = secure_execution
         self.unsafe_local_shell = unsafe_local_shell
+        self.tracer = tracer
 
     def drive(
         self,
@@ -84,6 +87,19 @@ class DeepAgentWorkflowDriver:
     ) -> None:
         self._assert_cycle_spec(cycle)
         agent, authority, context = self._agent(cycle)
+        trace_callback = (
+            AgentTraceCallbackHandler(
+                self.tracer,
+                context_provider=lambda: self._trace_context(cycle),
+                model_names={
+                    "planning": self.planning_model,
+                    "execution": self.execution_model,
+                    "validation": self.validation_model,
+                },
+            )
+            if self.tracer is not None
+            else None
+        )
         invoke_workflow_phase(
             agent,
             authority=authority,
@@ -91,6 +107,11 @@ class DeepAgentWorkflowDriver:
             prompt=prompt,
             context=context,
             resume=resume,
+            trace_callback=trace_callback,
+            tracer=self.tracer,
+            trace_context=(
+                self._trace_context(cycle, task) if self.tracer is not None else None
+            ),
         )
         fresh = self.runtime.active_task(cycle.workflow_cycle_id)
         if fresh is not None:
@@ -175,6 +196,8 @@ class DeepAgentWorkflowDriver:
             publish_result=lambda **kwargs: self._publish_result(cycle, **kwargs),
             execution_evidence=lambda: list(observations),
             validation_evidence=lambda: list(validations),
+            tracer=self.tracer,
+            trace_context=lambda task: self._trace_context(cycle, task),
         )
         extra = [
             self._validation_tool(cycle, validations),
@@ -212,6 +235,35 @@ class DeepAgentWorkflowDriver:
             permissions=permissions,
         )
         return agent, authority, context
+
+    def _trace_context(
+        self, cycle: WorkflowCycle, task: TaskRun | None = None
+    ) -> TraceContext:
+        current = task or self.runtime.active_task(cycle.workflow_cycle_id)
+        try:
+            root = self._root_event(cycle)
+            thread = self.store.issue_thread(cycle.thread_id)
+        except Exception:
+            return TraceContext(
+                thread_id=cycle.thread_id,
+                workflow_cycle_id=cycle.workflow_cycle_id,
+                cycle_id=cycle.cycle_id,
+                task_id=current.task_id if current is not None else "",
+                task_run_id=current.task_run_id if current is not None else "",
+                phase=current.phase.value if current is not None else "",
+            )
+        return TraceContext(
+            thread_id=cycle.thread_id,
+            repo=str(root["repo_full_name"]),
+            issue_number=(int(thread["issue_number"]) if thread is not None else None),
+            origin_surface=str(root["origin_surface"]),
+            subject_number=int(root["subject_number"]),
+            workflow_cycle_id=cycle.workflow_cycle_id,
+            cycle_id=cycle.cycle_id,
+            task_id=current.task_id if current is not None else "",
+            task_run_id=current.task_run_id if current is not None else "",
+            phase=current.phase.value if current is not None else "",
+        )
 
     def _publish_plan(
         self,

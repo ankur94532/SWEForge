@@ -8,6 +8,7 @@ from typing import Any
 from langgraph.types import Command
 
 from .agent import pending_interrupt_values
+from .agent_trace import AgentTraceCallbackHandler, AgentTracer, TraceContext
 from .workflow_middleware import WorkflowAuthority
 from .workflow_runtime import TaskPhase
 
@@ -66,9 +67,14 @@ def invoke_workflow_phase(
     prompt: str,
     context: Any = None,
     resume: Mapping[str, Any] | None = None,
+    trace_callback: AgentTraceCallbackHandler | None = None,
+    tracer: AgentTracer | None = None,
+    trace_context: TraceContext | None = None,
 ) -> dict[str, Any]:
     """Invoke one phase and fail closed on natural-language completion."""
     config = {"configurable": {"thread_id": thread_id}}
+    if trace_callback is not None:
+        config["callbacks"] = [trace_callback]
     before = (
         authority.resume_snapshot(str(resume.get("kind") or ""))
         if resume is not None
@@ -79,6 +85,12 @@ def invoke_workflow_phase(
         if resume is not None
         else {"messages": [{"role": "user", "content": prompt}]}
     )
+    if resume is not None and tracer is not None:
+        tracer.resume(
+            trace_context or TraceContext(thread_id=thread_id),
+            str(resume.get("kind") or "UNKNOWN"),
+            str(resume.get("occurrence_key") or "unknown"),
+        )
     for attempt in range(MAX_PROTOCOL_NUDGES + 1):
         try:
             result = agent.invoke(
@@ -87,7 +99,7 @@ def invoke_workflow_phase(
                 durability="sync",
                 context=context,
             )
-        except Exception:
+        except Exception as exc:
             # A lifecycle gateway commits its transition before the agent sees
             # the tool result. The next model turn therefore runs under stale
             # phase authority and may fail closed. Once durable state proves
@@ -95,8 +107,24 @@ def invoke_workflow_phase(
             # successful transition into a dispatcher failure.
             if _phase_advanced(authority, before):
                 return {}
+            if tracer is not None:
+                tracer.emit(
+                    "AGENT ERROR",
+                    f"{type(exc).__name__}: {exc}",
+                    trace_context or TraceContext(thread_id=thread_id),
+                )
             raise
         if result.get("__interrupt__"):
+            if tracer is not None:
+                for item in result["__interrupt__"]:
+                    payload = getattr(item, "value", item)
+                    if not isinstance(payload, Mapping):
+                        continue
+                    tracer.interrupt(
+                        trace_context or TraceContext(thread_id=thread_id),
+                        str(payload.get("kind") or "UNKNOWN"),
+                        str(payload.get("occurrence_key") or "unknown"),
+                    )
             return result
         if _phase_advanced(authority, before):
             return result

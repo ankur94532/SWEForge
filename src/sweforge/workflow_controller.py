@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .agent_trace import AgentTracer, TraceContext
 from .execution import normalize_task
 from .execution_locks import ThreadLockUnavailable, thread_lock
 from .github_models import (
@@ -73,6 +74,7 @@ class DeclarativeWorkflowController:
             [WorkflowRuntime, str, Path, WorkflowSpec], WorkflowAgentDriver
         ],
         clock: Callable[[], str],
+        tracer: AgentTracer | None = None,
     ) -> None:
         self.store = store
         self.client = client
@@ -83,6 +85,7 @@ class DeclarativeWorkflowController:
         self.lock_root = lock_root
         self.driver_factory = driver_factory
         self.clock = clock
+        self.tracer = tracer
         self.runtime = WorkflowRuntime(store, clock=clock)
 
     def advance(self, thread_id: str) -> ControllerResult:
@@ -121,6 +124,12 @@ class DeclarativeWorkflowController:
                 cycle.status.value,
                 cycle.workflow_cycle_id,
             )
+        if self.tracer is not None:
+            self.tracer.emit(
+                "SCHEDULER",
+                f"selected {task.task_id}",
+                self._trace_context(cycle, task),
+            )
         workspace = self._workspace(cycle)
         cycle_spec = self.runtime.spec_for_cycle(cycle.workflow_cycle_id)
         driver = self.driver_factory(
@@ -129,7 +138,16 @@ class DeclarativeWorkflowController:
         mode = self.store.interaction_mode(cycle.thread_id)
         if task.phase == TaskPhase.WAITING_FOR_PLAN_APPROVAL:
             if mode == InteractionMode.AUTO:
+                before = task
                 self.runtime.auto_authorize_plan(task.task_run_id)
+                if self.tracer is not None:
+                    context = self._trace_context(cycle, before)
+                    self.tracer.authorization(context, "AUTO", "plan")
+                    try:
+                        after_phase = self.runtime.task(task.task_run_id).phase
+                    except Exception:
+                        after_phase = before.phase
+                    self.tracer.transition(context, before.phase, after_phase)
                 return self._result(
                     cycle, self.runtime.task(task.task_run_id), "ACTIVE"
                 )
@@ -140,7 +158,16 @@ class DeclarativeWorkflowController:
             driver.drive(cycle=cycle, task=task, prompt="", resume=resume)
         elif task.phase == TaskPhase.WAITING_FOR_RESULT_APPROVAL:
             if mode == InteractionMode.AUTO:
+                before = task
                 self.runtime.auto_accept_result(task.task_run_id)
+                if self.tracer is not None:
+                    context = self._trace_context(cycle, before)
+                    self.tracer.authorization(context, "AUTO", "result")
+                    try:
+                        after_phase = self.runtime.task(task.task_run_id).phase
+                    except Exception:
+                        after_phase = before.phase
+                    self.tracer.transition(context, before.phase, after_phase)
                 fresh = self.runtime.select_active_task(cycle.workflow_cycle_id)
                 return ControllerResult(
                     cycle.thread_id,
@@ -241,6 +268,32 @@ class DeclarativeWorkflowController:
                 or root["body"]
             )
         return root["body"]
+
+    def _trace_context(self, cycle: WorkflowCycle, task: TaskRun) -> TraceContext:
+        try:
+            root = self._root_event(cycle)
+            thread = self.store.issue_thread(cycle.thread_id)
+        except Exception:
+            return TraceContext(
+                thread_id=cycle.thread_id,
+                workflow_cycle_id=cycle.workflow_cycle_id,
+                cycle_id=cycle.cycle_id,
+                task_id=task.task_id,
+                task_run_id=task.task_run_id,
+                phase=task.phase.value,
+            )
+        return TraceContext(
+            thread_id=cycle.thread_id,
+            repo=str(root["repo_full_name"]),
+            issue_number=(int(thread["issue_number"]) if thread is not None else None),
+            origin_surface=str(root["origin_surface"]),
+            subject_number=int(root["subject_number"]),
+            workflow_cycle_id=cycle.workflow_cycle_id,
+            cycle_id=cycle.cycle_id,
+            task_id=task.task_id,
+            task_run_id=task.task_run_id,
+            phase=task.phase.value,
+        )
 
     def _workspace(self, cycle: WorkflowCycle) -> ThreadWorkspace:
         thread = self.store.issue_thread(cycle.thread_id)
