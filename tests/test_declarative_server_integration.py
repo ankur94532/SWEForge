@@ -1369,3 +1369,98 @@ def test_mid_revision_steering_replans_same_owner_without_consuming_later_input(
         == 2
     )
     store.close()
+
+
+def test_deferred_result_feedback_waits_for_the_next_revision_cycle(tmp_path):
+    FakeDriver.events = []
+    FakeDriver.specs = []
+    FakeDriver.verdicts = {}
+    FakePublisher.calls = []
+    server = _server(tmp_path, max_ticks=1)
+    thread_id = "github:41:issue:9"
+    _record(
+        server.config.db,
+        "issues",
+        _event(
+            SourceKind.ISSUE,
+            "root",
+            "@agent establish a base implementation",
+            "2026-01-01T00:00:00Z",
+        ),
+    )
+    server._worker_entry(thread_id)
+    _approve(server, "initial-plan", 20)
+    server._worker_entry(thread_id)
+    server._worker_entry(thread_id)
+    _approve(server, "initial-result", 21)
+
+    first = _event(
+        SourceKind.ISSUE_COMMENT,
+        "revision-one",
+        "@agent update the compatibility behavior",
+        "2026-01-01T00:30:00Z",
+    )
+    _record(server.config.db, "issue_comments", first)
+    server._worker_entry(thread_id)
+    _approve(server, "revision-plan", 31)
+    server._worker_entry(thread_id)
+    server._worker_entry(thread_id)
+
+    feedback = _event(
+        SourceKind.ISSUE_COMMENT,
+        "unrelated-result-feedback",
+        "@agent redesign the authentication system",
+        "2026-01-01T00:33:00Z",
+    )
+    _record(server.config.db, "issue_comments", feedback)
+    store = SQLiteGitHubStore(server.config.db)
+    revision = store.connection.execute(
+        """SELECT * FROM workflow_cycles_v1 WHERE cycle_kind='REVISION'
+           ORDER BY cycle_id DESC LIMIT 1"""
+    ).fetchone()
+    task = store.connection.execute(
+        "SELECT * FROM workflow_task_runs_v1 WHERE workflow_cycle_id=?",
+        (revision["workflow_cycle_id"],),
+    ).fetchone()
+    result = store.connection.execute(
+        """SELECT * FROM workflow_task_results_v1 WHERE task_run_id=?
+           ORDER BY result_id DESC LIMIT 1""",
+        (task["task_run_id"],),
+    ).fetchone()
+    assert task["phase"] == "WAITING_FOR_RESULT_APPROVAL"
+    review = store.begin_feedback_review(
+        event_key=feedback.event_key,
+        task_run_id=task["task_run_id"],
+        feedback_kind="RESULT",
+        occurrence_key=result["result_occurrence_key"],
+        feedback_text=feedback.body,
+        now="2026-01-01T00:33:01Z",
+    )
+    store.defer_feedback_to_revision(
+        review.feedback_review_id, now="2026-01-01T00:33:02Z"
+    )
+    store.close()
+
+    server._worker_entry(thread_id)
+
+    store = SQLiteGitHubStore(server.config.db)
+    current_task = store.connection.execute(
+        "SELECT * FROM workflow_task_runs_v1 WHERE workflow_cycle_id=?",
+        (revision["workflow_cycle_id"],),
+    ).fetchone()
+    current_result = store.connection.execute(
+        """SELECT * FROM workflow_task_results_v1 WHERE task_run_id=?
+           ORDER BY result_id DESC LIMIT 1""",
+        (task["task_run_id"],),
+    ).fetchone()
+    pending = store.pending_revision_inputs(thread_id)
+    deferred = store.feedback_review(review.feedback_review_id)
+    assert current_task["phase"] == "WAITING_FOR_RESULT_APPROVAL"
+    assert current_result["result_id"] == result["result_id"]
+    assert current_result["validation_id"] == result["validation_id"]
+    assert current_result["result_occurrence_key"] == result["result_occurrence_key"]
+    assert len(pending) == 1
+    assert pending[0]["source_event_key"] == feedback.event_key
+    assert pending[0]["classification_reason"] == "DEFERRED_RESULT_FEEDBACK"
+    assert deferred is not None and deferred.status == "DEFERRED_WAITING"
+    store.close()

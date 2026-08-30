@@ -452,7 +452,11 @@ class DeclarativeWorkflowController:
             TaskPhase.WAITING_FOR_RESULT_APPROVAL,
         }:
             return False
-        pending = self.store.pending_revision_inputs(cycle.thread_id)
+        pending = [
+            row
+            for row in self.store.pending_revision_inputs(cycle.thread_id)
+            if row["classification_reason"] == "UNSOLICITED_STEERING"
+        ]
         if not pending:
             return False
         if self.tracer is not None:
@@ -466,6 +470,7 @@ class DeclarativeWorkflowController:
             thread_id=cycle.thread_id,
             workflow_cycle_id=cycle.workflow_cycle_id,
             now=self.clock(),
+            revision_input_ids=[row["revision_input_id"] for row in pending],
         )
         new_ids = [row["revision_input_id"] for row in pending]
         self.runtime.replan_for_revision_inputs(

@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -6412,8 +6412,18 @@ class SQLiteGitHubStore:
         ).fetchone()
 
     def batch_revision_inputs(
-        self, *, thread_id: str, workflow_cycle_id: str, now: str
+        self,
+        *,
+        thread_id: str,
+        workflow_cycle_id: str,
+        now: str,
+        revision_input_ids: Sequence[str] | None = None,
     ) -> list[sqlite3.Row]:
+        selected_ids = (
+            tuple(dict.fromkeys(revision_input_ids))
+            if revision_input_ids is not None
+            else None
+        )
         with self.transaction(immediate=True) as db:
             cycle = db.execute(
                 """SELECT * FROM workflow_cycles_v1 WHERE workflow_cycle_id=?
@@ -6422,12 +6432,24 @@ class SQLiteGitHubStore:
             ).fetchone()
             if cycle is None:
                 raise ValueError("revision input batch target is not active")
-            db.execute(
-                """UPDATE revision_inputs_v1 SET status='BATCHED',
-                   revision_workflow_cycle_id=?,batched_at=?
-                   WHERE thread_id=? AND status='PENDING'""",
-                (workflow_cycle_id, now, thread_id),
-            )
+            if selected_ids is None:
+                db.execute(
+                    """UPDATE revision_inputs_v1 SET status='BATCHED',
+                       revision_workflow_cycle_id=?,batched_at=?
+                       WHERE thread_id=? AND status='PENDING'""",
+                    (workflow_cycle_id, now, thread_id),
+                )
+            elif selected_ids:
+                placeholders = ",".join("?" for _ in selected_ids)
+                changed = db.execute(
+                    f"""UPDATE revision_inputs_v1 SET status='BATCHED',
+                        revision_workflow_cycle_id=?,batched_at=?
+                        WHERE thread_id=? AND status='PENDING'
+                          AND revision_input_id IN ({placeholders})""",
+                    (workflow_cycle_id, now, thread_id, *selected_ids),
+                )
+                if changed.rowcount != len(selected_ids):
+                    raise ValueError("selected revision input batch changed")
             db.execute(
                 """UPDATE deferred_followups SET status='CONSUMED',
                    consumed_cycle_id=?,consumed_at=?
