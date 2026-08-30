@@ -923,3 +923,42 @@ def test_in_flight_feedback_review_keeps_its_thread_runnable(tmp_path, kind):
     assert reopened.runnable_thread_ids(now="2026-01-01T00:30:00Z") == [cycle.thread_id]
     reopened.close()
     store.close()
+
+
+def test_validation_verdict_is_a_constrained_choice_not_free_text(tmp_path):
+    """The four legal verdicts must be advertised in the tool schema.
+
+    Typing the parameter as a bare string lets a plausible-but-wrong value
+    such as "pass" reach ``ValidationVerdict(...)``, whose ValueError escapes
+    the tool and fails the whole dispatcher turn. The model never learns what
+    the legal values were, so it repeats the mistake until the retry budget is
+    gone.
+    """
+    store, _repo, runtime, cycle, _task = setup_runtime(tmp_path)
+    tools = {
+        item.name: item
+        for item in build_lifecycle_tools(
+            runtime=runtime,
+            workflow_cycle_id=cycle.workflow_cycle_id,
+            publish_plan=lambda **_kwargs: (1, NOW),
+            publish_result=lambda **_kwargs: (2, NOW),
+        )
+    }
+    schema = tools["finish_validation"].args_schema.model_json_schema()
+    verdict = schema["properties"]["verdict"]
+    definitions = schema.get("$defs", {})
+    if "$ref" in verdict:
+        verdict = definitions[verdict["$ref"].rsplit("/", 1)[-1]]
+    assert set(verdict["enum"]) == {"ACCEPT", "NEEDS_FIXES", "REPLAN", "BLOCKED"}
+
+    with pytest.raises(Exception, match="(?i)verdict|validation"):
+        tools["finish_validation"].invoke(
+            {
+                "verdict": "pass",
+                "summary": "looks fine",
+                "findings": [],
+                "repair_instructions": [],
+                "evidence": {},
+            }
+        )
+    store.close()

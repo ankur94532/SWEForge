@@ -185,7 +185,7 @@ def build_lifecycle_tools(
 
     @tool
     def finish_validation(
-        verdict: str,
+        verdict: ValidationVerdict,
         summary: str,
         findings: list[dict[str, Any]],
         repair_instructions: list[str],
