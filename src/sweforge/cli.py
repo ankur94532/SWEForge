@@ -28,6 +28,10 @@ def main(argv: list[str] | None = None) -> int:
         from .repo_config_cli import main as repo_main
 
         return repo_main(selected[1:])
+    if selected[:1] == ["secret"]:
+        from .repo_secret_cli import main as secret_main
+
+        return secret_main(selected[1:])
     args = build_parser().parse_args(selected)
     workspace = None
     try:

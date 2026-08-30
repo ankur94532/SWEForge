@@ -33,6 +33,7 @@ from .github_publisher import GitHubPublisher
 from .github_store import SQLiteGitHubStore
 from .repo_config import RepoConfigRegistry
 from .repo_memory import SQLiteMemoryStore
+from .repo_secrets import RepoSecretStore
 from .workflow_controller import DeclarativeWorkflowController
 from .workflow_driver import DeepAgentWorkflowDriver
 from .workflow_learning import WorkflowLearningService
@@ -314,6 +315,7 @@ class SWEForgeServer:
             client, authenticator = self.client_factory(self.config)
             checkpoints = SQLiteCheckpointer(self.config.checkpoints)
             memory = SQLiteMemoryStore(self.config.memory_db)
+            secret_store = RepoSecretStore.from_environment(store)
             repo_config_registry = RepoConfigRegistry(store)
             bound_config = repo_config_registry.thread_generation(thread_id)
             if bound_config is not None:
@@ -371,6 +373,7 @@ class SWEForgeServer:
                     config_generation_id=(
                         bound_config.generation_id if bound_config is not None else None
                     ),
+                    secret_store=secret_store,
                 )
 
             controller = DeclarativeWorkflowController(

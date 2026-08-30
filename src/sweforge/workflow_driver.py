@@ -30,6 +30,7 @@ from .github_store import (
 from .memory_learning import candidate_from_proposal
 from .repo_config import RepoConfigRegistry
 from .repo_memory import MEMORY_VIRTUAL_PATH, ensure_repo_memory, repo_memory_namespace
+from .repo_secrets import RepoSecretStore
 from .script_tools import ScriptToolExecutor, build_script_tools
 from .skills import (
     DEFAULT_WORKFLOW_SKILLS,
@@ -75,6 +76,7 @@ class DeepAgentWorkflowDriver:
         tracer: AgentTracer | None = None,
         repo_config_registry: RepoConfigRegistry | None = None,
         config_generation_id: str | None = None,
+        secret_store: RepoSecretStore | None = None,
     ) -> None:
         self.runtime = runtime
         self.workflow_cycle_id = workflow_cycle_id
@@ -94,6 +96,7 @@ class DeepAgentWorkflowDriver:
         self.tracer = tracer
         self.repo_config_registry = repo_config_registry
         self.config_generation_id = config_generation_id
+        self.secret_store = secret_store
 
     def drive(
         self,
@@ -299,6 +302,17 @@ class DeepAgentWorkflowDriver:
                 files_for=lambda spec: self.repo_config_registry.script_files(
                     context.repo_id, self.config_generation_id, spec
                 ),
+                secret_resolver=(
+                    (
+                        lambda spec: self.secret_store.resolve_env(
+                            context.repo_id,
+                            spec.secret_env,
+                            subject=f"script:{spec.name}",
+                        )
+                    )
+                    if self.secret_store is not None
+                    else None
+                ),
                 sandbox_backend=isolated,
                 unsafe_local_shell=self.unsafe_local_shell,
                 tracer=self.tracer,
@@ -310,7 +324,12 @@ class DeepAgentWorkflowDriver:
             extra.extend(script_tools)
         if self.capability_registry is not None:
             mcp_tools, _ = asyncio.run(
-                load_repo_mcp_tools(self.capability_registry, context)
+                load_repo_mcp_tools(
+                    self.capability_registry,
+                    context,
+                    secret_store=self.secret_store,
+                    tracer=self.tracer,
+                )
             )
             extra.extend(mcp_tools)
         permissions = [

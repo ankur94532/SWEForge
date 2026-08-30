@@ -17,6 +17,7 @@ from langchain_core.tools import StructuredTool
 
 from .agent_trace import AgentTracer, TraceContext
 from .repo_config import MAX_SCRIPT_OUTPUT_CHARS, ScriptToolSpec
+from .repo_secrets import MIN_SECRET_CHARS, SecretValue
 
 
 def _validate_value(value: Any, schema: Mapping[str, Any], label: str) -> None:
@@ -59,6 +60,15 @@ def _bounded(value: str) -> str:
     return value[: available // 2] + marker + value[-(available - available // 2) :]
 
 
+def redact_injected_secrets(value: object, secrets: list[str]) -> str:
+    """Redact exact injected values before any model/log/error boundary."""
+    rendered = str(value)
+    for secret in secrets:
+        if len(secret) >= MIN_SECRET_CHARS:
+            rendered = rendered.replace(secret, "[REDACTED]")
+    return rendered
+
+
 class ScriptToolExecutor:
     """Execute fixed trusted scripts for one repo/config/worktree binding."""
 
@@ -67,6 +77,9 @@ class ScriptToolExecutor:
         *,
         worktree: str | Path,
         files_for: Callable[[ScriptToolSpec], Mapping[str, str]],
+        secret_resolver: (
+            Callable[[ScriptToolSpec], Mapping[str, SecretValue]] | None
+        ) = None,
         sandbox_backend: Any = None,
         unsafe_local_shell: bool = False,
         tracer: AgentTracer | None = None,
@@ -74,6 +87,7 @@ class ScriptToolExecutor:
     ) -> None:
         self.worktree = Path(worktree).resolve()
         self.files_for = files_for
+        self.secret_resolver = secret_resolver
         self.sandbox_backend = sandbox_backend
         self.unsafe_local_shell = unsafe_local_shell
         self.tracer = tracer
@@ -86,6 +100,9 @@ class ScriptToolExecutor:
             raise PermissionError("bound script entrypoint is unavailable")
         stage = Path(tempfile.mkdtemp(prefix=".sweforge-tool-", dir=str(self.worktree)))
         started = time.monotonic()
+        status = "failure"
+        output_chars = 0
+        secret_values: list[str] = []
         if self.tracer is not None:
             self.tracer.emit(
                 "SCRIPT TOOL CALL",
@@ -114,10 +131,48 @@ class ScriptToolExecutor:
                 "LANG": os.environ.get("LANG", "C.UTF-8"),
                 **dict(spec.env),
             }
+            if spec.secret_env:
+                if self.secret_resolver is None:
+                    if self.tracer is not None:
+                        self.tracer.emit(
+                            "SECRET RESOLUTION",
+                            (
+                                f"tool={spec.name} required={len(spec.secret_env)} "
+                                f"resolved=0 required_missing={len(spec.secret_env)}"
+                            ),
+                            self.trace_context,
+                        )
+                    raise PermissionError(
+                        "required repository credential store is unavailable"
+                    )
+                try:
+                    resolved = self.secret_resolver(spec)
+                except PermissionError:
+                    if self.tracer is not None:
+                        self.tracer.emit(
+                            "SECRET RESOLUTION",
+                            (
+                                f"tool={spec.name} required={len(spec.secret_env)} "
+                                f"resolved=0 required_missing={len(spec.secret_env)}"
+                            ),
+                            self.trace_context,
+                        )
+                    raise
+                secret_values = [value.reveal() for value in resolved.values()]
+                env.update({name: value.reveal() for name, value in resolved.items()})
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "SECRET RESOLUTION",
+                        (
+                            f"tool={spec.name} required={len(spec.secret_env)} "
+                            f"resolved={len(resolved)}"
+                        ),
+                        self.trace_context,
+                    )
             stdin = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
             result = self._run(command, stdin, env, spec.timeout_seconds)
-            stdout = _bounded(result.stdout)
-            stderr = _bounded(result.stderr)
+            stdout = _bounded(redact_injected_secrets(result.stdout, secret_values))
+            stderr = _bounded(redact_injected_secrets(result.stderr, secret_values))
             rendered = stdout
             if stderr:
                 rendered += ("\n" if rendered else "") + f"stderr:\n{stderr}"
@@ -126,18 +181,29 @@ class ScriptToolExecutor:
                     f"Script tool failed with exit code {result.returncode}.\n"
                     f"{rendered}"
                 )
-            return _bounded(rendered.rstrip())
+            rendered = _bounded(rendered.rstrip())
+            output_chars = len(rendered)
+            status = "success" if result.returncode == 0 else "failure"
+            return rendered
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError(
                 f"script tool exceeded {spec.timeout_seconds} second timeout"
             ) from exc
+        except (PermissionError, TimeoutError):
+            raise
+        except Exception as exc:
+            safe = redact_injected_secrets(exc, secret_values)
+            raise RuntimeError(f"registered script tool failed: {safe}") from None
         finally:
             shutil.rmtree(stage, ignore_errors=True)
             if self.tracer is not None:
                 duration_ms = int((time.monotonic() - started) * 1000)
                 self.tracer.emit(
                     "SCRIPT TOOL RESULT",
-                    f"tool={spec.name} duration_ms={duration_ms}",
+                    (
+                        f"tool={spec.name} status={status} "
+                        f"duration_ms={duration_ms} output_chars={output_chars}"
+                    ),
                     self.trace_context,
                 )
 

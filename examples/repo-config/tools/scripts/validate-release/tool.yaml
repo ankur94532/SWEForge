@@ -5,6 +5,10 @@ runtime: python
 entrypoint: validate_release.py
 effect: read
 timeout_seconds: 30
+env:
+  RELEASE_REGION: example-region
+secret_env:
+  RELEASE_POLICY_TOKEN: RELEASE_POLICY_TOKEN
 args_schema:
   type: object
   properties:

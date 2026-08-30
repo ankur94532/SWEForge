@@ -74,6 +74,7 @@ class ScriptToolSpec:
     effect: str
     directory: str
     env: Mapping[str, str] = MappingProxyType({})
+    secret_env: Mapping[str, str] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +82,7 @@ class MCPBundleServer:
     server_id: str
     connection: Mapping[str, Any]
     tools: tuple[str, ...]
+    secret_env: Mapping[str, str] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,6 +254,7 @@ def _parse_scripts(root: Path, files: Mapping[str, str]) -> tuple[ScriptToolSpec
             "timeout_seconds",
             "effect",
             "env",
+            "secret_env",
         }
         unknown = set(item) - allowed
         if unknown:
@@ -296,6 +299,13 @@ def _parse_scripts(root: Path, files: Mapping[str, str]) -> tuple[ScriptToolSpec
         ):
             raise ValueError(f"{label}.timeout_seconds is invalid")
         env = _string_mapping(item.get("env"), f"{label}.env", env_names=True)
+        secret_env = _string_mapping(
+            item.get("secret_env"), f"{label}.secret_env", env_names=True
+        )
+        if any(not _ENV_NAME.fullmatch(name) for name in secret_env.values()):
+            raise ValueError(f"{label}.secret_env contains an invalid secret name")
+        if set(env) & set(secret_env):
+            raise ValueError(f"{label} configures an environment name twice")
         names.add(name)
         result.append(
             ScriptToolSpec(
@@ -312,6 +322,7 @@ def _parse_scripts(root: Path, files: Mapping[str, str]) -> tuple[ScriptToolSpec
                 effect=effect,
                 directory=f"tools/scripts/{directory.name}",
                 env=MappingProxyType(env),
+                secret_env=MappingProxyType(secret_env),
             )
         )
     return tuple(result)
@@ -330,7 +341,7 @@ def _parse_mcp(files: Mapping[str, str]) -> tuple[MCPBundleServer, ...]:
         if not isinstance(server_id, str) or not _NAME.fullmatch(server_id):
             raise ValueError("MCP server ID is malformed")
         item = _mapping(raw, f"MCP server {server_id}")
-        unknown = set(item) - {"connection", "tools"}
+        unknown = set(item) - {"connection", "tools", "secret_env"}
         if unknown:
             raise ValueError(
                 f"MCP server {server_id} has unknown fields: {sorted(unknown)}"
@@ -349,11 +360,33 @@ def _parse_mcp(files: Mapping[str, str]) -> tuple[MCPBundleServer, ...]:
             or len(tools) != len(set(tools))
         ):
             raise ValueError(f"MCP server {server_id} configuration is incomplete")
+        secret_env = _string_mapping(
+            item.get("secret_env"), f"MCP server {server_id}.secret_env", env_names=True
+        )
+        if any(not _ENV_NAME.fullmatch(name) for name in secret_env.values()):
+            raise ValueError(
+                f"MCP server {server_id}.secret_env contains an invalid secret name"
+            )
+        if secret_env and connection.get("transport") != "stdio":
+            raise ValueError(
+                "remote MCP secret references are unsupported; use local stdio"
+            )
+        fixed_env = connection.get("env", {})
+        if fixed_env:
+            fixed_env = _string_mapping(
+                fixed_env, f"MCP server {server_id}.connection.env", env_names=True
+            )
+            if set(fixed_env) & set(secret_env):
+                raise ValueError(
+                    f"MCP server {server_id} configures an environment name twice"
+                )
+            connection = {**connection, "env": fixed_env}
         result.append(
             MCPBundleServer(
                 server_id=server_id,
                 connection=MappingProxyType(dict(connection)),
                 tools=tuple(tools),
+                secret_env=MappingProxyType(secret_env),
             )
         )
     return tuple(result)
@@ -419,6 +452,7 @@ def validate_repo_bundle(path: str | Path) -> ValidatedRepoBundle:
                 "effect": item.effect,
                 "directory": item.directory,
                 "env": dict(item.env),
+                "secret_env": dict(item.secret_env),
             }
             for item in scripts
         ],
@@ -427,6 +461,7 @@ def validate_repo_bundle(path: str | Path) -> ValidatedRepoBundle:
                 "server_id": item.server_id,
                 "connection": dict(item.connection),
                 "tools": list(item.tools),
+                "secret_env": dict(item.secret_env),
             }
             for item in mcp_servers
         ],
@@ -613,6 +648,7 @@ class RepoConfigRegistry:
                 effect=item["effect"],
                 directory=item["directory"],
                 env=MappingProxyType(item.get("env", {})),
+                secret_env=MappingProxyType(item.get("secret_env", {})),
             )
             for item in manifest["scripts"]
         )
@@ -638,7 +674,11 @@ class RepoConfigRegistry:
         registry = RepoCapabilityRegistry()
         for item in manifest["mcp"]:
             registry.register_server(
-                MCPServerSpec(item["server_id"], dict(item["connection"]))
+                MCPServerSpec(
+                    item["server_id"],
+                    dict(item["connection"]),
+                    dict(item.get("secret_env", {})),
+                )
             )
             registry.approve(repo_id, item["server_id"], set(item["tools"]))
         return registry
@@ -662,11 +702,37 @@ class RepoConfigRegistry:
                 for item in manifest["skills"]
             ],
             "scripts": [
-                {"name": item["name"], "effect": item["effect"]}
+                {
+                    "name": item["name"],
+                    "effect": item["effect"],
+                    "credentials": self._credential_status(
+                        repo_id, item.get("secret_env", {})
+                    ),
+                }
                 for item in manifest["scripts"]
             ],
             "mcp": [
-                {"server": item["server_id"], "tools": item["tools"]}
+                {
+                    "server": item["server_id"],
+                    "tools": item["tools"],
+                    "credentials": self._credential_status(
+                        repo_id, item.get("secret_env", {})
+                    ),
+                }
                 for item in manifest["mcp"]
             ],
         }
+
+    def _credential_status(
+        self, repo_id: int, references: Mapping[str, str]
+    ) -> dict[str, int]:
+        required = set(references.values())
+        if not required:
+            return {"required": 0, "configured": 0}
+        placeholders = ",".join("?" for _ in required)
+        row = self.store.connection.execute(
+            f"SELECT count(*) AS total FROM repo_secrets_v1 "
+            f"WHERE repo_id=? AND name IN ({placeholders})",
+            (repo_id, *sorted(required)),
+        ).fetchone()
+        return {"required": len(required), "configured": int(row["total"])}

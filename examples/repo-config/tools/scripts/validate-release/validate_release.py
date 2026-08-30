@@ -1,6 +1,7 @@
 """Harmless example registered tool; JSON arguments arrive on standard input."""
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -14,7 +15,16 @@ def main() -> int:
     document = json.loads(path.read_text(encoding="utf-8"))
     checks = document.get("checks")
     valid = isinstance(checks, list) and all(isinstance(item, str) for item in checks)
-    print(json.dumps({"valid": valid, "check_count": len(checks or [])}))
+    print(
+        json.dumps(
+            {
+                "valid": valid,
+                "check_count": len(checks or []),
+                "credential_configured": bool(os.environ.get("RELEASE_POLICY_TOKEN")),
+                "region": os.environ.get("RELEASE_REGION"),
+            }
+        )
+    )
     return 0 if valid else 1
 
 

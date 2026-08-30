@@ -252,3 +252,40 @@ def test_reference_bundle_is_valid_and_complete():
         "reporting",
     }
     assert [item.name for item in bundle.scripts] == ["validate_release"]
+
+
+def test_secret_env_collision_invalid_name_and_remote_mcp_refs_are_rejected(tmp_path):
+    collision = bundle_copy(tmp_path, "collision-env")
+    tool = collision / "tools" / "scripts" / "validate-release" / "tool.yaml"
+    tool.write_text(
+        tool.read_text().replace(
+            "RELEASE_REGION: example-region",
+            "RELEASE_POLICY_TOKEN: example-region",
+        )
+    )
+    with pytest.raises(ValueError, match="environment name twice"):
+        validate_repo_bundle(collision)
+
+    invalid = bundle_copy(tmp_path, "invalid-secret")
+    tool = invalid / "tools" / "scripts" / "validate-release" / "tool.yaml"
+    tool.write_text(
+        tool.read_text().replace(
+            "RELEASE_POLICY_TOKEN: RELEASE_POLICY_TOKEN",
+            "RELEASE_POLICY_TOKEN: invalid-name",
+        )
+    )
+    with pytest.raises(ValueError, match="secret name"):
+        validate_repo_bundle(invalid)
+
+    remote = bundle_copy(tmp_path, "remote")
+    (remote / "tools" / "mcp" / "servers.yaml").write_text(
+        """version: 1
+servers:
+  remote:
+    connection: {transport: http, url: https://example.invalid/mcp}
+    tools: [lookup]
+    secret_env: {TOKEN: REMOTE_TOKEN}
+"""
+    )
+    with pytest.raises(ValueError, match="remote MCP"):
+        validate_repo_bundle(remote)

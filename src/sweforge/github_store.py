@@ -145,6 +145,23 @@ CREATE TABLE IF NOT EXISTS repo_config_current_v1 (
     generation_id TEXT NOT NULL REFERENCES repo_config_generations_v1(generation_id),
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS repo_secrets_v1 (
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    name TEXT NOT NULL,
+    ciphertext BLOB NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(repo_id, name)
+);
+CREATE TABLE IF NOT EXISTS repo_secret_audit_v1 (
+    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    name TEXT,
+    operation TEXT NOT NULL,
+    subject TEXT,
+    count INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS issue_threads (
     thread_id TEXT PRIMARY KEY,
     repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),

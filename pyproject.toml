@@ -5,6 +5,7 @@ description = "A small local software-engineering agent harness built on Deep Ag
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "cryptography>=43.0.0",
     "deepagents>=0.7.0",
     "httpx>=0.28.0",
     "langgraph-checkpoint-sqlite>=3.1.1",

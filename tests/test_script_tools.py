@@ -6,9 +6,17 @@ import pytest
 
 from sweforge.github_store import SQLiteGitHubStore
 from sweforge.repo_config import RepoConfigRegistry, validate_repo_bundle
+from sweforge.repo_secrets import SecretValue
 from sweforge.script_tools import ScriptToolExecutor, build_script_tools
 
 EXAMPLE = Path(__file__).parents[1] / "examples" / "repo-config"
+
+
+def resolve_test_secrets(spec):
+    return {
+        environment_name: SecretValue("test-secret-value")
+        for environment_name in spec.secret_env
+    }
 
 
 def configured(tmp_path):
@@ -23,6 +31,7 @@ def configured(tmp_path):
     executor = ScriptToolExecutor(
         worktree=worktree,
         files_for=lambda spec: registry.script_files(1, generation.generation_id, spec),
+        secret_resolver=resolve_test_secrets,
         unsafe_local_shell=True,
     )
     tools, effects = build_script_tools(
@@ -47,7 +56,12 @@ def test_registered_script_executes_fixed_entrypoint_in_current_worktree(tmp_pat
 
     result = tool.invoke({"config_path": "release.json"})
 
-    assert json.loads(result) == {"valid": True, "check_count": 2}
+    assert json.loads(result) == {
+        "valid": True,
+        "check_count": 2,
+        "credential_configured": True,
+        "region": "example-region",
+    }
     assert list(worktree.glob(".sweforge-tool-*")) == []
 
 
@@ -81,6 +95,7 @@ def test_nonzero_stderr_and_output_are_bounded(tmp_path):
                 bundle / "tools" / "scripts" / "validate-release" / "tool.yaml"
             ).read_text(),
         },
+        secret_resolver=resolve_test_secrets,
         unsafe_local_shell=True,
     )
 
@@ -108,6 +123,7 @@ def test_timeout_is_enforced(tmp_path):
             "validate_release.py": script.read_text(),
             "tool.yaml": tool_yaml.read_text(),
         },
+        secret_resolver=resolve_test_secrets,
         unsafe_local_shell=True,
     )
     with pytest.raises(TimeoutError, match="timeout"):
@@ -132,6 +148,7 @@ def test_shell_runtime_uses_json_stdin_and_fixed_entrypoint(tmp_path):
             "validate_release.sh": script.read_text(),
             "tool.yaml": metadata.read_text(),
         },
+        secret_resolver=resolve_test_secrets,
         unsafe_local_shell=True,
     )
 

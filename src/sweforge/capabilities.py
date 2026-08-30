@@ -1,6 +1,7 @@
 """Trusted repo-scoped MCP capability registry and interceptor."""
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,9 @@ from langchain_core.messages import ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.interceptors import MCPToolCallRequest
 
+from .agent_trace import AgentTracer, TraceContext
 from .context import RepoAgentContext
+from .repo_secrets import RepoSecretStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +21,7 @@ class MCPServerSpec:
 
     server_id: str
     connection: dict[str, Any]
+    secret_env: dict[str, str] | None = None
 
 
 class RepoCapabilityRegistry:
@@ -106,13 +110,75 @@ def repo_scope_interceptor(registry: RepoCapabilityRegistry):
 async def load_repo_mcp_tools(
     registry: RepoCapabilityRegistry,
     context: RepoAgentContext,
+    *,
+    secret_store: RepoSecretStore | None = None,
+    tracer: AgentTracer | None = None,
 ):
     """Load only approved server tools; callers still pass the interceptor."""
+    connections: dict[str, dict[str, Any]] = {}
+    for key, spec in registry.approved_servers(context.repo_id).items():
+        connection = dict(spec.connection)
+        if connection.get("transport") == "stdio":
+            fixed_env = dict(connection.get("env", {}))
+            resolved = {}
+            if spec.secret_env:
+                if secret_store is None:
+                    if tracer is not None:
+                        tracer.emit(
+                            "SECRET RESOLUTION",
+                            (
+                                f"server={key} required={len(spec.secret_env)} "
+                                f"resolved=0 required_missing={len(spec.secret_env)}"
+                            ),
+                            TraceContext(
+                                thread_id=context.thread_id,
+                                repo=context.repo_full_name,
+                            ),
+                        )
+                    raise PermissionError(
+                        "required repository credential store is unavailable"
+                    )
+                try:
+                    resolved = secret_store.resolve_env(
+                        context.repo_id,
+                        spec.secret_env,
+                        subject=f"mcp:{key}",
+                    )
+                except PermissionError:
+                    if tracer is not None:
+                        tracer.emit(
+                            "SECRET RESOLUTION",
+                            (
+                                f"server={key} required={len(spec.secret_env)} "
+                                f"resolved=0 required_missing={len(spec.secret_env)}"
+                            ),
+                            TraceContext(
+                                thread_id=context.thread_id,
+                                repo=context.repo_full_name,
+                            ),
+                        )
+                    raise
+            connection["env"] = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "LANG": os.environ.get("LANG", "C.UTF-8"),
+                **fixed_env,
+                **{name: value.reveal() for name, value in resolved.items()},
+            }
+            if tracer is not None:
+                tracer.emit(
+                    "MCP SERVER START",
+                    (
+                        f"server={key} required={len(spec.secret_env or {})} "
+                        f"resolved={len(resolved)}"
+                    ),
+                    TraceContext(
+                        thread_id=context.thread_id,
+                        repo=context.repo_full_name,
+                    ),
+                )
+        connections[key] = connection
     client = MultiServerMCPClient(
-        {
-            key: spec.connection
-            for key, spec in registry.approved_servers(context.repo_id).items()
-        },
+        connections,
         tool_interceptors=[repo_scope_interceptor(registry)],
         tool_name_prefix=True,
         handle_tool_errors=False,
