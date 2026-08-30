@@ -1,0 +1,14 @@
+version: 1
+name: validate_release
+description: Validate a release-policy JSON file and return structured diagnostics.
+runtime: python
+entrypoint: validate_release.py
+effect: read
+timeout_seconds: 30
+args_schema:
+  type: object
+  properties:
+    config_path:
+      type: string
+  required: [config_path]
+  additionalProperties: false

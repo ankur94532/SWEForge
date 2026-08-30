@@ -162,7 +162,12 @@ def _skill_key(path: str) -> str:
 
 
 def put_repo_skill(
-    store: BaseStore, repo_id: int, relative_path: str, content: str
+    store: BaseStore,
+    repo_id: int,
+    relative_path: str,
+    content: str,
+    *,
+    config_generation_id: str | None = None,
 ) -> None:
     """Trusted operator write for one repo skill file."""
     if not content or len(content.encode()) > MAX_SKILL_FILE_BYTES:
@@ -174,7 +179,7 @@ def put_repo_skill(
         if key.count("/") < 2:
             raise ValueError("skill files must be inside a skill directory")
     store.put(
-        repo_skills_namespace(repo_id),
+        repo_skills_namespace(repo_id, config_generation_id),
         key,
         {"content": content, "encoding": "utf-8"},
     )
@@ -201,8 +206,17 @@ def list_repo_skills(store: BaseStore, repo_id: int) -> list[str]:
     return sorted(keys)
 
 
-def show_repo_skill(store: BaseStore, repo_id: int, relative_path: str) -> str | None:
-    item = store.get(repo_skills_namespace(repo_id), _skill_key(relative_path))
+def show_repo_skill(
+    store: BaseStore,
+    repo_id: int,
+    relative_path: str,
+    *,
+    config_generation_id: str | None = None,
+) -> str | None:
+    item = store.get(
+        repo_skills_namespace(repo_id, config_generation_id),
+        _skill_key(relative_path),
+    )
     if item is None:
         return None
     content = item.value.get("content")

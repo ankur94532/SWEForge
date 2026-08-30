@@ -431,6 +431,47 @@ def test_validation_cannot_mutate_after_skill_discovery():
         policy.wrap_tool_call(tool_request("edit_file"), lambda item: "ran")
 
 
+@pytest.mark.parametrize("phase", [TaskPhase.PLANNING, TaskPhase.VALIDATING])
+def test_registered_mutating_script_is_denied_outside_execution(phase):
+    authority = Authority(phase, ("release_deploy",))
+    policy = WorkflowPolicyMiddleware(
+        authority, tool_effects={"release_deploy": "mutate"}
+    )
+    request = ModelRequest(tools=[SimpleNamespace(name="release_deploy")])
+    captured = policy.wrap_model_call(request, lambda item: item)
+    assert captured.tools == []
+    with pytest.raises(PermissionError, match="forbidden"):
+        policy.wrap_tool_call(tool_request("release_deploy"), lambda _item: "ran")
+
+
+def test_registered_mutating_script_requires_execution_workflow_authority():
+    authority = Authority(TaskPhase.EXECUTING, ("release_deploy",))
+    policy = WorkflowPolicyMiddleware(
+        authority, tool_effects={"release_deploy": "mutate"}
+    )
+    assert (
+        policy.wrap_tool_call(tool_request("release_deploy"), lambda _item: "ran")
+        == "ran"
+    )
+    assert authority.runtime.reauthorized == ["task-run-A"]
+
+
+def test_investigator_gets_only_registered_read_effect_tools():
+    authority = Authority(TaskPhase.EXECUTING, ("read_release", "release_deploy"))
+    policy = DelegatedWorkflowPolicyMiddleware(
+        authority,
+        tool_effects={"read_release": "read", "release_deploy": "mutate"},
+    )
+    request = ModelRequest(
+        tools=[
+            SimpleNamespace(name="read_release"),
+            SimpleNamespace(name="release_deploy"),
+        ]
+    )
+    captured = policy.wrap_model_call(request, lambda item: item)
+    assert [tool.name for tool in captured.tools] == ["read_release"]
+
+
 def test_canonical_builder_requires_explicit_bounded_default_override(monkeypatch):
     with pytest.raises(ValueError, match="explicit bounded"):
         build_workflow_agent(

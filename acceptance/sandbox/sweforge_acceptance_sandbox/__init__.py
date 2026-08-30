@@ -402,6 +402,26 @@ class SeatbeltSandbox(BaseSandbox):
             truncated=truncated,
         )
 
+    def execute_tool(
+        self,
+        command: list[str],
+        *,
+        stdin: str,
+        env: dict[str, str],
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run one fixed registered tool without a model-controlled shell."""
+        return subprocess.run(
+            [SANDBOX_EXEC, "-f", str(self._profile_path), *command],
+            cwd=str(self.worktree),
+            env=env,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
         """Write through the sandbox so uploads obey the same boundary."""
         results: list[FileUploadResponse] = []

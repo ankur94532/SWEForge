@@ -1,0 +1,47 @@
+version: 1
+workflow_id: release-readiness
+tasks:
+  - id: model
+    depends_on: []
+    planning:
+      skill: domain-model
+      tools: [ls, read_file, glob, grep]
+    execution:
+      skill: domain-model
+      tools: [ls, read_file, glob, grep, edit_file, execute]
+    validation:
+      skill: domain-model
+      tools: [read_file, glob, grep, run_validation]
+  - id: config
+    depends_on: [model]
+    planning:
+      skill: config-loading
+      tools: [ls, read_file, glob, grep]
+    execution:
+      skill: config-loading
+      tools: [ls, read_file, glob, grep, edit_file, execute]
+    validation:
+      skill: config-loading
+      tools: [read_file, glob, grep, run_validation]
+  - id: readiness
+    depends_on: [model]
+    planning:
+      skill: readiness-rules
+      tools: [ls, read_file, glob, grep]
+    execution:
+      skill: readiness-rules
+      tools: [ls, read_file, glob, grep, edit_file, execute]
+    validation:
+      skill: readiness-rules
+      tools: [read_file, glob, grep, run_validation, validate_release]
+  - id: reporting
+    depends_on: [config, readiness]
+    planning:
+      skill: reporting
+      tools: [ls, read_file, glob, grep]
+    execution:
+      skill: reporting
+      tools: [ls, read_file, glob, grep, edit_file, execute]
+    validation:
+      skill: reporting
+      tools: [read_file, glob, grep, run_validation]

@@ -118,13 +118,20 @@ def build_durable_workflow_agent(
     permissions: list[FilesystemPermission] | None = None,
     middleware: list[AgentMiddleware] | None = None,
     tracer: AgentTracer | None = None,
+    tool_effects: Mapping[str, str] | None = None,
 ):
     """Build the one durable root agent with a bounded investigator below it."""
     extra_tools = capability_tools or []
+    effects = dict(tool_effects or {})
+    research_names = RESEARCH_TOOLS | frozenset(
+        name for name, effect in effects.items() if effect == "read"
+    )
     research = [
-        tool for tool in extra_tools if getattr(tool, "name", "") in RESEARCH_TOOLS
+        tool for tool in extra_tools if getattr(tool, "name", "") in research_names
     ]
-    delegated_policy = DelegatedWorkflowPolicyMiddleware(authority, tracer=tracer)
+    delegated_policy = DelegatedWorkflowPolicyMiddleware(
+        authority, tracer=tracer, tool_effects=effects
+    )
     delegated_skills = WorkflowSkillsMiddleware(authority, read_skill, tracer=tracer)
     subagents = [
         {
@@ -151,6 +158,7 @@ def build_durable_workflow_agent(
             TaskPhase.VALIDATING: validation_model,
         },
         tracer=tracer,
+        tool_effects=effects,
     )
     return build_workflow_agent(
         model=planning_model,
@@ -301,7 +309,9 @@ def _build_backend(
         )
     if repo_context is not None and skills_store is not None:
         routes["/skills/"] = StoreBackend(
-            namespace=lambda runtime: repo_skills_namespace(runtime.context.repo_id),
+            namespace=lambda runtime: repo_skills_namespace(
+                runtime.context.repo_id, runtime.context.config_generation_id
+            ),
             store=skills_store,
         )
     return CompositeBackend(

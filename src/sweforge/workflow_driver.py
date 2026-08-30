@@ -28,10 +28,13 @@ from .github_store import (
     repo_memory_candidate_id_for,
 )
 from .memory_learning import candidate_from_proposal
+from .repo_config import RepoConfigRegistry
 from .repo_memory import MEMORY_VIRTUAL_PATH, ensure_repo_memory, repo_memory_namespace
+from .script_tools import ScriptToolExecutor, build_script_tools
 from .skills import (
     DEFAULT_WORKFLOW_SKILLS,
     ensure_default_repo_skills,
+    put_repo_skill,
     show_repo_skill,
 )
 from .workflow_agent_runtime import invoke_workflow_phase
@@ -70,6 +73,8 @@ class DeepAgentWorkflowDriver:
         secure_execution: bool,
         unsafe_local_shell: bool,
         tracer: AgentTracer | None = None,
+        repo_config_registry: RepoConfigRegistry | None = None,
+        config_generation_id: str | None = None,
     ) -> None:
         self.runtime = runtime
         self.workflow_cycle_id = workflow_cycle_id
@@ -87,6 +92,8 @@ class DeepAgentWorkflowDriver:
         self.secure_execution = secure_execution
         self.unsafe_local_shell = unsafe_local_shell
         self.tracer = tracer
+        self.repo_config_registry = repo_config_registry
+        self.config_generation_id = config_generation_id
 
     def drive(
         self,
@@ -173,6 +180,7 @@ class DeepAgentWorkflowDriver:
             repo_id=root["repo_id"],
             repo_full_name=root["repo_full_name"],
             thread_id=cycle.thread_id,
+            config_generation_id=self.config_generation_id,
         )
         if self.secure_execution:
             isolated = require_secure_backend(
@@ -184,20 +192,53 @@ class DeepAgentWorkflowDriver:
         else:
             isolated = None
         ensure_repo_memory(self.memory_store, repo_memory_namespace(context.repo_id))
-        ensure_default_repo_skills(
-            self.memory_store,
-            context.repo_id,
-            (
-                skill
-                for task_spec in self.spec.tasks
-                for phase in (
-                    task_spec.planning,
-                    task_spec.execution,
-                    task_spec.validation,
+        if self.repo_config_registry is not None and self.config_generation_id:
+            for relative_path, content in self.repo_config_registry.skill_files(
+                context.repo_id, self.config_generation_id
+            ).items():
+                if (
+                    show_repo_skill(
+                        self.memory_store,
+                        context.repo_id,
+                        relative_path,
+                        config_generation_id=self.config_generation_id,
+                    )
+                    is None
+                ):
+                    put_repo_skill(
+                        self.memory_store,
+                        context.repo_id,
+                        relative_path,
+                        content,
+                        config_generation_id=self.config_generation_id,
+                    )
+            if self.tracer is not None:
+                generation = self.repo_config_registry.generation(
+                    context.repo_id, self.config_generation_id
                 )
-                for skill in phase.skills
-            ),
-        )
+                self.tracer.emit(
+                    "REPO CONFIG LOADED",
+                    (
+                        f"generation={generation.generation} "
+                        f"digest={generation.digest[:12]}"
+                    ),
+                    self._trace_context(cycle),
+                )
+        else:
+            ensure_default_repo_skills(
+                self.memory_store,
+                context.repo_id,
+                (
+                    skill
+                    for task_spec in self.spec.tasks
+                    for phase in (
+                        task_spec.planning,
+                        task_spec.execution,
+                        task_spec.validation,
+                    )
+                    for skill in phase.skills
+                ),
+            )
         observations: list[dict[str, Any]] = []
 
         def capture_execution_evidence(**observation: Any) -> None:
@@ -248,6 +289,25 @@ class DeepAgentWorkflowDriver:
             self._issue_memory_tool(context.repo_id),
             self._repo_memory_proposal_tool(cycle, context.repo_id),
         ]
+        tool_effects: dict[str, str] = {}
+        if self.repo_config_registry is not None and self.config_generation_id:
+            script_specs = self.repo_config_registry.script_specs(
+                context.repo_id, self.config_generation_id
+            )
+            script_executor = ScriptToolExecutor(
+                worktree=self.worktree,
+                files_for=lambda spec: self.repo_config_registry.script_files(
+                    context.repo_id, self.config_generation_id, spec
+                ),
+                sandbox_backend=isolated,
+                unsafe_local_shell=self.unsafe_local_shell,
+                tracer=self.tracer,
+                trace_context=self._trace_context(cycle),
+            )
+            script_tools, tool_effects = build_script_tools(
+                script_specs, script_executor
+            )
+            extra.extend(script_tools)
         if self.capability_registry is not None:
             mcp_tools, _ = asyncio.run(
                 load_repo_mcp_tools(self.capability_registry, context)
@@ -269,15 +329,14 @@ class DeepAgentWorkflowDriver:
             authority=authority,
             lifecycle_tools=lifecycle,
             capability_tools=extra,
-            read_skill=lambda _cycle_id, skill: self._read_skill(
-                context.repo_id, skill
-            ),
+            read_skill=lambda _cycle_id, skill: self._read_skill(context, skill),
             checkpointer=self.checkpointer,
             store=self.memory_store,
             context_schema=RepoAgentContext,
             memory=[MEMORY_VIRTUAL_PATH],
             permissions=permissions,
             tracer=self.tracer,
+            tool_effects=tool_effects,
         )
         return agent, authority, context
 
@@ -453,8 +512,14 @@ class DeepAgentWorkflowDriver:
             return cycle.thread_id
         return f"{cycle.thread_id}:revision:{cycle.workflow_cycle_id}"
 
-    def _read_skill(self, repo_id: int, skill: str) -> str:
-        content = show_repo_skill(self.memory_store, repo_id, f"{skill}/SKILL.md")
+    def _read_skill(self, context: RepoAgentContext, skill: str) -> str:
+        if self.repo_config_registry is not None and context.config_generation_id:
+            return self.repo_config_registry.read_skill(
+                context.repo_id, context.config_generation_id, skill
+            )
+        content = show_repo_skill(
+            self.memory_store, context.repo_id, f"{skill}/SKILL.md"
+        )
         if content:
             return content
         if skill in DEFAULT_WORKFLOW_SKILLS:

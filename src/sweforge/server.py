@@ -31,6 +31,7 @@ from .github_client import GitHubClient, HttpxGitHubClient
 from .github_poller import GitHubPoller
 from .github_publisher import GitHubPublisher
 from .github_store import SQLiteGitHubStore
+from .repo_config import RepoConfigRegistry
 from .repo_memory import SQLiteMemoryStore
 from .workflow_controller import DeclarativeWorkflowController
 from .workflow_driver import DeepAgentWorkflowDriver
@@ -313,7 +314,35 @@ class SWEForgeServer:
             client, authenticator = self.client_factory(self.config)
             checkpoints = SQLiteCheckpointer(self.config.checkpoints)
             memory = SQLiteMemoryStore(self.config.memory_db)
-            capability_registry = self.capability_registry
+            repo_config_registry = RepoConfigRegistry(store)
+            bound_config = repo_config_registry.thread_generation(thread_id)
+            if bound_config is not None:
+                selected_spec = repo_config_registry.load_workflow(
+                    bound_config.repo_id, bound_config.generation_id
+                )
+                selected_spec_ref = (
+                    f"repo-config:{bound_config.generation_id}:{bound_config.digest}"
+                )
+                capability_registry = repo_config_registry.capability_registry(
+                    bound_config.repo_id, bound_config.generation_id
+                )
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "REPO CONFIG BOUND",
+                        (
+                            f"generation={bound_config.generation} "
+                            f"digest={bound_config.digest[:12]}"
+                        ),
+                        trace_context or TraceContext(thread_id=thread_id),
+                    )
+            else:
+                selected_spec = self.workflow_spec
+                selected_spec_ref = (
+                    str(self.config.workflow_spec.resolve())
+                    if self.config.workflow_spec
+                    else "builtin:default"
+                )
+                capability_registry = self.capability_registry
             sandbox = resolve_sandbox_provider(self.config.sandbox_provider)
 
             def production_driver_factory(
@@ -336,17 +365,19 @@ class SWEForgeServer:
                     secure_execution=not self.config.unsafe_local_shell,
                     unsafe_local_shell=self.config.unsafe_local_shell,
                     tracer=self.tracer,
+                    repo_config_registry=(
+                        repo_config_registry if bound_config is not None else None
+                    ),
+                    config_generation_id=(
+                        bound_config.generation_id if bound_config is not None else None
+                    ),
                 )
 
             controller = DeclarativeWorkflowController(
                 store=store,
                 client=client,
-                spec=self.workflow_spec,
-                spec_ref=(
-                    str(self.config.workflow_spec.resolve())
-                    if self.config.workflow_spec
-                    else "builtin:default"
-                ),
+                spec=selected_spec,
+                spec_ref=selected_spec_ref,
                 repo_paths=self.config.repo_paths,
                 workspace_root=self.config.workspace_root,
                 lock_root=self.config.lock_root,

@@ -1,5 +1,10 @@
 # SWEForge
 
+Trusted per-repository workflows, skills, registered tools, and MCP allowlists
+can be installed as immutable bundles. See
+[Adding a repository to SWEForge](docs/adding-a-repository.md) and the complete
+[`examples/repo-config`](examples/repo-config) bundle.
+
 SWEForge V0 is a small local walking skeleton for software-engineering agents.
 Its flow is: task → temporary Git worktree → Deep Agent → inspect/edit/test →
 diff/result.

@@ -163,19 +163,29 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
         *,
         phase_models: Mapping[TaskPhase, Any] | None = None,
         tracer: AgentTracer | None = None,
+        tool_effects: Mapping[str, str] | None = None,
     ) -> None:
         self.authority = authority
         self.tracer = tracer
+        self.tool_effects = dict(tool_effects or {})
         self.phase_models = {
             phase: resolve_model(model) for phase, model in (phase_models or {}).items()
         }
 
     @staticmethod
-    def allowed_tools(snapshot: WorkflowPolicySnapshot) -> frozenset[str]:
+    def allowed_tools(
+        snapshot: WorkflowPolicySnapshot,
+        tool_effects: Mapping[str, str] | None = None,
+    ) -> frozenset[str]:
         # ``task`` delegates only to the explicitly bounded investigator.
         configured = snapshot.configured_tools
         if snapshot.feedback_review_status == "REVIEWING":
-            return (configured & RESEARCH_TOOLS) | {
+            research = RESEARCH_TOOLS | frozenset(
+                name
+                for name, effect in (tool_effects or {}).items()
+                if effect == "read"
+            )
+            return (configured & research) | {
                 "task",
                 "replan_current_feedback",
                 "defer_current_feedback_to_revision",
@@ -187,6 +197,11 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
             # into an execution phase. Custom MCP tools remain operator-owned;
             # built-in mutation is denied here and again at call time.
             configured = configured - MUTATING_TOOLS
+            configured = configured - {
+                name
+                for name, effect in (tool_effects or {}).items()
+                if effect == "mutate"
+            }
         validation_service = (
             {"run_validation"} if snapshot.phase == TaskPhase.VALIDATING else set()
         )
@@ -201,7 +216,7 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
 
     def wrap_model_call(self, request, handler):
         snapshot = self.authority.snapshot()
-        allowed = self.allowed_tools(snapshot)
+        allowed = self.allowed_tools(snapshot, self.tool_effects)
         tools = [tool for tool in request.tools if _tool_name(tool) in allowed]
         prompt = (
             f"Authoritative SWEForge context: workflow={snapshot.workflow_id} "
@@ -248,7 +263,7 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
             if callable(snapshot_for_tool)
             else self.authority.snapshot()
         )
-        if name not in self.allowed_tools(snapshot):
+        if name not in self.allowed_tools(snapshot, self.tool_effects):
             raise PermissionError(
                 f"tool {name!r} is forbidden for {snapshot.phase.value}"
             )
@@ -311,14 +326,25 @@ class DelegatedWorkflowPolicyMiddleware(AgentMiddleware):
     """A strict subset policy for the explicit read-only investigator."""
 
     def __init__(
-        self, authority: WorkflowAuthority, *, tracer: AgentTracer | None = None
+        self,
+        authority: WorkflowAuthority,
+        *,
+        tracer: AgentTracer | None = None,
+        tool_effects: Mapping[str, str] | None = None,
     ) -> None:
         self.authority = authority
         self.tracer = tracer
+        self.tool_effects = dict(tool_effects or {})
+
+    @property
+    def research_tools(self) -> frozenset[str]:
+        return RESEARCH_TOOLS | frozenset(
+            name for name, effect in self.tool_effects.items() if effect == "read"
+        )
 
     def wrap_model_call(self, request, handler):
         snapshot = self.authority.snapshot()
-        allowed = snapshot.configured_tools & RESEARCH_TOOLS
+        allowed = snapshot.configured_tools & self.research_tools
         tools = [tool for tool in request.tools if _tool_name(tool) in allowed]
         prompt = (
             "You are a bounded read-only investigator below the root workflow "
@@ -336,7 +362,7 @@ class DelegatedWorkflowPolicyMiddleware(AgentMiddleware):
     def wrap_tool_call(self, request, handler):
         snapshot = self.authority.snapshot()
         name = _call_name(request)
-        if name not in (snapshot.configured_tools & RESEARCH_TOOLS):
+        if name not in (snapshot.configured_tools & self.research_tools):
             raise PermissionError(f"delegated tool {name!r} is forbidden")
         skill_read = WorkflowPolicyMiddleware._reject_inactive_skill_path(
             request, snapshot

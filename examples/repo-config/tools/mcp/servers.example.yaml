@@ -1,0 +1,8 @@
+version: 1
+servers:
+  release-catalog:
+    connection:
+      transport: stdio
+      command: python
+      args: [/trusted/operator/path/release_catalog_server.py]
+    tools: [lookup_release]

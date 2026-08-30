@@ -121,12 +121,37 @@ CREATE TABLE IF NOT EXISTS repositories (
     full_name TEXT NOT NULL UNIQUE,
     observed_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS repo_config_generations_v1 (
+    generation_id TEXT PRIMARY KEY,
+    repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
+    generation INTEGER NOT NULL,
+    digest TEXT NOT NULL,
+    workflow_id TEXT NOT NULL,
+    workflow_version INTEGER NOT NULL,
+    workflow_json TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(repo_id, generation)
+);
+CREATE TABLE IF NOT EXISTS repo_config_files_v1 (
+    generation_id TEXT NOT NULL REFERENCES repo_config_generations_v1(generation_id),
+    path TEXT NOT NULL,
+    content TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    PRIMARY KEY(generation_id, path)
+);
+CREATE TABLE IF NOT EXISTS repo_config_current_v1 (
+    repo_id INTEGER PRIMARY KEY REFERENCES repositories(repo_id),
+    generation_id TEXT NOT NULL REFERENCES repo_config_generations_v1(generation_id),
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS issue_threads (
     thread_id TEXT PRIMARY KEY,
     repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
     repo_full_name TEXT NOT NULL,
     issue_number INTEGER NOT NULL,
     interaction_mode TEXT NOT NULL DEFAULT 'MANUAL',
+    config_generation_id TEXT REFERENCES repo_config_generations_v1(generation_id),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(repo_id, issue_number)
@@ -1447,6 +1472,10 @@ class SQLiteGitHubStore:
             self.connection.execute(
                 "ALTER TABLE issue_threads ADD COLUMN interaction_mode "
                 "TEXT NOT NULL DEFAULT 'MANUAL'"
+            )
+        if "config_generation_id" not in thread_columns:
+            self.connection.execute(
+                "ALTER TABLE issue_threads ADD COLUMN config_generation_id TEXT"
             )
         cycle_columns = {
             row[1]
@@ -5913,16 +5942,22 @@ class SQLiteGitHubStore:
                 if any(label.casefold() == "auto" for label in event.issue_labels)
                 else InteractionMode.MANUAL
             )
+            current_config = db.execute(
+                "SELECT generation_id FROM repo_config_current_v1 WHERE repo_id=?",
+                (event.repo_id,),
+            ).fetchone()
             db.execute(
                 """INSERT INTO issue_threads(thread_id, repo_id, repo_full_name,
-                   issue_number, interaction_mode, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   issue_number, interaction_mode, config_generation_id,
+                   created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     thread_id,
                     event.repo_id,
                     event.repo_full_name,
                     event.subject_number,
                     interaction_mode.value,
+                    current_config["generation_id"] if current_config else None,
                     now,
                     now,
                 ),

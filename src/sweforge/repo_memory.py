@@ -23,9 +23,12 @@ def legacy_repo_memory_namespace(repo_id: int) -> tuple[str, ...]:
     return ("sweforge", "repo", str(repo_id))
 
 
-def repo_skills_namespace(repo_id: int) -> tuple[str, ...]:
-    """Return the separate durable namespace for one repository's skills."""
-    return ("sweforge", "repo", str(repo_id), "skills")
+def repo_skills_namespace(
+    repo_id: int, config_generation_id: str | None = None
+) -> tuple[str, ...]:
+    """Return the repo and optional immutable-generation skill namespace."""
+    base = ("sweforge", "repo", str(repo_id), "skills")
+    return (*base, config_generation_id) if config_generation_id else base
 
 
 class SQLiteMemoryStore:

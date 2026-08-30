@@ -23,7 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    selected = list(argv) if argv is not None else sys.argv[1:]
+    if selected[:1] == ["repo"]:
+        from .repo_config_cli import main as repo_main
+
+        return repo_main(selected[1:])
+    args = build_parser().parse_args(selected)
     workspace = None
     try:
         config = Config.from_environment(args.model)

@@ -10,6 +10,7 @@ class RepoAgentContext:
     repo_id: int
     repo_full_name: str
     thread_id: str
+    config_generation_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.repo_id <= 0:
@@ -18,3 +19,5 @@ class RepoAgentContext:
             raise ValueError("repo_full_name must be OWNER/REPOSITORY")
         if not self.thread_id:
             raise ValueError("thread_id must not be empty")
+        if self.config_generation_id is not None and not self.config_generation_id:
+            raise ValueError("config_generation_id must be non-empty when supplied")
