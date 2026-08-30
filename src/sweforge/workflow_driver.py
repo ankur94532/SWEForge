@@ -32,7 +32,12 @@ from .repo_memory import MEMORY_VIRTUAL_PATH, ensure_repo_memory, repo_memory_na
 from .skills import show_repo_skill
 from .workflow_agent_runtime import invoke_workflow_phase
 from .workflow_middleware import WorkflowAuthority
-from .workflow_runtime import TaskRun, WorkflowCycle, WorkflowRuntime
+from .workflow_runtime import (
+    TaskRun,
+    WorkflowCycle,
+    WorkflowCycleKind,
+    WorkflowRuntime,
+)
 from .workflow_spec import DEFAULT_WORKFLOW, WorkflowSpec
 from .workflow_tools import build_lifecycle_tools
 
@@ -103,7 +108,7 @@ class DeepAgentWorkflowDriver:
         invoke_workflow_phase(
             agent,
             authority=authority,
-            thread_id=cycle.thread_id,
+            thread_id=self._checkpoint_thread_id(cycle),
             prompt=prompt,
             context=context,
             resume=resume,
@@ -120,7 +125,7 @@ class DeepAgentWorkflowDriver:
     def reconcile_interrupts(self, *, cycle: WorkflowCycle, task: TaskRun) -> None:
         self._assert_cycle_spec(cycle)
         agent, _, _ = self._agent(cycle)
-        config = {"configurable": {"thread_id": cycle.thread_id}}
+        config = {"configurable": {"thread_id": self._checkpoint_thread_id(cycle)}}
         for payload in pending_interrupt_values(agent, config):
             if payload.get("task_run_id") != task.task_run_id:
                 continue
@@ -137,7 +142,7 @@ class DeepAgentWorkflowDriver:
     ) -> bool:
         self._assert_cycle_spec(cycle)
         agent, _, _ = self._agent(cycle)
-        config = {"configurable": {"thread_id": cycle.thread_id}}
+        config = {"configurable": {"thread_id": self._checkpoint_thread_id(cycle)}}
         matches = [
             payload
             for payload in pending_interrupt_values(agent, config)
@@ -196,6 +201,18 @@ class DeepAgentWorkflowDriver:
             publish_result=lambda **kwargs: self._publish_result(cycle, **kwargs),
             execution_evidence=lambda: list(observations),
             validation_evidence=lambda: list(validations),
+            auto_plan_ready=lambda: (
+                not (
+                    cycle.cycle_kind == WorkflowCycleKind.REVISION
+                    and self.store.pending_revision_inputs(cycle.thread_id)
+                )
+            ),
+            auto_result_ready=lambda: (
+                not (
+                    cycle.cycle_kind == WorkflowCycleKind.REVISION
+                    and self.store.pending_revision_inputs(cycle.thread_id)
+                )
+            ),
             tracer=self.tracer,
             trace_context=lambda task: self._trace_context(cycle, task),
         )
@@ -400,18 +417,31 @@ class DeepAgentWorkflowDriver:
         if root is not None:
             return root
         deferred = self.store.deferred_followup_by_id(cycle.root_input_id)
-        if deferred is None:
-            raise RuntimeError("workflow root input disappeared")
-        root = self.store.source_event(deferred["event_key"])
+        if deferred is not None:
+            root = self.store.source_event(deferred["event_key"])
+        else:
+            root = self.store.revision_input(cycle.root_input_id)
         if root is None:
             raise RuntimeError("workflow root SourceEvent disappeared")
         return root
+
+    @staticmethod
+    def _checkpoint_thread_id(cycle: WorkflowCycle) -> str:
+        if cycle.cycle_kind == WorkflowCycleKind.INITIAL:
+            return cycle.thread_id
+        return f"{cycle.thread_id}:revision:{cycle.workflow_cycle_id}"
 
     def _read_skill(self, repo_id: int, skill: str) -> str:
         content = show_repo_skill(self.memory_store, repo_id, f"{skill}/SKILL.md")
         if content:
             return content
-        if self.spec.digest == DEFAULT_WORKFLOW.digest:
+        default_skills = {
+            skill
+            for task in DEFAULT_WORKFLOW.tasks
+            for phase in (task.planning, task.execution, task.validation)
+            for skill in phase.skills
+        }
+        if self.spec.digest == DEFAULT_WORKFLOW.digest or skill in default_skills:
             return (
                 "Inspect the repository carefully, follow the approved scope, use "
                 "the current phase tools, and provide concrete validation evidence."

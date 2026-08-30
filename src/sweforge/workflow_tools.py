@@ -22,6 +22,8 @@ def build_lifecycle_tools(
     publish_result: Callable[..., tuple[int, str]],
     execution_evidence: Callable[[], list[dict[str, Any]]] | None = None,
     validation_evidence: Callable[[], list[dict[str, Any]]] | None = None,
+    auto_plan_ready: Callable[[], bool] | None = None,
+    auto_result_ready: Callable[[], bool] | None = None,
     tracer: AgentTracer | None = None,
     trace_context: Callable[[TaskRun], TraceContext] | None = None,
 ) -> list[Any]:
@@ -90,12 +92,17 @@ def build_lifecycle_tools(
             task = trace_transition(task)
         if runtime.store.interaction_mode(task.thread_id) == InteractionMode.AUTO:
             waiting = runtime.task(task.task_run_id)
-            if waiting.phase == TaskPhase.WAITING_FOR_PLAN_APPROVAL:
+            ready = auto_plan_ready is None or auto_plan_ready()
+            if waiting.phase == TaskPhase.WAITING_FOR_PLAN_APPROVAL and ready:
                 runtime.auto_authorize_plan(task.task_run_id)
                 if tracer is not None:
                     tracer.authorization(context(waiting), "AUTO", "plan")
                 trace_transition(waiting)
-            return "Exact AUTO plan authorization recorded. Continue in EXECUTING."
+            return (
+                "Exact AUTO plan authorization recorded. Continue in EXECUTING."
+                if ready
+                else "AUTO plan is waiting for queued revision input reconciliation."
+            )
         approval = interrupt(
             {
                 "kind": "PLAN_APPROVAL",
@@ -206,6 +213,10 @@ def build_lifecycle_tools(
         else:
             raise PermissionError("only validation may submit a result")
         if runtime.store.interaction_mode(task.thread_id) == InteractionMode.AUTO:
+            if auto_result_ready is not None and not auto_result_ready():
+                return (
+                    "AUTO result is waiting for queued revision input reconciliation."
+                )
             before = runtime.task(task.task_run_id) if tracer is not None else task
             runtime.auto_accept_result(task.task_run_id)
             if tracer is not None:

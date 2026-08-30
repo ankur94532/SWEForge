@@ -123,6 +123,15 @@ CREATE TABLE IF NOT EXISTS issue_threads (
     updated_at TEXT NOT NULL,
     UNIQUE(repo_id, issue_number)
 );
+CREATE TABLE IF NOT EXISTS thread_workflow_lifecycle_v1 (
+    thread_id TEXT PRIMARY KEY REFERENCES issue_threads(thread_id),
+    initial_state TEXT NOT NULL,
+    initial_root_event_key TEXT NOT NULL,
+    initial_workflow_cycle_id TEXT,
+    initial_workflow_digest TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS source_events (
     event_key TEXT PRIMARY KEY,
     repo_id INTEGER NOT NULL REFERENCES repositories(repo_id),
@@ -424,6 +433,8 @@ CREATE TABLE IF NOT EXISTS workflow_cycles_v1 (
     workflow_digest TEXT NOT NULL,
     workflow_spec_json TEXT NOT NULL,
     workflow_spec_ref TEXT,
+    cycle_kind TEXT NOT NULL DEFAULT 'INITIAL',
+    revision_sequence INTEGER,
     status TEXT NOT NULL,
     active_task_id TEXT,
     failure_reason TEXT,
@@ -431,6 +442,21 @@ CREATE TABLE IF NOT EXISTS workflow_cycles_v1 (
     updated_at TEXT NOT NULL,
     UNIQUE(thread_id, cycle_id)
 );
+CREATE TABLE IF NOT EXISTS revision_inputs_v1 (
+    revision_input_id TEXT PRIMARY KEY,
+    source_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    residual_text TEXT,
+    classification_reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    queued_at TEXT NOT NULL,
+    revision_workflow_cycle_id TEXT REFERENCES workflow_cycles_v1(workflow_cycle_id),
+    batched_at TEXT,
+    consumed_at TEXT,
+    UNIQUE(source_event_key, residual_text)
+);
+CREATE INDEX IF NOT EXISTS idx_revision_inputs_thread_status
+    ON revision_inputs_v1(thread_id, status, queued_at, revision_input_id);
 CREATE TABLE IF NOT EXISTS workflow_task_runs_v1 (
     task_run_id TEXT PRIMARY KEY,
     workflow_cycle_id TEXT NOT NULL REFERENCES workflow_cycles_v1(workflow_cycle_id),
@@ -1318,6 +1344,19 @@ class SQLiteGitHubStore:
                 "ALTER TABLE issue_threads ADD COLUMN interaction_mode "
                 "TEXT NOT NULL DEFAULT 'MANUAL'"
             )
+        cycle_columns = {
+            row[1]
+            for row in self.connection.execute("PRAGMA table_info(workflow_cycles_v1)")
+        }
+        if "cycle_kind" not in cycle_columns:
+            self.connection.execute(
+                "ALTER TABLE workflow_cycles_v1 ADD COLUMN cycle_kind "
+                "TEXT NOT NULL DEFAULT 'INITIAL'"
+            )
+        if "revision_sequence" not in cycle_columns:
+            self.connection.execute(
+                "ALTER TABLE workflow_cycles_v1 ADD COLUMN revision_sequence INTEGER"
+            )
         permit_columns = {
             row[1]
             for row in self.connection.execute(
@@ -1339,6 +1378,60 @@ class SQLiteGitHubStore:
                SET phase='WAITING_FOR_PLAN_APPROVAL'
                WHERE phase='WAITING_FOR_APPROVAL'"""
         )
+        # Threads created by this version receive an explicit NOT_STARTED row
+        # at ingestion.  Pre-feature rows are backfilled only from durable
+        # lifecycle/publication evidence; otherwise they fail closed.
+        for thread in self.connection.execute(
+            """SELECT t.* FROM issue_threads AS t
+               LEFT JOIN thread_workflow_lifecycle_v1 AS l
+                 ON l.thread_id=t.thread_id WHERE l.thread_id IS NULL"""
+        ).fetchall():
+            initial = self.connection.execute(
+                """SELECT * FROM workflow_cycles_v1
+                   WHERE thread_id=? AND cycle_kind='INITIAL'
+                   ORDER BY cycle_id LIMIT 1""",
+                (thread["thread_id"],),
+            ).fetchone()
+            published = self.connection.execute(
+                """SELECT 1 FROM logical_publications
+                   WHERE thread_id=? AND status IN ('COMPLETED','NO_CHANGES')
+                   LIMIT 1""",
+                (thread["thread_id"],),
+            ).fetchone()
+            legacy_active = self.connection.execute(
+                "SELECT 1 FROM issue_workflow_state WHERE thread_id=? LIMIT 1",
+                (thread["thread_id"],),
+            ).fetchone()
+            root = self.connection.execute(
+                """SELECT event_key FROM source_events WHERE thread_id=?
+                   ORDER BY source_updated_at,discovered_at,event_key LIMIT 1""",
+                (thread["thread_id"],),
+            ).fetchone()
+            if root is None:
+                continue
+            if published:
+                state = "PUBLISHED"
+            elif initial is not None:
+                state = "ACTIVE" if initial["status"] == "ACTIVE" else "COMPLETE"
+            elif legacy_active:
+                state = "ACTIVE"
+            else:
+                state = "LEGACY_BLOCKED"
+            self.connection.execute(
+                """INSERT OR IGNORE INTO thread_workflow_lifecycle_v1(
+                   thread_id,initial_state,initial_root_event_key,
+                   initial_workflow_cycle_id,initial_workflow_digest,
+                   created_at,updated_at) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    thread["thread_id"],
+                    state,
+                    root["event_key"],
+                    initial["workflow_cycle_id"] if initial else None,
+                    initial["workflow_digest"] if initial else None,
+                    thread["created_at"],
+                    thread["updated_at"],
+                ),
+            )
 
     def _migrate_execution_baselines(self) -> None:
         columns = {
@@ -2266,6 +2359,19 @@ class SQLiteGitHubStore:
                         event.review_thread_root_id,
                     ),
                 )
+                if thread_id is not None:
+                    db.execute(
+                        """INSERT OR IGNORE INTO thread_workflow_lifecycle_v1(
+                           thread_id,initial_state,initial_root_event_key,
+                           created_at,updated_at) VALUES(?,'NOT_STARTED',?,?,?)""",
+                        (thread_id, event.event_key, polled_at, polled_at),
+                    )
+                    self._classify_revision_input(
+                        db,
+                        event_key=event.event_key,
+                        thread_id=thread_id,
+                        queued_at=polled_at,
+                    )
                 result.events_persisted += 1
             db.execute(
                 """INSERT INTO poll_cursors(repo_id, stream, since, etag,
@@ -2285,6 +2391,184 @@ class SQLiteGitHubStore:
                 source_kind=stream,
             )
         return result
+
+    @classmethod
+    def _classify_revision_input(
+        cls,
+        db: sqlite3.Connection,
+        *,
+        event_key: str,
+        thread_id: str,
+        queued_at: str,
+    ) -> str:
+        """Classify one durable input without consulting model/checkpoint state."""
+        event = db.execute(
+            "SELECT * FROM source_events WHERE event_key=?", (event_key,)
+        ).fetchone()
+        lifecycle = db.execute(
+            "SELECT * FROM thread_workflow_lifecycle_v1 WHERE thread_id=?",
+            (thread_id,),
+        ).fetchone()
+        if event is None or lifecycle is None:
+            raise RuntimeError("routed SourceEvent lifecycle is missing")
+        if event_key == lifecycle["initial_root_event_key"]:
+            return "INITIAL_ROOT"
+        if not is_actionable_source_event(event["source_kind"], event["body"]):
+            return "IGNORED"
+        has_declarative = db.execute(
+            "SELECT 1 FROM workflow_cycles_v1 WHERE thread_id=? LIMIT 1",
+            (thread_id,),
+        ).fetchone()
+        legacy_state = db.execute(
+            "SELECT 1 FROM issue_workflow_state WHERE thread_id=? LIMIT 1",
+            (thread_id,),
+        ).fetchone()
+        # Until application code chooses the initial runtime, retain exact
+        # SourceEvent order without guessing whether the legacy or declarative
+        # controller will own this thread. The selected controller classifies
+        # it before the next model invocation.
+        if (
+            lifecycle["initial_state"] == "NOT_STARTED"
+            and has_declarative is None
+            and legacy_state is None
+        ):
+            return "PENDING_INITIAL_SELECTION"
+        if has_declarative is None and legacy_state is not None:
+            return "LEGACY_WORKFLOW_INPUT"
+        expected = cls._matches_open_interaction(db, event, thread_id)
+        if expected:
+            return "EXPECTED_RESPONSE"
+        if is_exact_agent_approval(event["body"]):
+            cls._record_disposition_sql(
+                db,
+                event_key=event_key,
+                thread_id=thread_id,
+                cycle_id=cls._latest_cycle_id_sql(db, thread_id),
+                status="STALE_APPROVAL",
+                recorded_at=queued_at,
+            )
+            return "STALE_APPROVAL"
+        revision_input_id = (
+            "revision-input-" + hashlib.sha256(event_key.encode()).hexdigest()[:24]
+        )
+        db.execute(
+            """INSERT OR IGNORE INTO revision_inputs_v1(
+               revision_input_id,source_event_key,thread_id,residual_text,
+               classification_reason,status,queued_at)
+               VALUES(?,?,?,NULL,'UNSOLICITED_STEERING','PENDING',?)""",
+            (revision_input_id, event_key, thread_id, queued_at),
+        )
+        cls._record_disposition_sql(
+            db,
+            event_key=event_key,
+            thread_id=thread_id,
+            cycle_id=cls._latest_cycle_id_sql(db, thread_id),
+            status="REVISION_QUEUED",
+            recorded_at=queued_at,
+        )
+        return "REVISION_QUEUED"
+
+    @staticmethod
+    def _latest_cycle_id_sql(db: sqlite3.Connection, thread_id: str) -> int:
+        row = db.execute(
+            "SELECT COALESCE(MAX(cycle_id),0) FROM workflow_cycles_v1 WHERE thread_id=?",
+            (thread_id,),
+        ).fetchone()
+        return int(row[0])
+
+    @staticmethod
+    def _record_disposition_sql(
+        db: sqlite3.Connection,
+        *,
+        event_key: str,
+        thread_id: str,
+        cycle_id: int,
+        status: str,
+        recorded_at: str,
+    ) -> None:
+        db.execute(
+            """INSERT INTO thread_input_consumptions(
+               event_key,thread_id,cycle_id,purpose,status,claimed_at,consumed_at)
+               VALUES(?,?,?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING""",
+            (
+                event_key,
+                thread_id,
+                cycle_id,
+                InputPurpose.CLARIFICATION_ROUTED.value,
+                status,
+                recorded_at,
+                recorded_at,
+            ),
+        )
+
+    @staticmethod
+    def _cycle_root_event_sql(
+        db: sqlite3.Connection, root_input_id: str
+    ) -> sqlite3.Row | None:
+        root = db.execute(
+            "SELECT * FROM source_events WHERE event_key=?", (root_input_id,)
+        ).fetchone()
+        if root is not None:
+            return root
+        root = db.execute(
+            """SELECT se.* FROM deferred_followups AS d
+               JOIN source_events AS se ON se.event_key=d.source_event_key
+               WHERE d.deferred_id=?""",
+            (root_input_id,),
+        ).fetchone()
+        if root is not None:
+            return root
+        return db.execute(
+            """SELECT se.* FROM revision_inputs_v1 AS r
+               JOIN source_events AS se ON se.event_key=r.source_event_key
+               WHERE r.revision_input_id=?""",
+            (root_input_id,),
+        ).fetchone()
+
+    @classmethod
+    def _matches_open_interaction(
+        cls, db: sqlite3.Connection, event: sqlite3.Row, thread_id: str
+    ) -> bool:
+        if not starts_with_agent_invocation(event["body"]):
+            return False
+        cycle = db.execute(
+            """SELECT * FROM workflow_cycles_v1 WHERE thread_id=? AND status='ACTIVE'
+               ORDER BY cycle_id DESC LIMIT 1""",
+            (thread_id,),
+        ).fetchone()
+        if cycle is None or not cycle["active_task_id"]:
+            return False
+        task = db.execute(
+            """SELECT * FROM workflow_task_runs_v1
+               WHERE workflow_cycle_id=? AND task_id=?""",
+            (cycle["workflow_cycle_id"], cycle["active_task_id"]),
+        ).fetchone()
+        if task is None or task["phase"] not in {
+            "WAITING_FOR_PLAN_APPROVAL",
+            "WAITING_FOR_RESULT_APPROVAL",
+            "WAITING_FOR_INPUT",
+        }:
+            return False
+        root = cls._cycle_root_event_sql(db, cycle["root_input_id"])
+        if root is None or not cls._same_generic_target(event, root):
+            return False
+        threshold = task["updated_at"]
+        if task["phase"] == "WAITING_FOR_PLAN_APPROVAL":
+            occurrence = db.execute(
+                "SELECT posted_at FROM workflow_task_plans_v1 WHERE plan_id=?",
+                (task["current_plan_id"],),
+            ).fetchone()
+            threshold = occurrence["posted_at"] if occurrence else threshold
+        elif task["phase"] == "WAITING_FOR_RESULT_APPROVAL":
+            occurrence = db.execute(
+                """SELECT r.posted_at FROM workflow_task_results_v1 AS r
+                   JOIN workflow_task_validations_v1 AS v
+                     ON v.validation_id=r.validation_id
+                   WHERE r.task_run_id=? ORDER BY v.validation_round DESC LIMIT 1""",
+                (task["task_run_id"],),
+            ).fetchone()
+            threshold = occurrence["posted_at"] if occurrence else threshold
+        return SQLiteGitHubStore._after_posted_at(event, threshold)
 
     def observe_issue_content(
         self,
@@ -4357,6 +4641,12 @@ class SQLiteGitHubStore:
         db: sqlite3.Connection, thread_id: str
     ) -> PublicationTarget | None:
         """Prove cumulative publication eligibility from generic task state."""
+        if db.execute(
+            """SELECT 1 FROM revision_inputs_v1
+               WHERE thread_id=? AND status='PENDING' LIMIT 1""",
+            (thread_id,),
+        ).fetchone():
+            return None
         cycle = db.execute(
             """SELECT * FROM workflow_cycles_v1 WHERE thread_id=?
                ORDER BY cycle_id DESC LIMIT 1""",
@@ -4366,6 +4656,34 @@ class SQLiteGitHubStore:
             cycle is None
             or cycle["status"] != "AWAITING_PUBLICATION"
             or cycle["active_task_id"] is not None
+        ):
+            return None
+        lifecycle = db.execute(
+            "SELECT * FROM thread_workflow_lifecycle_v1 WHERE thread_id=?",
+            (thread_id,),
+        ).fetchone()
+        if lifecycle is None or lifecycle["initial_state"] not in {
+            "COMPLETE",
+            "PUBLISHED",
+        }:
+            return None
+        initial = db.execute(
+            "SELECT * FROM workflow_cycles_v1 WHERE workflow_cycle_id=?",
+            (lifecycle["initial_workflow_cycle_id"],),
+        ).fetchone()
+        if (
+            initial is None
+            or initial["thread_id"] != thread_id
+            or initial["cycle_kind"] != "INITIAL"
+            or initial["workflow_digest"] != lifecycle["initial_workflow_digest"]
+            or initial["status"] not in {"AWAITING_PUBLICATION", "PUBLISHED"}
+        ):
+            return None
+        if cycle["cycle_kind"] == "REVISION" and (
+            cycle["workflow_spec_ref"]
+            != f"derived:{initial['workflow_cycle_id']}:{initial['workflow_digest']}"
+            or cycle["workflow_id"] != f"revision-{initial['workflow_digest'][:16]}"
+            or cycle["revision_sequence"] is None
         ):
             return None
         try:
@@ -4400,6 +4718,13 @@ class SQLiteGitHubStore:
                 """SELECT se.* FROM deferred_followups AS df
                    JOIN source_events AS se ON se.event_key=df.source_event_key
                    WHERE df.deferred_id=?""",
+                (cycle["root_input_id"],),
+            ).fetchone()
+        if root is None and str(cycle["root_input_id"]).startswith("revision-input-"):
+            root = db.execute(
+                """SELECT se.* FROM revision_inputs_v1 AS ri
+                   JOIN source_events AS se ON se.event_key=ri.source_event_key
+                   WHERE ri.revision_input_id=?""",
                 (cycle["root_input_id"],),
             ).fetchone()
         if root is None:
@@ -4862,6 +5187,20 @@ class SQLiteGitHubStore:
                 )
                 if finalized.rowcount != 1:
                     raise ValueError("workflow state changed during finalization")
+                db.execute(
+                    """UPDATE workflow_cycles_v1 SET status='PUBLISHED',updated_at=?
+                       WHERE thread_id=? AND cycle_id<?
+                         AND status='AWAITING_PUBLICATION'""",
+                    (now, target.thread_id, target.cycle_id),
+                )
+                lifecycle = db.execute(
+                    """UPDATE thread_workflow_lifecycle_v1
+                       SET initial_state='PUBLISHED',updated_at=?
+                       WHERE thread_id=? AND initial_state IN ('COMPLETE','PUBLISHED')""",
+                    (now, target.thread_id),
+                )
+                if lifecycle.rowcount != 1:
+                    raise ValueError("initial workflow publication state is missing")
             else:
                 db.execute(
                     """UPDATE issue_plans SET status = ?
@@ -4965,24 +5304,35 @@ class SQLiteGitHubStore:
         if publication is None:
             return None
         cycle = self.connection.execute(
-            """SELECT workflow_cycle_id FROM workflow_cycles_v1
+            """SELECT workflow_cycle_id,cycle_id FROM workflow_cycles_v1
                WHERE thread_id=? AND cycle_id=? AND root_input_id=?""",
             (publication.thread_id, publication.cycle_id, publication.root_input_id),
         ).fetchone()
         if cycle is None:
             return None
         rows = self.connection.execute(
-            """SELECT t.task_id,e.summary
-               FROM workflow_task_runs_v1 AS t
+            """SELECT c.cycle_kind,c.revision_sequence,t.task_id,e.summary
+               FROM workflow_cycles_v1 AS c
+               JOIN workflow_task_runs_v1 AS t
+                 ON t.workflow_cycle_id=c.workflow_cycle_id
                JOIN workflow_task_executions_v1 AS e
                  ON e.task_run_id=t.task_run_id AND e.attempt=t.execution_attempt
-               WHERE t.workflow_cycle_id=? ORDER BY t.declaration_index""",
-            (cycle["workflow_cycle_id"],),
+               WHERE c.thread_id=? AND c.cycle_id<=?
+                 AND c.status IN ('AWAITING_PUBLICATION','PUBLISHED')
+               ORDER BY c.cycle_id,t.declaration_index""",
+            (publication.thread_id, cycle["cycle_id"]),
         ).fetchall()
         return "\n\n".join(
             [
                 "SWEForge completed the declared workflow tasks:",
-                *[f"### {row['task_id']}\n{row['summary']}" for row in rows],
+                *[
+                    (
+                        f"### {row['task_id']}\n{row['summary']}"
+                        if row["cycle_kind"] == "INITIAL"
+                        else f"### revision {row['revision_sequence']}\n{row['summary']}"
+                    )
+                    for row in rows
+                ],
             ]
         )[:12_000]
 
@@ -5137,6 +5487,168 @@ class SQLiteGitHubStore:
         if thread is None:
             raise ValueError("unknown IssueThread")
         return InteractionMode(thread["interaction_mode"])
+
+    def thread_workflow_lifecycle(self, thread_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM thread_workflow_lifecycle_v1 WHERE thread_id=?",
+            (thread_id,),
+        ).fetchone()
+
+    def activate_initial_workflow(
+        self,
+        *,
+        thread_id: str,
+        workflow_cycle_id: str,
+        workflow_digest: str,
+        now: str,
+    ) -> None:
+        with self.transaction(immediate=True) as db:
+            changed = db.execute(
+                """UPDATE thread_workflow_lifecycle_v1
+                   SET initial_state='ACTIVE',initial_workflow_cycle_id=?,
+                       initial_workflow_digest=?,updated_at=?
+                   WHERE thread_id=? AND initial_state='NOT_STARTED'""",
+                (workflow_cycle_id, workflow_digest, now, thread_id),
+            )
+            if changed.rowcount != 1:
+                row = db.execute(
+                    "SELECT * FROM thread_workflow_lifecycle_v1 WHERE thread_id=?",
+                    (thread_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["initial_workflow_cycle_id"] != workflow_cycle_id
+                    or row["initial_workflow_digest"] != workflow_digest
+                    or row["initial_state"] not in {"ACTIVE", "COMPLETE", "PUBLISHED"}
+                ):
+                    raise ValueError("initial workflow may only be activated once")
+
+    def complete_initial_workflow(
+        self, *, thread_id: str, workflow_cycle_id: str, now: str
+    ) -> None:
+        with self.transaction(immediate=True) as db:
+            changed = db.execute(
+                """UPDATE thread_workflow_lifecycle_v1 SET initial_state='COMPLETE',
+                   updated_at=? WHERE thread_id=? AND initial_state='ACTIVE'
+                   AND initial_workflow_cycle_id=?""",
+                (now, thread_id, workflow_cycle_id),
+            )
+            if changed.rowcount != 1:
+                row = db.execute(
+                    "SELECT * FROM thread_workflow_lifecycle_v1 WHERE thread_id=?",
+                    (thread_id,),
+                ).fetchone()
+                if row is None or row["initial_state"] not in {"COMPLETE", "PUBLISHED"}:
+                    raise ValueError("initial workflow completion identity mismatch")
+
+    def route_unmatched_inputs(self, thread_id: str, *, now: str) -> list[str]:
+        """Move non-response inputs to the durable revision inbox exactly once."""
+        routed: list[str] = []
+        with self.transaction(immediate=True) as db:
+            rows = db.execute(
+                """SELECT se.* FROM source_events AS se
+                   LEFT JOIN thread_input_consumptions AS c
+                     ON c.event_key=se.event_key
+                   WHERE se.thread_id=? AND c.event_key IS NULL
+                   ORDER BY se.source_updated_at,se.discovered_at,se.event_key""",
+                (thread_id,),
+            ).fetchall()
+            for row in rows:
+                disposition = self._classify_revision_input(
+                    db,
+                    event_key=row["event_key"],
+                    thread_id=thread_id,
+                    queued_at=row["discovered_at"] or now,
+                )
+                if disposition == "REVISION_QUEUED":
+                    routed.append(row["event_key"])
+        return routed
+
+    def pending_revision_inputs(self, thread_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """SELECT r.*,se.repo_full_name,se.source_kind,se.source_id,
+                      se.source_updated_at,se.source_created_at,se.subject_kind,
+                      se.subject_number,se.author_login,se.body AS source_body,
+                      se.html_url,se.origin_surface,se.path,se.line,se.start_line,
+                      se.side,se.start_side,se.diff_hunk,se.commit_id,
+                      se.original_commit_id,se.in_reply_to_id,
+                      se.pull_request_review_id,se.review_thread_root_id
+               FROM revision_inputs_v1 AS r
+               JOIN source_events AS se ON se.event_key=r.source_event_key
+               WHERE r.thread_id=? AND r.status='PENDING'
+               ORDER BY se.source_updated_at,r.queued_at,r.revision_input_id""",
+            (thread_id,),
+        ).fetchall()
+
+    def revision_inputs_for_cycle(
+        self, workflow_cycle_id: str, *, include_consumed: bool = True
+    ) -> list[sqlite3.Row]:
+        status = "" if include_consumed else " AND r.status='BATCHED'"
+        return self.connection.execute(
+            """SELECT r.*,se.repo_full_name,se.source_kind,se.source_id,
+                      se.source_updated_at,se.source_created_at,se.subject_kind,
+                      se.subject_number,se.author_login,se.body AS source_body,
+                      se.html_url,se.origin_surface,se.path,se.line,se.start_line,
+                      se.side,se.start_side,se.diff_hunk,se.commit_id,
+                      se.original_commit_id,se.in_reply_to_id,
+                      se.pull_request_review_id,se.review_thread_root_id
+               FROM revision_inputs_v1 AS r
+               JOIN source_events AS se ON se.event_key=r.source_event_key
+               WHERE r.revision_workflow_cycle_id=?"""
+            + status
+            + " ORDER BY se.source_updated_at,r.queued_at,r.revision_input_id",
+            (workflow_cycle_id,),
+        ).fetchall()
+
+    def revision_input(self, revision_input_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """SELECT r.*,se.* FROM revision_inputs_v1 AS r
+               JOIN source_events AS se ON se.event_key=r.source_event_key
+               WHERE r.revision_input_id=?""",
+            (revision_input_id,),
+        ).fetchone()
+
+    def batch_revision_inputs(
+        self, *, thread_id: str, workflow_cycle_id: str, now: str
+    ) -> list[sqlite3.Row]:
+        with self.transaction(immediate=True) as db:
+            cycle = db.execute(
+                """SELECT * FROM workflow_cycles_v1 WHERE workflow_cycle_id=?
+                   AND thread_id=? AND cycle_kind='REVISION' AND status='ACTIVE'""",
+                (workflow_cycle_id, thread_id),
+            ).fetchone()
+            if cycle is None:
+                raise ValueError("revision input batch target is not active")
+            db.execute(
+                """UPDATE revision_inputs_v1 SET status='BATCHED',
+                   revision_workflow_cycle_id=?,batched_at=?
+                   WHERE thread_id=? AND status='PENDING'""",
+                (workflow_cycle_id, now, thread_id),
+            )
+            db.execute(
+                """UPDATE deferred_followups SET status='CONSUMED',
+                   consumed_cycle_id=?,consumed_at=?
+                   WHERE thread_id=? AND status='QUEUED' AND EXISTS(
+                     SELECT 1 FROM revision_inputs_v1 AS r
+                     WHERE r.revision_workflow_cycle_id=?
+                       AND r.source_event_key=deferred_followups.source_event_key
+                       AND COALESCE(r.residual_text,'')=
+                           COALESCE(deferred_followups.residual_text,''))""",
+                (cycle["cycle_id"], now, thread_id, workflow_cycle_id),
+            )
+        return self.revision_inputs_for_cycle(workflow_cycle_id)
+
+    def consume_revision_inputs(
+        self, *, thread_id: str, workflow_cycle_id: str, now: str
+    ) -> int:
+        with self.transaction(immediate=True) as db:
+            changed = db.execute(
+                """UPDATE revision_inputs_v1 SET status='CONSUMED',consumed_at=?
+                   WHERE thread_id=? AND revision_workflow_cycle_id=?
+                     AND status='BATCHED'""",
+                (now, thread_id, workflow_cycle_id),
+            )
+            return changed.rowcount
 
     def source_events_for_thread(self, thread_id: str) -> list[sqlite3.Row]:
         return self.connection.execute(
@@ -6335,6 +6847,24 @@ class SQLiteGitHubStore:
                     queued_at,
                 ),
             )
+            revision_input_id = (
+                "revision-input-"
+                + hashlib.sha256(deferred_id.encode()).hexdigest()[:24]
+            )
+            db.execute(
+                """INSERT OR IGNORE INTO revision_inputs_v1(
+                   revision_input_id,source_event_key,thread_id,residual_text,
+                   classification_reason,status,queued_at)
+                   VALUES(?,?,?,?,?,'PENDING',?)""",
+                (
+                    revision_input_id,
+                    source_event_key,
+                    thread_id,
+                    residual_text,
+                    "CLARIFICATION_RESIDUAL",
+                    queued_at,
+                ),
+            )
             if disposition_status is not None:
                 db.execute(
                     """INSERT INTO thread_input_consumptions(
@@ -6808,6 +7338,7 @@ class SQLiteGitHubStore:
         self, *, generic: sqlite3.Row, pending: list[sqlite3.Row], actionable: bool
     ) -> bool:
         status = generic["status"]
+        pending_revision = bool(self.pending_revision_inputs(generic["thread_id"]))
         if status == "FAILED":
             return False
         if status == "PUBLISHED":
@@ -6815,9 +7346,12 @@ class SQLiteGitHubStore:
                 self.pending_memory_learning(generic["thread_id"])
                 or self.pending_issue_resolution(generic["thread_id"])
                 or self.deferred_followups(generic["thread_id"])
+                or pending_revision
                 or actionable
             )
         if status == "AWAITING_PUBLICATION":
+            if pending_revision:
+                return True
             publication_id = publication_id_for(
                 thread_id=generic["thread_id"],
                 cycle_id=generic["cycle_id"],
@@ -6848,7 +7382,7 @@ class SQLiteGitHubStore:
             and self.interaction_mode(generic["thread_id"]) == InteractionMode.AUTO
         ):
             return True
-        root = self.source_event(generic["root_input_id"])
+        root = self._cycle_root_event_sql(self.connection, generic["root_input_id"])
         if root is None:
             return False
         if task["phase"] == "WAITING_FOR_PLAN_APPROVAL":

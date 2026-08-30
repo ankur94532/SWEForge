@@ -34,6 +34,11 @@ class WorkflowCycleStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class WorkflowCycleKind(StrEnum):
+    INITIAL = "INITIAL"
+    REVISION = "REVISION"
+
+
 class ValidationVerdict(StrEnum):
     ACCEPT = "ACCEPT"
     NEEDS_FIXES = "NEEDS_FIXES"
@@ -50,6 +55,8 @@ class WorkflowCycle:
     workflow_id: str
     workflow_version: int
     workflow_digest: str
+    cycle_kind: WorkflowCycleKind
+    revision_sequence: int | None
     status: WorkflowCycleStatus
     active_task_id: str | None
     failure_reason: str | None
@@ -184,6 +191,8 @@ class WorkflowRuntime:
         root_input_id: str,
         spec: WorkflowSpec,
         spec_ref: str | None = None,
+        cycle_kind: WorkflowCycleKind = WorkflowCycleKind.INITIAL,
+        revision_sequence: int | None = None,
     ) -> WorkflowCycle:
         identity = workflow_cycle_id_for(
             thread_id=thread_id, cycle_id=cycle_id, workflow_id=spec.workflow_id
@@ -202,15 +211,25 @@ class WorkflowRuntime:
                     existing["workflow_cycle_id"] != identity
                     or existing["workflow_digest"] != spec.digest
                     or existing["root_input_id"] != root_input_id
+                    or existing["cycle_kind"] != cycle_kind.value
+                    or existing["revision_sequence"] != revision_sequence
                 ):
                     raise ValueError("workflow cycle identity/specification mismatch")
                 return self._cycle(existing)
+            active = db.execute(
+                """SELECT workflow_cycle_id FROM workflow_cycles_v1
+                   WHERE thread_id=? AND status='ACTIVE' LIMIT 1""",
+                (thread_id,),
+            ).fetchone()
+            if active is not None:
+                raise ValueError("IssueThread already has an active workflow owner")
             db.execute(
                 """INSERT INTO workflow_cycles_v1(
                    workflow_cycle_id,thread_id,cycle_id,root_input_id,workflow_id,
                    workflow_version,workflow_digest,workflow_spec_json,
-                   workflow_spec_ref,status,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   workflow_spec_ref,cycle_kind,revision_sequence,status,
+                   created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     identity,
                     thread_id,
@@ -221,6 +240,8 @@ class WorkflowRuntime:
                     spec.digest,
                     canonical,
                     spec_ref,
+                    cycle_kind.value,
+                    revision_sequence,
                     WorkflowCycleStatus.ACTIVE.value,
                     timestamp,
                     timestamp,
@@ -253,6 +274,13 @@ class WorkflowRuntime:
                         timestamp,
                     ),
                 )
+        if cycle_kind == WorkflowCycleKind.INITIAL:
+            self.store.activate_initial_workflow(
+                thread_id=thread_id,
+                workflow_cycle_id=identity,
+                workflow_digest=spec.digest,
+                now=timestamp,
+            )
         return self.cycle(identity)
 
     def cycle(self, workflow_cycle_id: str) -> WorkflowCycle:
@@ -279,6 +307,14 @@ class WorkflowRuntime:
         row = self.db.execute(
             """SELECT COALESCE(MAX(cycle_id),0)+1 FROM workflow_cycles_v1
                WHERE thread_id=?""",
+            (thread_id,),
+        ).fetchone()
+        return int(row[0])
+
+    def next_revision_sequence(self, thread_id: str) -> int:
+        row = self.db.execute(
+            """SELECT COALESCE(MAX(revision_sequence),0)+1
+               FROM workflow_cycles_v1 WHERE thread_id=? AND cycle_kind='REVISION'""",
             (thread_id,),
         ).fetchone()
         return int(row[0])
@@ -382,6 +418,14 @@ class WorkflowRuntime:
                             workflow_cycle_id,
                         ),
                     )
+                    if cycle["cycle_kind"] == WorkflowCycleKind.INITIAL.value:
+                        db.execute(
+                            """UPDATE thread_workflow_lifecycle_v1
+                               SET initial_state='COMPLETE',updated_at=?
+                               WHERE thread_id=? AND initial_state='ACTIVE'
+                                 AND initial_workflow_cycle_id=?""",
+                            (timestamp, cycle["thread_id"], workflow_cycle_id),
+                        )
                 return None
             if (
                 db.execute(
@@ -670,6 +714,74 @@ class WorkflowRuntime:
                 (
                     TaskPhase.PLANNING.value,
                     TaskPhase.PLANNING.value,
+                    timestamp,
+                    task_run_id,
+                ),
+            )
+        return self.task(task_run_id)
+
+    def replan_for_revision_inputs(
+        self, *, task_run_id: str, revision_input_ids: list[str]
+    ) -> TaskRun:
+        """Supersede a visible stale revision occurrence at a safe boundary."""
+        if not revision_input_ids:
+            raise ValueError("revision replan requires durable input identities")
+        timestamp = self.clock()
+        with self.store.transaction(immediate=True) as db:
+            row = db.execute(
+                "SELECT * FROM workflow_task_runs_v1 WHERE task_run_id=?",
+                (task_run_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown task run")
+            task = self._task(row)
+            cycle = db.execute(
+                "SELECT * FROM workflow_cycles_v1 WHERE workflow_cycle_id=?",
+                (task.workflow_cycle_id,),
+            ).fetchone()
+            if (
+                cycle is None
+                or cycle["cycle_kind"] != WorkflowCycleKind.REVISION.value
+                or cycle["status"] != WorkflowCycleStatus.ACTIVE.value
+                or cycle["active_task_id"] != task.task_id
+                or task.phase
+                not in {
+                    TaskPhase.WAITING_FOR_PLAN_APPROVAL,
+                    TaskPhase.WAITING_FOR_RESULT_APPROVAL,
+                }
+            ):
+                raise ValueError("revision task is not at a replanning boundary")
+            history = list(task.repair_feedback)
+            history.append(
+                {
+                    "kind": "QUEUED_REVISION_INPUTS",
+                    "revision_input_ids": list(revision_input_ids),
+                    "superseded_phase": task.phase.value,
+                }
+            )
+            if task.current_plan_id:
+                db.execute(
+                    "UPDATE workflow_task_plans_v1 SET status='SUPERSEDED' "
+                    "WHERE plan_id=?",
+                    (task.current_plan_id,),
+                )
+            db.execute(
+                """UPDATE workflow_task_permits_v1 SET invalidated_at=?
+                   WHERE task_run_id=? AND invalidated_at IS NULL""",
+                (timestamp, task_run_id),
+            )
+            db.execute(
+                """UPDATE workflow_task_result_approvals_v1 SET invalidated_at=?
+                   WHERE task_run_id=? AND invalidated_at IS NULL""",
+                (timestamp, task_run_id),
+            )
+            db.execute(
+                """UPDATE workflow_task_runs_v1 SET status=?,phase=?,
+                   repair_feedback_json=?,updated_at=? WHERE task_run_id=?""",
+                (
+                    TaskPhase.PLANNING.value,
+                    TaskPhase.PLANNING.value,
+                    json.dumps(history, sort_keys=True),
                     timestamp,
                     task_run_id,
                 ),
@@ -1420,6 +1532,8 @@ class WorkflowRuntime:
             workflow_id=row["workflow_id"],
             workflow_version=row["workflow_version"],
             workflow_digest=row["workflow_digest"],
+            cycle_kind=WorkflowCycleKind(row["cycle_kind"]),
+            revision_sequence=row["revision_sequence"],
             status=WorkflowCycleStatus(row["status"]),
             active_task_id=row["active_task_id"],
             failure_reason=row["failure_reason"],

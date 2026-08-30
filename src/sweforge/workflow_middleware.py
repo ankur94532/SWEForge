@@ -28,6 +28,7 @@ class WorkflowPolicySnapshot:
     phase: TaskPhase
     skill: str
     configured_tools: frozenset[str]
+    skills: tuple[str, ...] = ()
 
 
 class WorkflowAuthority:
@@ -97,6 +98,7 @@ class WorkflowAuthority:
             task_run_id=task.task_run_id,
             phase=phase,
             skill=phase_spec.skill,
+            skills=phase_spec.skills,
             configured_tools=frozenset(phase_spec.tools),
         )
 
@@ -219,8 +221,12 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
         path = str(args.get("file_path") or args.get("path") or "")
         if not path.startswith("/skills/"):
             return
-        allowed_prefix = f"/skills/{snapshot.skill}/"
-        if path != allowed_prefix + "SKILL.md" and not path.startswith(allowed_prefix):
+        skills = snapshot.skills or (snapshot.skill,)
+        allowed_prefixes = tuple(f"/skills/{skill}/" for skill in skills)
+        if not any(
+            path == prefix + "SKILL.md" or path.startswith(prefix)
+            for prefix in allowed_prefixes
+        ):
             raise PermissionError("inactive task/phase skill access is forbidden")
 
 
@@ -285,11 +291,12 @@ class WorkflowSkillsMiddleware(AgentMiddleware):
 
     def wrap_model_call(self, request, handler):
         snapshot = self.authority.snapshot()
-        content = self.read_skill(snapshot.cycle_id, snapshot.skill)
-        if not isinstance(content, str) or not content.strip():
-            raise PermissionError(
-                f"required workflow skill is missing: {snapshot.skill}"
-            )
+        rendered = []
+        for skill in snapshot.skills or (snapshot.skill,):
+            content = self.read_skill(snapshot.cycle_id, skill)
+            if not isinstance(content, str) or not content.strip():
+                raise PermissionError(f"required workflow skill is missing: {skill}")
+            rendered.append(f"[Trusted skill: {skill}]\n{content}")
         prefix = getattr(request.system_message, "content", "")
-        prompt = f"{prefix}\n\n[Active skill: {snapshot.skill}]\n{content}"
+        prompt = f"{prefix}\n\n" + "\n\n".join(rendered)
         return handler(request.override(system_message=SystemMessage(content=prompt)))

@@ -7,6 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 
 from sweforge.github_models import (
+    OriginSurface,
     RepositoryRef,
     SourceEvent,
     SourceKind,
@@ -666,7 +667,7 @@ def test_clarification_keeps_owner_and_rejects_approval_as_answer(tmp_path):
     FakeDriver.clarify_once = False
 
 
-def test_queued_deferred_followup_becomes_next_declarative_cycle(tmp_path):
+def test_queued_deferred_followup_becomes_generic_revision_cycle(tmp_path):
     FakeDriver.events = []
     FakeDriver.verdicts = {}
     FakePublisher.calls = []
@@ -720,7 +721,343 @@ def test_queued_deferred_followup_becomes_next_declarative_cycle(tmp_path):
         "SELECT * FROM workflow_cycles_v1 ORDER BY cycle_id"
     ).fetchall()
     assert [row["status"] for row in cycles] == ["PUBLISHED", "ACTIVE"]
-    assert cycles[1]["root_input_id"] == deferred.deferred_id
-    assert cycles[1]["active_task_id"] == "implementation"
+    assert cycles[1]["root_input_id"].startswith("revision-input-")
+    assert cycles[1]["cycle_kind"] == "REVISION"
+    assert cycles[1]["active_task_id"] == "revision"
     assert store.deferred_followup_by_id(deferred.deferred_id)["status"] == "CONSUMED"
+    assert {
+        row["residual_text"]
+        for row in store.revision_inputs_for_cycle(cycles[1]["workflow_cycle_id"])
+    } == {None, "update the documentation"}
+    store.close()
+
+
+def test_unsolicited_inputs_batch_before_first_publication_and_run_generic_revision(
+    tmp_path,
+):
+    FakeDriver.events = []
+    FakeDriver.specs = []
+    FakeDriver.verdicts = {}
+    FakePublisher.calls = []
+    server = _server(tmp_path, max_ticks=1)
+    thread_id = "github:41:issue:9"
+    _record(
+        server.config.db,
+        "issues",
+        _event(
+            SourceKind.ISSUE,
+            "root",
+            "@agent implement the original request",
+            "2026-01-01T00:00:00Z",
+        ),
+    )
+    server._worker_entry(thread_id)
+    _record(
+        server.config.db,
+        "issue_comments",
+        _event(
+            SourceKind.ISSUE_COMMENT,
+            "plan-ok",
+            "@agent approve",
+            "2026-01-01T00:20:00Z",
+        ),
+    )
+    server._worker_entry(thread_id)
+
+    first = _event(
+        SourceKind.ISSUE_COMMENT,
+        "steering-executing",
+        "@agent preserve old configuration compatibility",
+        "2026-01-01T00:21:00Z",
+    )
+    _record(server.config.db, "issue_comments", first)
+    server._worker_entry(thread_id)
+    second = _event(
+        SourceKind.ISSUE_COMMENT,
+        "steering-validating",
+        "@agent keep the legacy error shape",
+        "2026-01-01T00:22:00Z",
+    )
+    _record(server.config.db, "issue_comments", second)
+    server._worker_entry(thread_id)
+
+    store = SQLiteGitHubStore(server.config.db)
+    pending_keys = [
+        row["source_event_key"] for row in store.pending_revision_inputs(thread_id)
+    ]
+    assert pending_keys == [
+        first.event_key,
+        second.event_key,
+    ]
+    assert FakePublisher.calls == []
+    store.close()
+
+    _record(
+        server.config.db,
+        "issue_comments",
+        _event(
+            SourceKind.ISSUE_COMMENT,
+            "result-ok",
+            "@agent approve",
+            "2026-01-01T00:23:00Z",
+        ),
+    )
+    server._worker_entry(thread_id)
+    store = SQLiteGitHubStore(server.config.db)
+    cycles = store.connection.execute(
+        "SELECT * FROM workflow_cycles_v1 ORDER BY cycle_id"
+    ).fetchall()
+    assert [(row["cycle_kind"], row["status"]) for row in cycles] == [
+        ("INITIAL", "AWAITING_PUBLICATION"),
+        ("REVISION", "ACTIVE"),
+    ]
+    revision_tasks = store.connection.execute(
+        """SELECT * FROM workflow_task_runs_v1
+           WHERE workflow_cycle_id=?""",
+        (cycles[1]["workflow_cycle_id"],),
+    ).fetchall()
+    assert [row["task_id"] for row in revision_tasks] == ["revision"]
+    batched = store.revision_inputs_for_cycle(cycles[1]["workflow_cycle_id"])
+    assert [row["source_event_key"] for row in batched] == [
+        first.event_key,
+        second.event_key,
+    ]
+    assert FakePublisher.calls == []
+    store.close()
+
+    server._worker_entry(thread_id)  # revision planning
+    _approve(server, "revision-plan-ok", 24)
+    server._worker_entry(thread_id)  # revision execution
+    server._worker_entry(thread_id)  # revision validation/result
+    _approve(server, "revision-result-ok", 25)
+
+    store = SQLiteGitHubStore(server.config.db)
+    cycles = store.connection.execute(
+        "SELECT * FROM workflow_cycles_v1 ORDER BY cycle_id"
+    ).fetchall()
+    assert [row["status"] for row in cycles] == ["PUBLISHED", "PUBLISHED"]
+    assert [
+        row["status"]
+        for row in store.revision_inputs_for_cycle(cycles[1]["workflow_cycle_id"])
+    ] == ["CONSUMED", "CONSUMED"]
+    assert store.thread_workflow_lifecycle(thread_id)["initial_state"] == "PUBLISHED"
+    assert len(FakePublisher.calls) == 1
+    assert {workflow_id for workflow_id, _ in FakeDriver.specs} == {
+        "default",
+        f"revision-{server.workflow_spec.digest[:16]}",
+    }
+    store.close()
+
+
+def test_mapped_pr_surfaces_batch_into_same_revision_and_cross_surface_approval_fails(
+    tmp_path,
+):
+    FakeDriver.events = []
+    FakeDriver.specs = []
+    FakeDriver.verdicts = {}
+    FakePublisher.calls = []
+    server = _server(tmp_path, max_ticks=1)
+    thread_id = "github:41:issue:9"
+    root = _event(
+        SourceKind.ISSUE,
+        "root",
+        "@agent establish the implementation",
+        "2026-01-01T00:00:00Z",
+    )
+    _record(server.config.db, "issues", root)
+    server._worker_entry(thread_id)
+    _approve(server, "initial-plan", 20)
+    server._worker_entry(thread_id)
+    server._worker_entry(thread_id)
+    _approve(server, "initial-result", 21)
+    store = SQLiteGitHubStore(server.config.db)
+    published = store.thread_workflow_lifecycle(thread_id)["initial_state"]
+    store.close()
+    assert published == "PUBLISHED"
+    store = SQLiteGitHubStore(server.config.db)
+    store.register_pr_mapping(41, 12, thread_id)
+    store.close()
+
+    conversation = replace(
+        _event(
+            SourceKind.ISSUE_COMMENT,
+            "pr-conversation",
+            "@agent preserve the old response",
+            "2026-01-01T00:31:00Z",
+        ),
+        subject_kind=SubjectKind.PULL_REQUEST,
+        subject_number=12,
+        origin_surface=OriginSurface.PR_CONVERSATION,
+    )
+    inline = replace(
+        _event(
+            SourceKind.REVIEW_COMMENT,
+            "inline",
+            "@agent apply this only to optional checks",
+            "2026-01-01T00:32:00Z",
+        ),
+        subject_kind=SubjectKind.PULL_REQUEST,
+        subject_number=12,
+        origin_surface=OriginSurface.PR_INLINE_REVIEW,
+        path="src/checks.py",
+        line=17,
+        start_line=15,
+        side="RIGHT",
+        diff_hunk="@@ -15,3 +15,5 @@",
+        commit_id="new",
+        original_commit_id="old",
+        review_thread_root_id="700",
+    )
+    _record(server.config.db, "issue_comments", conversation)
+    _record(server.config.db, "review_comments", inline)
+    server._worker_entry(thread_id)
+
+    store = SQLiteGitHubStore(server.config.db)
+    cycle = store.connection.execute(
+        """SELECT * FROM workflow_cycles_v1 WHERE cycle_kind='REVISION'
+           ORDER BY cycle_id DESC LIMIT 1"""
+    ).fetchone()
+    assert cycle["active_task_id"] == "revision"
+    assert (
+        cycle["root_input_id"]
+        == store.revision_inputs_for_cycle(cycle["workflow_cycle_id"])[0][
+            "revision_input_id"
+        ]
+    )
+    inputs = store.revision_inputs_for_cycle(cycle["workflow_cycle_id"])
+    assert [row["origin_surface"] for row in inputs] == [
+        "PR_CONVERSATION",
+        "PR_INLINE_REVIEW",
+    ]
+    assert inputs[1]["path"] == "src/checks.py"
+    assert inputs[1]["diff_hunk"] == "@@ -15,3 +15,5 @@"
+    store.close()
+
+    server._worker_entry(thread_id)  # publish the revision plan on PR conversation
+    wrong_surface_approval = replace(
+        inline,
+        source_id="wrong-surface-approval",
+        source_updated_at="2026-01-01T00:40:00Z",
+        source_created_at="2026-01-01T00:40:00Z",
+        body="@agent approve",
+    )
+    _record(server.config.db, "review_comments", wrong_surface_approval)
+    server._worker_entry(thread_id)
+    store = SQLiteGitHubStore(server.config.db)
+    task = store.connection.execute(
+        "SELECT * FROM workflow_task_runs_v1 WHERE workflow_cycle_id=?",
+        (cycle["workflow_cycle_id"],),
+    ).fetchone()
+    assert task["phase"] == "WAITING_FOR_PLAN_APPROVAL"
+    assert store.input_consumption(wrong_surface_approval.event_key).status == (
+        "STALE_APPROVAL"
+    )
+    store.close()
+
+
+def test_mid_revision_steering_replans_same_owner_without_consuming_later_input(
+    tmp_path,
+):
+    FakeDriver.events = []
+    FakeDriver.specs = []
+    FakeDriver.verdicts = {}
+    FakePublisher.calls = []
+    server = _server(tmp_path, max_ticks=1)
+    thread_id = "github:41:issue:9"
+    _record(
+        server.config.db,
+        "issues",
+        _event(
+            SourceKind.ISSUE,
+            "root",
+            "@agent establish a base implementation",
+            "2026-01-01T00:00:00Z",
+        ),
+    )
+    server._worker_entry(thread_id)
+    _approve(server, "initial-plan", 20)
+    server._worker_entry(thread_id)
+    server._worker_entry(thread_id)
+    _approve(server, "initial-result", 21)
+
+    first = _event(
+        SourceKind.ISSUE_COMMENT,
+        "revision-one",
+        "@agent update the compatibility behavior",
+        "2026-01-01T00:30:00Z",
+    )
+    _record(server.config.db, "issue_comments", first)
+    server._worker_entry(thread_id)
+    _approve(server, "revision-plan-v1", 31)
+
+    later = _event(
+        SourceKind.ISSUE_COMMENT,
+        "revision-two",
+        "@agent also cover empty arrays",
+        "2026-01-01T00:32:00Z",
+    )
+    _record(server.config.db, "issue_comments", later)
+    server._worker_entry(thread_id)  # finish the already-authorized execution
+    store = SQLiteGitHubStore(server.config.db)
+    revision = store.connection.execute(
+        """SELECT * FROM workflow_cycles_v1 WHERE cycle_kind='REVISION'
+           ORDER BY cycle_id DESC LIMIT 1"""
+    ).fetchone()
+    task = store.connection.execute(
+        "SELECT * FROM workflow_task_runs_v1 WHERE workflow_cycle_id=?",
+        (revision["workflow_cycle_id"],),
+    ).fetchone()
+    assert task["phase"] == "VALIDATING"
+    pending_keys = [
+        row["source_event_key"] for row in store.pending_revision_inputs(thread_id)
+    ]
+    assert pending_keys == [later.event_key]
+    store.close()
+
+    server._worker_entry(thread_id)  # validate, then replan at the safe boundary
+    store = SQLiteGitHubStore(server.config.db)
+    task = store.connection.execute(
+        "SELECT * FROM workflow_task_runs_v1 WHERE workflow_cycle_id=?",
+        (revision["workflow_cycle_id"],),
+    ).fetchone()
+    plans = store.connection.execute(
+        "SELECT * FROM workflow_task_plans_v1 WHERE task_run_id=? ORDER BY version",
+        (task["task_run_id"],),
+    ).fetchall()
+    assert task["phase"] == "PLANNING"
+    assert [row["status"] for row in plans] == ["SUPERSEDED"]
+    assert [
+        row["source_event_key"]
+        for row in store.revision_inputs_for_cycle(revision["workflow_cycle_id"])
+    ] == [first.event_key, later.event_key]
+    assert (
+        store.revision_inputs_for_cycle(revision["workflow_cycle_id"])[1]["status"]
+        == "BATCHED"
+    )
+    store.close()
+
+    stale = _event(
+        SourceKind.ISSUE_COMMENT,
+        "stale-v1-approval",
+        "@agent approve",
+        "2026-01-01T00:33:00Z",
+    )
+    _record(server.config.db, "issue_comments", stale)
+    server._worker_entry(thread_id)  # produce cumulative plan v2
+    store = SQLiteGitHubStore(server.config.db)
+    task = store.connection.execute(
+        "SELECT * FROM workflow_task_runs_v1 WHERE workflow_cycle_id=?",
+        (revision["workflow_cycle_id"],),
+    ).fetchone()
+    assert task["phase"] == "WAITING_FOR_PLAN_APPROVAL"
+    assert store.input_consumption(stale.event_key).status == "STALE_APPROVAL"
+    assert (
+        len(
+            store.connection.execute(
+                "SELECT * FROM workflow_task_plans_v1 WHERE task_run_id=?",
+                (task["task_run_id"],),
+            ).fetchall()
+        )
+        == 2
+    )
     store.close()

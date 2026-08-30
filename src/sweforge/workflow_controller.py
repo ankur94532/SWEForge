@@ -12,7 +12,7 @@ from .execution import normalize_task
 from .execution_locks import ThreadLockUnavailable, thread_lock
 from .github_models import (
     InteractionMode,
-    is_actionable_source_event,
+    format_source_context,
     is_exact_agent_approval,
     parse_timestamp,
     starts_with_agent_invocation,
@@ -22,10 +22,11 @@ from .workflow_runtime import (
     TaskPhase,
     TaskRun,
     WorkflowCycle,
+    WorkflowCycleKind,
     WorkflowCycleStatus,
     WorkflowRuntime,
 )
-from .workflow_spec import WorkflowSpec
+from .workflow_spec import WorkflowSpec, derive_revision_spec
 from .workspace import ThreadWorkspace, WorkspaceError
 
 
@@ -96,6 +97,14 @@ class DeclarativeWorkflowController:
             return ControllerResult(thread_id, "BUSY")
 
     def _advance_locked(self, thread_id: str) -> ControllerResult:
+        queued = self.store.route_unmatched_inputs(thread_id, now=self.clock())
+        if self.tracer is not None:
+            for _event_key in queued:
+                self.tracer.emit(
+                    "REVISION INPUT QUEUED",
+                    "unsolicited steering persisted",
+                    TraceContext(thread_id=thread_id),
+                )
         cycle = self.runtime.cycle_for_thread(thread_id)
         if cycle is None:
             cycle = self._begin_cycle(thread_id)
@@ -111,6 +120,16 @@ class DeclarativeWorkflowController:
                 failed_task.phase if failed_task else None,
             )
         if cycle.status == WorkflowCycleStatus.AWAITING_PUBLICATION:
+            cycle = self._settle_completed_cycle(cycle)
+            if cycle.status == WorkflowCycleStatus.ACTIVE:
+                active = self.runtime.active_task(cycle.workflow_cycle_id)
+                if active is None:
+                    raise RuntimeError("revision cycle has no active owner")
+                return self._result(
+                    cycle,
+                    active,
+                    "ACTIVE",
+                )
             return ControllerResult(
                 thread_id,
                 "AWAITING_PUBLICATION",
@@ -119,6 +138,12 @@ class DeclarativeWorkflowController:
         task = self.runtime.select_active_task(cycle.workflow_cycle_id)
         cycle = self.runtime.cycle(cycle.workflow_cycle_id)
         if task is None:
+            if cycle.status == WorkflowCycleStatus.AWAITING_PUBLICATION:
+                fresh = self._settle_completed_cycle(cycle)
+                if fresh.status == WorkflowCycleStatus.ACTIVE:
+                    task = self.runtime.active_task(fresh.workflow_cycle_id)
+                    assert task is not None
+                    return self._result(fresh, task, "ACTIVE")
             return ControllerResult(
                 thread_id,
                 cycle.status.value,
@@ -135,6 +160,8 @@ class DeclarativeWorkflowController:
         driver = self.driver_factory(
             self.runtime, cycle.workflow_cycle_id, workspace.path, cycle_spec
         )
+        if self._settle_revision_steering(cycle, task):
+            return self._result(cycle, self.runtime.task(task.task_run_id), "ACTIVE")
         mode = self.store.interaction_mode(cycle.thread_id)
         if task.phase == TaskPhase.WAITING_FOR_PLAN_APPROVAL:
             if mode == InteractionMode.AUTO:
@@ -169,10 +196,16 @@ class DeclarativeWorkflowController:
                         after_phase = before.phase
                     self.tracer.transition(context, before.phase, after_phase)
                 fresh = self.runtime.select_active_task(cycle.workflow_cycle_id)
+                fresh_cycle = self.runtime.cycle(cycle.workflow_cycle_id)
+                if fresh_cycle.status == WorkflowCycleStatus.AWAITING_PUBLICATION:
+                    settled = self._settle_completed_cycle(fresh_cycle)
+                    if settled.workflow_cycle_id != fresh_cycle.workflow_cycle_id:
+                        fresh_cycle = settled
+                        fresh = self.runtime.active_task(settled.workflow_cycle_id)
                 return ControllerResult(
                     cycle.thread_id,
-                    self.runtime.cycle(cycle.workflow_cycle_id).status.value,
-                    cycle.workflow_cycle_id,
+                    fresh_cycle.status.value,
+                    fresh_cycle.workflow_cycle_id,
                     fresh.task_id if fresh else None,
                     fresh.phase if fresh else None,
                 )
@@ -195,12 +228,21 @@ class DeclarativeWorkflowController:
             )
         fresh_cycle = self.runtime.cycle(cycle.workflow_cycle_id)
         fresh_task = self.runtime.active_task(cycle.workflow_cycle_id)
+        if fresh_task is not None and self._settle_revision_steering(
+            fresh_cycle, fresh_task
+        ):
+            fresh_task = self.runtime.task(fresh_task.task_run_id)
         if fresh_task is None:
             # Release/selection is deliberately a separate scheduler action,
             # but do it in this bounded tick so a completed task can expose the
             # next declaration-order owner without involving legacy state.
             fresh_task = self.runtime.select_active_task(cycle.workflow_cycle_id)
             fresh_cycle = self.runtime.cycle(cycle.workflow_cycle_id)
+        if fresh_cycle.status == WorkflowCycleStatus.AWAITING_PUBLICATION:
+            settled = self._settle_completed_cycle(fresh_cycle)
+            if settled.workflow_cycle_id != fresh_cycle.workflow_cycle_id:
+                fresh_cycle = settled
+                fresh_task = self.runtime.active_task(settled.workflow_cycle_id)
         return ControllerResult(
             thread_id,
             fresh_cycle.status.value,
@@ -210,51 +252,184 @@ class DeclarativeWorkflowController:
         )
 
     def _begin_cycle(self, thread_id: str) -> WorkflowCycle | None:
-        deferred = list(self.store.deferred_followups(thread_id))
-        candidates = deferred + [
-            row
-            for row in self.store.unconsumed_inputs(thread_id)
-            if is_actionable_source_event(row["source_kind"], row["body"])
-        ]
-        if not candidates:
+        lifecycle = self.store.thread_workflow_lifecycle(thread_id)
+        if lifecycle is None or lifecycle["initial_state"] == "LEGACY_BLOCKED":
             return None
-        event = candidates[0]
-        deferred_id = event["deferred_id"] if "deferred_id" in event.keys() else None
-        root_input_id = deferred_id or event["event_key"]
-        cycle_id = self.runtime.next_cycle_id(thread_id)
-        cycle = self.runtime.initialize_cycle(
-            thread_id=thread_id,
-            cycle_id=cycle_id,
-            root_input_id=root_input_id,
-            spec=self.spec,
-            spec_ref=self.spec_ref,
-        )
-        if deferred_id:
-            self.store.consume_deferred_followup(
-                event["event_key"],
-                deferred_id=deferred_id,
+        if lifecycle["initial_state"] == "NOT_STARTED":
+            root_input_id = lifecycle["initial_root_event_key"]
+            cycle_id = self.runtime.next_cycle_id(thread_id)
+            cycle = self.runtime.initialize_cycle(
+                thread_id=thread_id,
                 cycle_id=cycle_id,
-                consumed_at=self.clock(),
+                root_input_id=root_input_id,
+                spec=self.spec,
+                spec_ref=self.spec_ref,
+                cycle_kind=WorkflowCycleKind.INITIAL,
             )
-        else:
+            self.store.activate_initial_workflow(
+                thread_id=thread_id,
+                workflow_cycle_id=cycle.workflow_cycle_id,
+                workflow_digest=cycle.workflow_digest,
+                now=self.clock(),
+            )
             self.store.record_input_disposition(
-                event["event_key"],
+                root_input_id,
                 thread_id=thread_id,
                 cycle_id=cycle_id,
                 status="CYCLE_ROOT",
                 recorded_at=self.clock(),
             )
+            self._workspace(cycle)
+            return cycle
+        if lifecycle["initial_state"] not in {"COMPLETE", "PUBLISHED"}:
+            return None
+        return self._begin_revision(thread_id)
+
+    def _begin_revision(self, thread_id: str) -> WorkflowCycle | None:
+        pending = self.store.pending_revision_inputs(thread_id)
+        if not pending:
+            return None
+        if self.tracer is not None:
+            for item in pending:
+                self.tracer.emit(
+                    "REVISION INPUT QUEUED",
+                    f"input={item['revision_input_id']}",
+                    TraceContext(
+                        thread_id=thread_id,
+                        origin_surface=item["origin_surface"],
+                        subject_number=item["subject_number"],
+                    ),
+                )
+        lifecycle = self.store.thread_workflow_lifecycle(thread_id)
+        if lifecycle is None or lifecycle["initial_state"] not in {
+            "COMPLETE",
+            "PUBLISHED",
+        }:
+            return None
+        initial_cycle_id = lifecycle["initial_workflow_cycle_id"]
+        if not initial_cycle_id:
+            raise RuntimeError("revision authority has no persisted initial workflow")
+        initial_spec = self.runtime.spec_for_cycle(initial_cycle_id)
+        revision_spec = derive_revision_spec(initial_spec)
+        root_input_id = pending[0]["revision_input_id"]
+        cycle_id = self.runtime.next_cycle_id(thread_id)
+        cycle = self.runtime.initialize_cycle(
+            thread_id=thread_id,
+            cycle_id=cycle_id,
+            root_input_id=root_input_id,
+            spec=revision_spec,
+            spec_ref=f"derived:{initial_cycle_id}:{initial_spec.digest}",
+            cycle_kind=WorkflowCycleKind.REVISION,
+            revision_sequence=self.runtime.next_revision_sequence(thread_id),
+        )
+        batched = self.store.batch_revision_inputs(
+            thread_id=thread_id,
+            workflow_cycle_id=cycle.workflow_cycle_id,
+            now=self.clock(),
+        )
+        if self.tracer is not None:
+            context = TraceContext(
+                thread_id=thread_id,
+                workflow_cycle_id=cycle.workflow_cycle_id,
+                cycle_id=cycle.cycle_id,
+                task_id="revision",
+            )
+            self.tracer.emit("REVISION RUN START", "generic revision", context)
+            self.tracer.emit("REVISION INPUT BATCHED", f"count={len(batched)}", context)
         self._workspace(cycle)
         return cycle
+
+    def _settle_completed_cycle(self, cycle: WorkflowCycle) -> WorkflowCycle:
+        if cycle.cycle_kind == WorkflowCycleKind.INITIAL:
+            if not self.runtime.publication_is_eligible(cycle.workflow_cycle_id):
+                raise RuntimeError("initial workflow completion proof is incomplete")
+            self.store.complete_initial_workflow(
+                thread_id=cycle.thread_id,
+                workflow_cycle_id=cycle.workflow_cycle_id,
+                now=self.clock(),
+            )
+            if self.tracer is not None:
+                self.tracer.emit(
+                    "INITIAL WORKFLOW COMPLETE",
+                    "structured workflow will not run again",
+                    TraceContext(
+                        thread_id=cycle.thread_id,
+                        workflow_cycle_id=cycle.workflow_cycle_id,
+                        cycle_id=cycle.cycle_id,
+                    ),
+                )
+        else:
+            consumed = self.store.consume_revision_inputs(
+                thread_id=cycle.thread_id,
+                workflow_cycle_id=cycle.workflow_cycle_id,
+                now=self.clock(),
+            )
+            if self.tracer is not None:
+                self.tracer.emit(
+                    "REVISION RUN DONE",
+                    f"consumed_inputs={consumed}",
+                    TraceContext(
+                        thread_id=cycle.thread_id,
+                        workflow_cycle_id=cycle.workflow_cycle_id,
+                        cycle_id=cycle.cycle_id,
+                        task_id="revision",
+                    ),
+                )
+        next_revision = self._begin_revision(cycle.thread_id)
+        if next_revision is not None:
+            if self.tracer is not None:
+                self.tracer.emit(
+                    "PUBLICATION BLOCKED",
+                    "pending revision input",
+                    TraceContext(thread_id=cycle.thread_id),
+                )
+            self.runtime.select_active_task(next_revision.workflow_cycle_id)
+            return self.runtime.cycle(next_revision.workflow_cycle_id)
+        return cycle
+
+    def _settle_revision_steering(self, cycle: WorkflowCycle, task: TaskRun) -> bool:
+        if cycle.cycle_kind != WorkflowCycleKind.REVISION or task.phase not in {
+            TaskPhase.WAITING_FOR_PLAN_APPROVAL,
+            TaskPhase.WAITING_FOR_RESULT_APPROVAL,
+        }:
+            return False
+        pending = self.store.pending_revision_inputs(cycle.thread_id)
+        if not pending:
+            return False
+        if self.tracer is not None:
+            for item in pending:
+                self.tracer.emit(
+                    "REVISION INPUT QUEUED",
+                    f"input={item['revision_input_id']}",
+                    self._trace_context(cycle, task),
+                )
+        batched = self.store.batch_revision_inputs(
+            thread_id=cycle.thread_id,
+            workflow_cycle_id=cycle.workflow_cycle_id,
+            now=self.clock(),
+        )
+        new_ids = [row["revision_input_id"] for row in pending]
+        self.runtime.replan_for_revision_inputs(
+            task_run_id=task.task_run_id, revision_input_ids=new_ids
+        )
+        if self.tracer is not None:
+            self.tracer.emit(
+                "REVISION REPLAN",
+                f"new_inputs={len(new_ids)} total_inputs={len(batched)}",
+                self._trace_context(cycle, task),
+            )
+        return True
 
     def _root_event(self, cycle: WorkflowCycle):
         root = self.store.source_event(cycle.root_input_id)
         if root is not None:
             return root
         deferred = self.store.deferred_followup_by_id(cycle.root_input_id)
-        if deferred is None:
-            raise RuntimeError("workflow root input disappeared")
-        root = self.store.source_event(deferred["event_key"])
+        if deferred is not None:
+            root = self.store.source_event(deferred["event_key"])
+        else:
+            revision = self.store.revision_input(cycle.root_input_id)
+            root = revision
         if root is None:
             raise RuntimeError("workflow root SourceEvent disappeared")
         return root
@@ -267,6 +442,11 @@ class DeclarativeWorkflowController:
                 )
                 or root["body"]
             )
+        if cycle.root_input_id.startswith("revision-input-"):
+            revision = self.store.revision_input(cycle.root_input_id)
+            if revision is None:
+                raise RuntimeError("revision root input disappeared")
+            return revision["residual_text"] or revision["body"]
         return root["body"]
 
     def _trace_context(self, cycle: WorkflowCycle, task: TaskRun) -> TraceContext:
@@ -505,6 +685,37 @@ class DeclarativeWorkflowController:
         )
         cumulative_history = str(list(task.repair_feedback))[:10_000]
         root_request = normalize_task(self._root_body(cycle, root))
+        if cycle.cycle_kind == WorkflowCycleKind.REVISION:
+            lifecycle = self.store.thread_workflow_lifecycle(cycle.thread_id)
+            original = (
+                self.store.source_event(lifecycle["initial_root_event_key"])
+                if lifecycle is not None
+                else None
+            )
+            inputs = self.store.revision_inputs_for_cycle(cycle.workflow_cycle_id)
+            rendered_inputs = []
+            for item in inputs:
+                text = item["residual_text"] or item["source_body"]
+                rendered_inputs.append(
+                    f"Revision input identity: {item['revision_input_id']}\n"
+                    + format_source_context(dict(item), normalize_task(text))
+                )
+            original_text = (
+                normalize_task(original["body"])
+                if original is not None
+                else "(missing)"
+            )
+            return (
+                "Generic cumulative revision workflow. Application code has selected "
+                "this workflow; do not route work back to original task owners.\n"
+                f"Revision sequence: {cycle.revision_sequence}\n"
+                f"Phase: {task.phase.value}\n"
+                f"Original issue request (untrusted): {original_text}\n"
+                "Durably batched revision inputs with immutable provenance:\n"
+                + "\n\n".join(rendered_inputs)[:24_000]
+                + "\nPrior revision execution/validation history (preserve cumulative "
+                f"workspace behavior): {cumulative_history}"
+            )
         return (
             f"Workflow task: {task.task_id}\n"
             f"Phase: {task.phase.value}\n"

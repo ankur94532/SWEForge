@@ -15,7 +15,12 @@ from sweforge.github_models import (
 )
 from sweforge.github_store import SQLiteGitHubStore
 from sweforge.workflow_driver import DeepAgentWorkflowDriver
-from sweforge.workflow_runtime import TaskPhase, ValidationVerdict, WorkflowRuntime
+from sweforge.workflow_runtime import (
+    TaskPhase,
+    ValidationVerdict,
+    WorkflowCycleKind,
+    WorkflowRuntime,
+)
 from sweforge.workflow_spec import parse_workflow_spec
 from sweforge.workspace import ThreadWorkspace, WorkspaceError
 
@@ -138,11 +143,23 @@ def test_interaction_mode_is_captured_once_and_survives_restart_and_cycles(tmp_p
         root_input_id=root.event_key,
         spec=spec(),
     )
+    store.connection.execute(
+        "UPDATE workflow_cycles_v1 SET status='PUBLISHED' WHERE thread_id=?",
+        (thread_id,),
+    )
+    store.connection.execute(
+        """UPDATE thread_workflow_lifecycle_v1
+           SET initial_state='PUBLISHED' WHERE thread_id=?""",
+        (thread_id,),
+    )
+    store.connection.commit()
     runtime.initialize_cycle(
         thread_id=thread_id,
         cycle_id=2,
         root_input_id=later.event_key,
         spec=spec(),
+        cycle_kind=WorkflowCycleKind.REVISION,
+        revision_sequence=1,
     )
     store.close()
 

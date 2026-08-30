@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from sweforge.workflow_spec import load_workflow_spec, parse_workflow_spec
+from sweforge.workflow_spec import (
+    derive_revision_spec,
+    load_workflow_spec,
+    parse_workflow_spec,
+)
 
 
 def document(order=("A", "B", "C", "D")):
@@ -82,3 +86,25 @@ tasks:
     assert spec.workflow_id == "simple"
     with pytest.raises(FileNotFoundError):
         load_workflow_spec(tmp_path / "repository-controlled.yaml")
+
+
+def test_revision_spec_is_one_owner_with_all_trusted_skills_and_phase_tool_union():
+    initial = parse_workflow_spec(document())
+    revision = derive_revision_spec(initial)
+
+    assert revision.workflow_id == f"revision-{initial.digest[:16]}"
+    assert [task.id for task in revision.tasks] == ["revision"]
+    task = revision.tasks[0]
+    expected_skills = tuple(
+        skill
+        for original in initial.tasks
+        for phase in (original.planning, original.execution, original.validation)
+        for skill in phase.skills
+    )
+    assert task.planning.skills == expected_skills
+    assert task.execution.skills == expected_skills
+    assert task.validation.skills == expected_skills
+    assert {"write_file", "edit_file", "execute"}.isdisjoint(task.planning.tools)
+    assert {"write_file", "edit_file", "execute"} <= set(task.execution.tools)
+    assert "run_validation" in task.validation.tools
+    assert revision == derive_revision_spec(initial)

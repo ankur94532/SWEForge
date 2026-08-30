@@ -44,6 +44,11 @@ BUILTIN_WORKFLOW_TOOLS = frozenset(
 class PhaseSpec:
     skill: str
     tools: tuple[str, ...]
+    additional_skills: tuple[str, ...] = ()
+
+    @property
+    def skills(self) -> tuple[str, ...]:
+        return (self.skill, *self.additional_skills)
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,14 +82,29 @@ class WorkflowSpec:
                     "planning": {
                         "skill": task.planning.skill,
                         "tools": list(task.planning.tools),
+                        **(
+                            {"skills": list(task.planning.additional_skills)}
+                            if task.planning.additional_skills
+                            else {}
+                        ),
                     },
                     "execution": {
                         "skill": task.execution.skill,
                         "tools": list(task.execution.tools),
+                        **(
+                            {"skills": list(task.execution.additional_skills)}
+                            if task.execution.additional_skills
+                            else {}
+                        ),
                     },
                     "validation": {
                         "skill": task.validation.skill,
                         "tools": list(task.validation.tools),
+                        **(
+                            {"skills": list(task.validation.additional_skills)}
+                            if task.validation.additional_skills
+                            else {}
+                        ),
                     },
                 }
                 for task in self.tasks
@@ -106,7 +126,7 @@ def _phase(
     skill_exists: Any,
 ) -> PhaseSpec:
     item = _mapping(value, label)
-    unknown_fields = set(item) - {"skill", "tools"}
+    unknown_fields = set(item) - {"skill", "skills", "tools"}
     if unknown_fields:
         raise ValueError(f"{label} has unknown fields: {sorted(unknown_fields)}")
     skill = item.get("skill")
@@ -117,6 +137,22 @@ def _phase(
         raise ValueError(f"{label}.skill is malformed")
     if skill_exists is not None and not skill_exists(skill):
         raise ValueError(f"{label}.skill does not exist: {skill}")
+    raw_additional_skills = item.get("skills", [])
+    if not isinstance(raw_additional_skills, list) or any(
+        not isinstance(name, str) or not _ID.fullmatch(name)
+        for name in raw_additional_skills
+    ):
+        raise ValueError(f"{label}.skills must be a list of skill names")
+    if skill in raw_additional_skills or len(raw_additional_skills) != len(
+        set(raw_additional_skills)
+    ):
+        raise ValueError(f"{label}.skills contains duplicates")
+    if skill_exists is not None:
+        missing_skills = [
+            name for name in raw_additional_skills if not skill_exists(name)
+        ]
+        if missing_skills:
+            raise ValueError(f"{label}.skills do not exist: {missing_skills}")
     raw_tools = item.get("tools")
     if not isinstance(raw_tools, list) or any(
         not isinstance(name, str) or not name for name in raw_tools
@@ -127,7 +163,11 @@ def _phase(
     unknown_tools = sorted(set(raw_tools) - known_tools)
     if unknown_tools:
         raise ValueError(f"{label}.tools contains unknown tools: {unknown_tools}")
-    return PhaseSpec(skill=skill, tools=tuple(raw_tools))
+    return PhaseSpec(
+        skill=skill,
+        tools=tuple(raw_tools),
+        additional_skills=tuple(raw_additional_skills),
+    )
 
 
 def parse_workflow_spec(
@@ -235,14 +275,29 @@ def parse_workflow_spec(
                 "planning": {
                     "skill": task.planning.skill,
                     "tools": list(task.planning.tools),
+                    **(
+                        {"skills": list(task.planning.additional_skills)}
+                        if task.planning.additional_skills
+                        else {}
+                    ),
                 },
                 "execution": {
                     "skill": task.execution.skill,
                     "tools": list(task.execution.tools),
+                    **(
+                        {"skills": list(task.execution.additional_skills)}
+                        if task.execution.additional_skills
+                        else {}
+                    ),
                 },
                 "validation": {
                     "skill": task.validation.skill,
                     "tools": list(task.validation.tools),
+                    **(
+                        {"skills": list(task.validation.additional_skills)}
+                        if task.validation.additional_skills
+                        else {}
+                    ),
                 },
             }
             for task in tasks
@@ -252,6 +307,78 @@ def parse_workflow_spec(
         json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return WorkflowSpec(SCHEMA_VERSION, workflow_id, tuple(tasks), digest)
+
+
+def derive_revision_spec(initial: WorkflowSpec) -> WorkflowSpec:
+    """Derive the exact trusted one-owner revision envelope from ``initial``."""
+
+    def ordered(values):
+        return list(dict.fromkeys(values))
+
+    all_skills = ordered(
+        skill
+        for task in initial.tasks
+        for phase in (task.planning, task.execution, task.validation)
+        for skill in phase.skills
+    )
+    research = {"ls", "read_file", "glob", "grep", "search_issue_memory"}
+    trusted_research = ordered(
+        tool
+        for task in initial.tasks
+        for phase in (task.planning, task.execution, task.validation)
+        for tool in phase.tools
+        if tool in research
+    )
+    planning_tools = ordered(
+        [
+            tool
+            for task in initial.tasks
+            for tool in task.planning.tools
+            if tool not in {"write_file", "edit_file", "execute"}
+        ]
+        + trusted_research
+    )
+    execution_tools = ordered(
+        [tool for task in initial.tasks for tool in task.execution.tools]
+        + trusted_research
+    )
+    validation_tools = ordered(
+        [tool for task in initial.tasks for tool in task.validation.tools]
+        + trusted_research
+    )
+    workflow_id = f"revision-{initial.digest[:16]}"
+    document = {
+        "version": SCHEMA_VERSION,
+        "workflow_id": workflow_id,
+        "tasks": [
+            {
+                "id": "revision",
+                "depends_on": [],
+                "planning": {
+                    "skill": all_skills[0],
+                    "skills": all_skills[1:],
+                    "tools": planning_tools,
+                },
+                "execution": {
+                    "skill": all_skills[0],
+                    "skills": all_skills[1:],
+                    "tools": execution_tools,
+                },
+                "validation": {
+                    "skill": all_skills[0],
+                    "skills": all_skills[1:],
+                    "tools": validation_tools,
+                },
+            }
+        ],
+    }
+    known_tools = {
+        tool
+        for task in initial.tasks
+        for phase in (task.planning, task.execution, task.validation)
+        for tool in phase.tools
+    }
+    return parse_workflow_spec(document, known_tools=known_tools)
 
 
 def load_workflow_spec(
