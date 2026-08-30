@@ -544,3 +544,44 @@ def test_durable_builder_keeps_gateways_root_only(monkeypatch):
     assert captured["middleware"][1].tracer is tracer
     assert investigator["middleware"][0].tracer is tracer
     assert investigator["middleware"][1].tracer is tracer
+
+
+@pytest.mark.parametrize(
+    ("phase", "kind", "gateway"),
+    [
+        (TaskPhase.PLANNING, "PLAN", "submit_plan"),
+        (TaskPhase.VALIDATING, "RESULT", "finish_validation"),
+    ],
+)
+def test_reviewing_feedback_still_authorizes_its_replayed_gateway(phase, kind, gateway):
+    """A resumed feedback review replays the interrupted lifecycle gateway.
+
+    ``submit_plan``/``finish_validation`` raised the approval interrupt, so
+    LangGraph re-executes them with the PLAN_FEEDBACK/RESULT_FEEDBACK resume
+    payload; the gateway then returns the review instruction rather than
+    approving anything. Excluding it from the REVIEWING tool set makes every
+    feedback resume fail closed and the review can never be decided.
+    """
+    snapshot = WorkflowPolicySnapshot(
+        workflow_id="flow",
+        workflow_digest="digest",
+        workflow_cycle_id="cycle",
+        cycle_id=1,
+        active_task_id="A",
+        task_run_id="task-run-A",
+        phase=phase,
+        skill="A-skill",
+        skills=(),
+        configured_tools=frozenset({"read_file", "glob", "edit_file"}),
+        feedback_review_id="feedback-review-1",
+        feedback_review_kind=kind,
+        feedback_review_status="REVIEWING",
+    )
+
+    allowed = WorkflowPolicyMiddleware.allowed_tools(snapshot, {})
+
+    assert gateway in allowed
+    assert {"replan_current_feedback", "defer_current_feedback_to_revision"} <= allowed
+    # The review stays read-only: no mutation escapes through this branch.
+    assert "edit_file" not in allowed
+    assert "finish_execution" not in allowed

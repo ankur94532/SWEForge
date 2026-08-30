@@ -185,10 +185,15 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
                 for name, effect in (tool_effects or {}).items()
                 if effect == "read"
             )
+            # The interrupted lifecycle gateway is replayed by LangGraph when
+            # the feedback resume is delivered; it returns the review
+            # instruction instead of approving anything, so it must stay
+            # authorized or the review can never be decided.
             return (configured & research) | {
                 "task",
                 "replan_current_feedback",
                 "defer_current_feedback_to_revision",
+                _phase_gateway(snapshot.phase),
             }
         if snapshot.feedback_review_status == "DEFERRED_WAITING":
             return frozenset({"defer_current_feedback_to_revision"})
