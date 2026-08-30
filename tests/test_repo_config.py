@@ -254,7 +254,7 @@ def test_reference_bundle_is_valid_and_complete():
     assert [item.name for item in bundle.scripts] == ["validate_release"]
 
 
-def test_secret_env_collision_invalid_name_and_remote_mcp_refs_are_rejected(tmp_path):
+def test_secret_env_collision_and_invalid_secret_names_are_rejected(tmp_path):
     collision = bundle_copy(tmp_path, "collision-env")
     tool = collision / "tools" / "scripts" / "validate-release" / "tool.yaml"
     tool.write_text(
@@ -277,15 +277,98 @@ def test_secret_env_collision_invalid_name_and_remote_mcp_refs_are_rejected(tmp_
     with pytest.raises(ValueError, match="secret name"):
         validate_repo_bundle(invalid)
 
-    remote = bundle_copy(tmp_path, "remote")
-    (remote / "tools" / "mcp" / "servers.yaml").write_text(
-        """version: 1
+
+def write_mcp(tmp_path: Path, name: str, document: str) -> Path:
+    bundle = bundle_copy(tmp_path, name)
+    (bundle / "tools" / "mcp" / "servers.yaml").write_text(document)
+    return bundle
+
+
+REMOTE_MCP = """version: 1
+servers:
+  remote:
+    connection: {transport: streamable_http, url: https://example.invalid/mcp}
+    tools: [lookup]
+    headers: {X-Client-Version: sweforge}
+    secret_headers: {Authorization: REMOTE_TOKEN}
+"""
+
+
+def test_remote_mcp_secret_headers_are_accepted_and_frozen(tmp_path):
+    bundle = validate_repo_bundle(write_mcp(tmp_path, "remote-ok", REMOTE_MCP))
+    server = bundle.mcp_servers[0]
+    assert server.secret_headers == {"Authorization": "REMOTE_TOKEN"}
+    assert server.connection["headers"] == {"X-Client-Version": "sweforge"}
+    assert server.secret_env == {}
+    assert bundle.manifest["mcp"][0]["secret_headers"] == {
+        "Authorization": "REMOTE_TOKEN"
+    }
+
+
+def test_remote_mcp_secret_env_is_still_rejected(tmp_path):
+    document = """version: 1
 servers:
   remote:
     connection: {transport: http, url: https://example.invalid/mcp}
     tools: [lookup]
     secret_env: {TOKEN: REMOTE_TOKEN}
 """
+    with pytest.raises(ValueError, match="local stdio"):
+        validate_repo_bundle(write_mcp(tmp_path, "remote-env", document))
+
+
+def test_fixed_and_secret_header_collision_is_rejected(tmp_path):
+    document = REMOTE_MCP.replace(
+        "headers: {X-Client-Version: sweforge}", "headers: {authorization: fixed}"
     )
-    with pytest.raises(ValueError, match="remote MCP"):
-        validate_repo_bundle(remote)
+    with pytest.raises(ValueError, match="HTTP header twice"):
+        validate_repo_bundle(write_mcp(tmp_path, "remote-collide", document))
+
+    nested = REMOTE_MCP.replace(
+        "url: https://example.invalid/mcp}",
+        "url: https://example.invalid/mcp, headers: {x-client-version: other}}",
+    )
+    with pytest.raises(ValueError, match="HTTP header twice"):
+        validate_repo_bundle(write_mcp(tmp_path, "remote-collide-nested", nested))
+
+
+def test_invalid_secret_header_reference_and_header_name_are_rejected(tmp_path):
+    document = REMOTE_MCP.replace(
+        "Authorization: REMOTE_TOKEN", "Authorization: bad-ref"
+    )
+    with pytest.raises(ValueError, match="secret name"):
+        validate_repo_bundle(write_mcp(tmp_path, "remote-bad-ref", document))
+
+    malformed = REMOTE_MCP.replace("X-Client-Version: sweforge", '"Bad Header": value')
+    with pytest.raises(ValueError, match="HTTP header"):
+        validate_repo_bundle(write_mcp(tmp_path, "remote-bad-header", malformed))
+
+
+def test_secret_headers_require_https_and_a_remote_transport(tmp_path):
+    plaintext = REMOTE_MCP.replace("https://example.invalid", "http://example.invalid")
+    with pytest.raises(ValueError, match="HTTPS"):
+        validate_repo_bundle(write_mcp(tmp_path, "remote-plain", plaintext))
+
+    document = """version: 1
+servers:
+  local:
+    connection: {transport: stdio, command: server, args: []}
+    tools: [lookup]
+    secret_headers: {Authorization: REMOTE_TOKEN}
+"""
+    with pytest.raises(ValueError, match="HTTP-based remote transport"):
+        validate_repo_bundle(write_mcp(tmp_path, "remote-stdio", document))
+
+
+def test_secret_header_reference_changes_digest_but_fixed_values_are_frozen(tmp_path):
+    baseline = validate_repo_bundle(write_mcp(tmp_path, "digest-one", REMOTE_MCP))
+    same = validate_repo_bundle(write_mcp(tmp_path, "digest-two", REMOTE_MCP))
+    assert baseline.digest == same.digest
+
+    rotated_reference = REMOTE_MCP.replace("REMOTE_TOKEN", "ROTATED_TOKEN")
+    assert (
+        validate_repo_bundle(
+            write_mcp(tmp_path, "digest-ref", rotated_reference)
+        ).digest
+        != baseline.digest
+    )

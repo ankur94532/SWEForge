@@ -36,6 +36,15 @@ class SecretValue:
         return "[REDACTED]"
 
 
+def redact_secret_values(value: object, secrets: list[str]) -> str:
+    """Redact exact runtime secret values before an external boundary."""
+    rendered = str(value)
+    for secret in secrets:
+        if len(secret) >= MIN_SECRET_CHARS:
+            rendered = rendered.replace(secret, "[REDACTED]")
+    return rendered
+
+
 def load_secret_master_key() -> bytes | None:
     """Load an operator-owned Fernet key without inventing local key storage."""
     value = os.getenv("SWEFORGE_SECRET_MASTER_KEY")

@@ -83,4 +83,6 @@ Configuration generations freeze credential reference names, not values.
 Rotating a secret immediately affects later calls from existing issues without
 changing their bound generation. Deleting a required value makes the tool fail
 closed until the value is configured again. Local stdio MCP servers support the
-same `secret_env` mapping; remote MCP auth references are not yet supported.
+same `secret_env` mapping. Remote HTTP MCP servers use separate fixed `headers`
+and secret-backed `secret_headers`; authenticated endpoints require HTTPS and
+do not follow redirects.

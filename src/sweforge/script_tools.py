@@ -17,7 +17,7 @@ from langchain_core.tools import StructuredTool
 
 from .agent_trace import AgentTracer, TraceContext
 from .repo_config import MAX_SCRIPT_OUTPUT_CHARS, ScriptToolSpec
-from .repo_secrets import MIN_SECRET_CHARS, SecretValue
+from .repo_secrets import SecretValue, redact_secret_values
 
 
 def _validate_value(value: Any, schema: Mapping[str, Any], label: str) -> None:
@@ -58,15 +58,6 @@ def _bounded(value: str) -> str:
     marker = "\n...[script output bounded]...\n"
     available = MAX_SCRIPT_OUTPUT_CHARS - len(marker)
     return value[: available // 2] + marker + value[-(available - available // 2) :]
-
-
-def redact_injected_secrets(value: object, secrets: list[str]) -> str:
-    """Redact exact injected values before any model/log/error boundary."""
-    rendered = str(value)
-    for secret in secrets:
-        if len(secret) >= MIN_SECRET_CHARS:
-            rendered = rendered.replace(secret, "[REDACTED]")
-    return rendered
 
 
 class ScriptToolExecutor:
@@ -171,8 +162,8 @@ class ScriptToolExecutor:
                     )
             stdin = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
             result = self._run(command, stdin, env, spec.timeout_seconds)
-            stdout = _bounded(redact_injected_secrets(result.stdout, secret_values))
-            stderr = _bounded(redact_injected_secrets(result.stderr, secret_values))
+            stdout = _bounded(redact_secret_values(result.stdout, secret_values))
+            stderr = _bounded(redact_secret_values(result.stderr, secret_values))
             rendered = stdout
             if stderr:
                 rendered += ("\n" if rendered else "") + f"stderr:\n{stderr}"
@@ -192,7 +183,7 @@ class ScriptToolExecutor:
         except (PermissionError, TimeoutError):
             raise
         except Exception as exc:
-            safe = redact_injected_secrets(exc, secret_values)
+            safe = redact_secret_values(exc, secret_values)
             raise RuntimeError(f"registered script tool failed: {safe}") from None
         finally:
             shutil.rmtree(stage, ignore_errors=True)

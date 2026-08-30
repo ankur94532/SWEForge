@@ -46,7 +46,8 @@ def _required_references(registry: RepoConfigRegistry, repo_id: int) -> set[str]
     return {
         secret_name
         for item in [*manifest["scripts"], *manifest["mcp"]]
-        for secret_name in item.get("secret_env", {}).values()
+        for references in (item.get("secret_env", {}), item.get("secret_headers", {}))
+        for secret_name in references.values()
     }
 
 

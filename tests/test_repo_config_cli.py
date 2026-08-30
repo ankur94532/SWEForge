@@ -2,9 +2,12 @@ import json
 import shutil
 from pathlib import Path
 
+from cryptography.fernet import Fernet
+
 from sweforge.cli import main as root_main
 from sweforge.github_store import SQLiteGitHubStore
 from sweforge.repo_config_cli import main
+from sweforge.repo_secrets import RepoSecretStore
 
 EXAMPLE = Path(__file__).parents[1] / "examples" / "repo-config"
 
@@ -88,3 +91,46 @@ def test_bad_cli_configure_keeps_previous_generation(tmp_path, capsys):
         == 1
     )
     assert "workflow" in capsys.readouterr().err
+
+
+def test_repo_show_never_reveals_remote_mcp_credentials(tmp_path, capsys):
+    state = observed_state(tmp_path)
+    bundle = tmp_path / "bundle"
+    shutil.copytree(EXAMPLE, bundle)
+    (bundle / "tools" / "mcp" / "servers.yaml").write_text(
+        """version: 1
+servers:
+  release-service:
+    connection:
+      transport: streamable_http
+      url: https://mcp.example.invalid/mcp
+    headers:
+      X-Client-Version: sweforge
+    secret_headers:
+      Authorization: RELEASE_MCP_AUTH
+    tools: [lookup_release]
+"""
+    )
+    store = SQLiteGitHubStore(state)
+    RepoSecretStore(store, Fernet.generate_key()).set(
+        1, "RELEASE_MCP_AUTH", "Bearer never-printed-value"
+    )
+    store.close()
+
+    assert main(["--state-db", str(state), "configure", "owner/repo", str(bundle)]) == 0
+    capsys.readouterr()
+    assert main(["--state-db", str(state), "show", "owner/repo"]) == 0
+    out = capsys.readouterr().out
+    shown = json.loads(out)
+
+    assert shown["mcp"] == [
+        {
+            "server": "release-service",
+            "tools": ["lookup_release"],
+            "credentials": {"required": 1, "configured": 1},
+        }
+    ]
+    assert "never-printed-value" not in out
+    assert "Authorization" not in out
+    assert "RELEASE_MCP_AUTH" not in out
+    assert "mcp.example.invalid" not in out

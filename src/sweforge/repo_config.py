@@ -14,7 +14,11 @@ from typing import Any
 
 import yaml
 
-from .capabilities import MCPServerSpec, RepoCapabilityRegistry
+from .capabilities import (
+    REMOTE_MCP_TRANSPORTS,
+    MCPServerSpec,
+    RepoCapabilityRegistry,
+)
 from .github_store import SQLiteGitHubStore
 from .skills import SkillMetadata, parse_skill_metadata
 from .workflow_spec import BUILTIN_WORKFLOW_TOOLS, WorkflowSpec, parse_workflow_spec
@@ -25,6 +29,7 @@ MAX_SCRIPT_TIMEOUT_SECONDS = 600
 MAX_SCRIPT_OUTPUT_CHARS = 20_000
 _NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]{0,127}$")
+_HTTP_HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _RUNTIMES = frozenset({"python", "shell"})
 _EFFECTS = frozenset({"read", "mutate"})
 
@@ -83,6 +88,7 @@ class MCPBundleServer:
     connection: Mapping[str, Any]
     tools: tuple[str, ...]
     secret_env: Mapping[str, str] = MappingProxyType({})
+    secret_headers: Mapping[str, str] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +174,28 @@ def _string_mapping(value: object, label: str, *, env_names: bool) -> dict[str, 
     ):
         raise ValueError(f"{label} must map valid names to non-empty strings")
     return {str(key): str(item) for key, item in result.items()}
+
+
+def _header_mapping(value: object, label: str) -> dict[str, str]:
+    result = _string_mapping(value, label, env_names=False)
+    normalized: set[str] = set()
+    for name, item in result.items():
+        folded = name.casefold()
+        if (
+            not _HTTP_HEADER_NAME.fullmatch(name)
+            or "\r" in item
+            or "\n" in item
+            or folded in normalized
+        ):
+            raise ValueError(f"{label} contains an invalid or duplicate HTTP header")
+        normalized.add(folded)
+    return result
+
+
+def _header_collision(left: Mapping[str, str], right: Mapping[str, str]) -> bool:
+    return bool(
+        {name.casefold() for name in left} & {name.casefold() for name in right}
+    )
 
 
 def _read_bundle_files(root: Path) -> dict[str, str]:
@@ -341,7 +369,13 @@ def _parse_mcp(files: Mapping[str, str]) -> tuple[MCPBundleServer, ...]:
         if not isinstance(server_id, str) or not _NAME.fullmatch(server_id):
             raise ValueError("MCP server ID is malformed")
         item = _mapping(raw, f"MCP server {server_id}")
-        unknown = set(item) - {"connection", "tools", "secret_env"}
+        unknown = set(item) - {
+            "connection",
+            "tools",
+            "secret_env",
+            "headers",
+            "secret_headers",
+        }
         if unknown:
             raise ValueError(
                 f"MCP server {server_id} has unknown fields: {sorted(unknown)}"
@@ -368,9 +402,7 @@ def _parse_mcp(files: Mapping[str, str]) -> tuple[MCPBundleServer, ...]:
                 f"MCP server {server_id}.secret_env contains an invalid secret name"
             )
         if secret_env and connection.get("transport") != "stdio":
-            raise ValueError(
-                "remote MCP secret references are unsupported; use local stdio"
-            )
+            raise ValueError("MCP secret_env is supported only for local stdio servers")
         fixed_env = connection.get("env", {})
         if fixed_env:
             fixed_env = _string_mapping(
@@ -381,12 +413,40 @@ def _parse_mcp(files: Mapping[str, str]) -> tuple[MCPBundleServer, ...]:
                     f"MCP server {server_id} configures an environment name twice"
                 )
             connection = {**connection, "env": fixed_env}
+        connection_headers = _header_mapping(
+            connection.get("headers"),
+            f"MCP server {server_id}.connection.headers",
+        )
+        headers = _header_mapping(
+            item.get("headers"), f"MCP server {server_id}.headers"
+        )
+        if _header_collision(connection_headers, headers):
+            raise ValueError(f"MCP server {server_id} configures an HTTP header twice")
+        fixed_headers = {**connection_headers, **headers}
+        secret_headers = _header_mapping(
+            item.get("secret_headers"), f"MCP server {server_id}.secret_headers"
+        )
+        if any(not _ENV_NAME.fullmatch(name) for name in secret_headers.values()):
+            raise ValueError(
+                f"MCP server {server_id}.secret_headers contains an invalid secret name"
+            )
+        if secret_headers and connection.get("transport") not in REMOTE_MCP_TRANSPORTS:
+            raise ValueError(
+                "MCP secret_headers requires an HTTP-based remote transport"
+            )
+        if secret_headers and not str(connection.get("url", "")).startswith("https://"):
+            raise ValueError("secret-authenticated remote MCP URLs must use HTTPS")
+        if _header_collision(fixed_headers, secret_headers):
+            raise ValueError(f"MCP server {server_id} configures an HTTP header twice")
+        if fixed_headers:
+            connection = {**connection, "headers": fixed_headers}
         result.append(
             MCPBundleServer(
                 server_id=server_id,
                 connection=MappingProxyType(dict(connection)),
                 tools=tuple(tools),
                 secret_env=MappingProxyType(secret_env),
+                secret_headers=MappingProxyType(secret_headers),
             )
         )
     return tuple(result)
@@ -462,6 +522,7 @@ def validate_repo_bundle(path: str | Path) -> ValidatedRepoBundle:
                 "connection": dict(item.connection),
                 "tools": list(item.tools),
                 "secret_env": dict(item.secret_env),
+                "secret_headers": dict(item.secret_headers),
             }
             for item in mcp_servers
         ],
@@ -678,6 +739,7 @@ class RepoConfigRegistry:
                     item["server_id"],
                     dict(item["connection"]),
                     dict(item.get("secret_env", {})),
+                    dict(item.get("secret_headers", {})),
                 )
             )
             registry.approve(repo_id, item["server_id"], set(item["tools"]))
@@ -716,7 +778,11 @@ class RepoConfigRegistry:
                     "server": item["server_id"],
                     "tools": item["tools"],
                     "credentials": self._credential_status(
-                        repo_id, item.get("secret_env", {})
+                        repo_id,
+                        {
+                            **item.get("secret_env", {}),
+                            **item.get("secret_headers", {}),
+                        },
                     ),
                 }
                 for item in manifest["mcp"]

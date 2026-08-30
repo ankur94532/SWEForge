@@ -8,3 +8,12 @@ servers:
     tools: [lookup_release]
     secret_env:
       RELEASE_CATALOG_TOKEN: RELEASE_CATALOG_TOKEN
+  remote-release-service:
+    connection:
+      transport: streamable_http
+      url: https://mcp.example.invalid/mcp
+    headers:
+      X-Client-Version: sweforge-example
+    secret_headers:
+      Authorization: RELEASE_MCP_AUTH
+    tools: [lookup_release]

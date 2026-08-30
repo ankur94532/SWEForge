@@ -81,3 +81,33 @@ def test_secret_cli_set_list_check_delete_never_displays_values(
         == 0
     )
     assert value not in capsys.readouterr().out
+
+
+def test_secret_check_reports_missing_remote_mcp_header_credentials(
+    tmp_path, monkeypatch, capsys
+):
+    state_path = tmp_path / "state.db"
+    state = SQLiteGitHubStore(state_path)
+    state.upsert_repository(1, "owner/repo", "now")
+    bundle = tmp_path / "bundle"
+    shutil.copytree(EXAMPLE, bundle)
+    (bundle / "tools" / "mcp" / "servers.yaml").write_text(
+        """version: 1
+servers:
+  release-service:
+    connection:
+      transport: streamable_http
+      url: https://mcp.example.invalid/mcp
+    secret_headers:
+      Authorization: RELEASE_MCP_AUTH
+    tools: [lookup_release]
+"""
+    )
+    RepoConfigRegistry(state).install(1, bundle, now="now")
+    state.close()
+    monkeypatch.setenv("SWEFORGE_SECRET_MASTER_KEY", Fernet.generate_key().decode())
+
+    assert main(["--state-db", str(state_path), "check", "owner/repo"]) == 1
+    output = capsys.readouterr().out
+    assert "RELEASE_MCP_AUTH\tmissing" in output
+    assert "RELEASE_POLICY_TOKEN\tmissing" in output
