@@ -19,16 +19,32 @@ class WorkflowProtocolError(RuntimeError):
     """The model stopped without using the required lifecycle gateway."""
 
 
-def _phase_advanced(authority: WorkflowAuthority, before: Any) -> bool:
+def _durable_phase(authority: WorkflowAuthority, before: Any) -> Any:
     active = authority.runtime.active_task(before.workflow_cycle_id)
     if active is None or active.task_run_id != before.task_run_id:
-        return True
-    phase = (
+        return None
+    return (
         active.waiting_from_phase
         if active.phase == TaskPhase.WAITING_FOR_INPUT
         else active.phase
     )
-    return phase != before.phase
+
+
+def _phase_advanced(
+    authority: WorkflowAuthority, before: Any, entry_phase: Any = None
+) -> bool:
+    """Report whether the exact task durably left the phase it started in.
+
+    ``entry_phase`` is the durable phase observed before the turn. A resume
+    runs under a synthetic replay phase (PLANNING for a plan-feedback review)
+    that never equals the durable waiting phase, so comparing against the
+    snapshot would be unconditionally true and would swallow every resume
+    failure as a completed turn.
+    """
+    phase = _durable_phase(authority, before)
+    if phase is None:
+        return True
+    return phase != (before.phase if entry_phase is None else entry_phase)
 
 
 def approval_resume_for_interrupt(
@@ -80,6 +96,7 @@ def invoke_workflow_phase(
         if resume is not None
         else authority.snapshot()
     )
+    entry_phase = _durable_phase(authority, before)
     state: Any = (
         Command(resume=dict(resume))
         if resume is not None
@@ -105,7 +122,7 @@ def invoke_workflow_phase(
             # phase authority and may fail closed. Once durable state proves
             # the exact task advanced, that post-gateway error must not turn a
             # successful transition into a dispatcher failure.
-            if _phase_advanced(authority, before):
+            if _phase_advanced(authority, before, entry_phase):
                 return {}
             if tracer is not None:
                 tracer.emit(
@@ -126,7 +143,7 @@ def invoke_workflow_phase(
                         str(payload.get("occurrence_key") or "unknown"),
                     )
             return result
-        if _phase_advanced(authority, before):
+        if _phase_advanced(authority, before, entry_phase):
             return result
         if attempt == MAX_PROTOCOL_NUDGES:
             raise WorkflowProtocolError(

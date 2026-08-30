@@ -136,3 +136,81 @@ def test_pre_gateway_agent_error_still_fails_closed():
         invoke_workflow_phase(
             Agent(), authority=authority, thread_id="thread-A", prompt="plan"
         )
+
+
+def test_resume_error_fails_closed_when_nothing_durably_advanced():
+    """A feedback resume must not be able to swallow its own failure.
+
+    ``resume_snapshot`` reports the synthetic phase the replayed gateway runs
+    under (PLANNING for a plan-feedback review) while the durable task stays
+    in WAITING_FOR_PLAN_APPROVAL. Comparing the durable phase against that
+    synthetic value is unconditionally true, so any exception raised during a
+    resume was reported as a completed turn and the worker re-dispatched the
+    same review forever.
+    """
+    active = SimpleNamespace(
+        task_run_id="task-run-A",
+        phase=TaskPhase.WAITING_FOR_PLAN_APPROVAL,
+        waiting_from_phase=None,
+    )
+    resume_snapshot = SimpleNamespace(
+        workflow_cycle_id="cycle-A",
+        task_run_id="task-run-A",
+        phase=TaskPhase.PLANNING,
+    )
+    runtime = SimpleNamespace(active_task=lambda _workflow_cycle_id: active)
+    authority = SimpleNamespace(
+        runtime=runtime,
+        snapshot=lambda: resume_snapshot,
+        resume_snapshot=lambda _kind: resume_snapshot,
+    )
+
+    class Agent:
+        def invoke(self, *_args, **_kwargs):
+            raise PermissionError("tool 'submit_plan' is forbidden for PLANNING")
+
+    with pytest.raises(PermissionError, match="forbidden"):
+        invoke_workflow_phase(
+            Agent(),
+            authority=authority,
+            thread_id="thread-A",
+            prompt="",
+            resume={"kind": "PLAN_FEEDBACK", "occurrence_key": "plan-approval:x"},
+        )
+
+
+def test_resume_error_is_still_accepted_after_a_real_durable_advance():
+    """The post-gateway allowance must survive for genuine transitions."""
+    state = SimpleNamespace(
+        task_run_id="task-run-A",
+        phase=TaskPhase.WAITING_FOR_PLAN_APPROVAL,
+        waiting_from_phase=None,
+    )
+    resume_snapshot = SimpleNamespace(
+        workflow_cycle_id="cycle-A",
+        task_run_id="task-run-A",
+        phase=TaskPhase.PLANNING,
+    )
+    runtime = SimpleNamespace(active_task=lambda _workflow_cycle_id: state)
+    authority = SimpleNamespace(
+        runtime=runtime,
+        snapshot=lambda: resume_snapshot,
+        resume_snapshot=lambda _kind: resume_snapshot,
+    )
+
+    class Agent:
+        def invoke(self, *_args, **_kwargs):
+            # The approval gateway committed before the agent saw the result.
+            state.phase = TaskPhase.EXECUTING
+            raise PermissionError("stale post-gateway phase authority")
+
+    assert (
+        invoke_workflow_phase(
+            Agent(),
+            authority=authority,
+            thread_id="thread-A",
+            prompt="",
+            resume={"kind": "PLAN_APPROVAL", "occurrence_key": "plan-approval:x"},
+        )
+        == {}
+    )
