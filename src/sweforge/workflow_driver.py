@@ -31,6 +31,8 @@ from .memory_learning import candidate_from_proposal
 from .repo_memory import MEMORY_VIRTUAL_PATH, ensure_repo_memory, repo_memory_namespace
 from .skills import show_repo_skill
 from .workflow_agent_runtime import invoke_workflow_phase
+from .workflow_comment_delivery import deliver_pending_workflow_comments
+from .workflow_messages import PLAN_FOOTER, RESULT_FOOTER
 from .workflow_middleware import WorkflowAuthority
 from .workflow_runtime import (
     TaskRun,
@@ -213,6 +215,13 @@ class DeepAgentWorkflowDriver:
                     and self.store.pending_revision_inputs(cycle.thread_id)
                 )
             ),
+            deliver_comments=lambda: deliver_pending_workflow_comments(
+                store=self.store,
+                client=self.client,
+                thread_id=cycle.thread_id,
+                now=self.runtime.clock(),
+                tracer=self.tracer,
+            ),
             tracer=self.tracer,
             trace_context=lambda task: self._trace_context(cycle, task),
         )
@@ -314,10 +323,7 @@ class DeepAgentWorkflowDriver:
                 "SWEForge will proceed automatically."
             )
         else:
-            body += (
-                "Reply with `@agent approve` to execute this exact plan, or "
-                "`@agent <feedback>` to revise it."
-            )
+            body += PLAN_FOOTER
         comment = matches[0] if matches else self._post_response(repo, root, body)
         return int(comment["id"]), str(
             comment.get("created_at") or self.runtime.clock()
@@ -369,10 +375,7 @@ class DeepAgentWorkflowDriver:
                 "automatically."
             )
         else:
-            body += (
-                "Reply with `@agent approve` to accept this task result, or "
-                "`@agent <feedback>` to request changes."
-            )
+            body += RESULT_FOOTER
         comment = matches[0] if matches else self._post_response(repo, root, body)
         return int(comment["id"]), str(
             comment.get("created_at") or self.runtime.clock()

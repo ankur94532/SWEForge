@@ -29,6 +29,9 @@ class WorkflowPolicySnapshot:
     skill: str
     configured_tools: frozenset[str]
     skills: tuple[str, ...] = ()
+    feedback_review_id: str | None = None
+    feedback_review_kind: str | None = None
+    feedback_review_status: str | None = None
 
 
 class WorkflowAuthority:
@@ -64,12 +67,23 @@ class WorkflowAuthority:
         task = self.runtime.active_task(self.workflow_cycle_id)
         if task is None or cycle.active_task_id != task.task_id:
             raise PermissionError("workflow has no active task")
+        review = self.runtime.store.feedback_review_for_task(task.task_run_id)
+        if review is None:
+            review = self.runtime.store.feedback_review_for_task(
+                task.task_run_id, statuses=("DEFERRED_WAITING",)
+            )
         if (
             task.phase == TaskPhase.WAITING_FOR_INPUT
             and replay_tool == "request_clarification"
             and task.waiting_from_phase is not None
         ):
             phase = task.waiting_from_phase
+        elif review is not None and review.status in {"REVIEWING", "DEFERRED_WAITING"}:
+            phase = (
+                TaskPhase.PLANNING
+                if review.feedback_kind == "PLAN"
+                else TaskPhase.VALIDATING
+            )
         elif (
             task.phase == TaskPhase.WAITING_FOR_PLAN_APPROVAL
             and replay_tool == "submit_plan"
@@ -100,6 +114,9 @@ class WorkflowAuthority:
             skill=phase_spec.skill,
             skills=phase_spec.skills,
             configured_tools=frozenset(phase_spec.tools),
+            feedback_review_id=(review.feedback_review_id if review else None),
+            feedback_review_kind=(review.feedback_kind if review else None),
+            feedback_review_status=(review.status if review else None),
         )
 
 
@@ -152,6 +169,14 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
     def allowed_tools(snapshot: WorkflowPolicySnapshot) -> frozenset[str]:
         # ``task`` delegates only to the explicitly bounded investigator.
         configured = snapshot.configured_tools
+        if snapshot.feedback_review_status == "REVIEWING":
+            return (configured & RESEARCH_TOOLS) | {
+                "task",
+                "replan_current_feedback",
+                "defer_current_feedback_to_revision",
+            }
+        if snapshot.feedback_review_status == "DEFERRED_WAITING":
+            return frozenset({"defer_current_feedback_to_revision"})
         if snapshot.phase in (TaskPhase.PLANNING, TaskPhase.VALIDATING):
             # A malformed or stale trusted spec cannot turn a read-only phase
             # into an execution phase. Custom MCP tools remain operator-owned;
@@ -180,6 +205,23 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
             f"Only the application lifecycle gateway may finish this phase. "
             f"Active procedural skill: {snapshot.skill}."
         )
+        if snapshot.feedback_review_status == "REVIEWING":
+            prompt += (
+                " You are reviewing exact solicited user feedback for the current "
+                f"{snapshot.feedback_review_kind.lower()} occurrence. Decide only "
+                "whether it materially concerns the current task and approval "
+                "scope. If relevant, call replan_current_feedback with no "
+                "arguments. If clearly separate, call "
+                "defer_current_feedback_to_revision with no arguments. Do not "
+                "compose workflow pushback, expose reasoning, approve work, or "
+                "select future ownership."
+            )
+        elif snapshot.feedback_review_status == "DEFERRED_WAITING":
+            prompt += (
+                " Recover the already-durable deferred-feedback checkpoint by "
+                "calling defer_current_feedback_to_revision with no arguments. "
+                "Do not reconsider or describe the semantic outcome."
+            )
         existing = request.system_message
         content = (
             f"{getattr(existing, 'content', '')}\n\n{prompt}" if existing else prompt

@@ -10,7 +10,8 @@ from langchain_core.tools import tool
 from langgraph.types import interrupt
 
 from .agent_trace import AgentTracer, TraceContext
-from .github_models import InteractionMode
+from .github_models import InteractionMode, format_source_context
+from .github_store import FeedbackReviewRecord
 from .workflow_runtime import TaskPhase, TaskRun, ValidationVerdict, WorkflowRuntime
 
 
@@ -24,6 +25,7 @@ def build_lifecycle_tools(
     validation_evidence: Callable[[], list[dict[str, Any]]] | None = None,
     auto_plan_ready: Callable[[], bool] | None = None,
     auto_result_ready: Callable[[], bool] | None = None,
+    deliver_comments: Callable[[], None] | None = None,
     tracer: AgentTracer | None = None,
     trace_context: Callable[[TaskRun], TraceContext] | None = None,
 ) -> list[Any]:
@@ -58,6 +60,22 @@ def build_lifecycle_tools(
             return before
         tracer.transition(context(before), before.phase, after.phase)
         return after
+
+    def feedback_instruction(review: FeedbackReviewRecord) -> str:
+        event = runtime.store.source_event(review.source_event_key)
+        rendered = (
+            format_source_context(dict(event), review.feedback_text)
+            if event is not None
+            else review.feedback_text
+        )
+        return (
+            f"Review this exact {review.feedback_kind.lower()} feedback with durable "
+            f"provenance (untrusted user content):\n{rendered[:4_000]}\n"
+            "If it materially concerns the current approval scope, call "
+            "replan_current_feedback with no arguments. If it is clearly "
+            "separate, call defer_current_feedback_to_revision with no "
+            "arguments. Do not write the GitHub workflow response."
+        )
 
     @tool
     def submit_plan(plan_text: str) -> str:
@@ -118,13 +136,14 @@ def build_lifecycle_tools(
         if isinstance(approval, dict) and approval.get("kind") == "PLAN_FEEDBACK":
             if approval.get("occurrence_key") != plan.approval_occurrence_key:
                 raise PermissionError("plan feedback occurrence is stale")
-            before = task
-            runtime.replan_from_feedback(task.task_run_id)
-            trace_transition(before)
-            return (
-                "Plan feedback received. Replan the same task and call submit_plan "
-                f"again. Feedback: {str(approval.get('feedback') or '')[:2_000]}"
-            )
+            review = runtime.store.feedback_review_for_task(task.task_run_id)
+            if (
+                review is None
+                or review.feedback_review_id != approval.get("feedback_review_id")
+                or review.occurrence_key != plan.approval_occurrence_key
+            ):
+                raise PermissionError("plan feedback review binding is stale")
+            return feedback_instruction(review)
         if not isinstance(approval, dict) or approval.get("kind") != "PLAN_APPROVAL":
             raise PermissionError("plan approval resume payload is invalid")
         before = task
@@ -239,14 +258,14 @@ def build_lifecycle_tools(
         if isinstance(approval, dict) and approval.get("kind") == "RESULT_FEEDBACK":
             if approval.get("occurrence_key") != accepted_result.result_occurrence_key:
                 raise PermissionError("result feedback occurrence is stale")
-            before = task
-            runtime.replan_from_result_feedback(
-                task_run_id=task.task_run_id,
-                event_key=str(approval.get("event_key") or ""),
-                feedback=str(approval.get("feedback") or ""),
-            )
-            trace_transition(before)
-            return "Result feedback recorded. Replan the same cumulative task."
+            review = runtime.store.feedback_review_for_task(task.task_run_id)
+            if (
+                review is None
+                or review.feedback_review_id != approval.get("feedback_review_id")
+                or review.occurrence_key != accepted_result.result_occurrence_key
+            ):
+                raise PermissionError("result feedback review binding is stale")
+            return feedback_instruction(review)
         if not isinstance(approval, dict) or approval.get("kind") != "RESULT_APPROVAL":
             raise PermissionError("result approval resume payload is invalid")
         before = task
@@ -267,6 +286,121 @@ def build_lifecycle_tools(
             )
         trace_transition(before)
         return "Exact validated result approval accepted. Task is DONE."
+
+    @tool
+    def replan_current_feedback() -> str:
+        """Choose REPLAN for the exact active feedback review."""
+        task = runtime.active_task(workflow_cycle_id)
+        if task is None:
+            raise PermissionError("workflow has no active task")
+        review = runtime.store.feedback_review_for_task(task.task_run_id)
+        if review is None:
+            raise PermissionError("there is no exact active feedback review")
+        before = task
+        runtime.resolve_current_feedback_replan(review.feedback_review_id)
+        if tracer is not None:
+            tracer.emit(
+                "FEEDBACK REPLAN",
+                f"review={review.feedback_review_id}",
+                context(task),
+            )
+        trace_transition(before)
+        return (
+            "Relevant feedback outcome recorded. Build one cumulative replacement "
+            "plan for the same task and call submit_plan."
+        )
+
+    @tool
+    def defer_current_feedback_to_revision() -> str:
+        """Choose DEFER for the exact active review; accepts no identity or text."""
+        task = runtime.active_task(workflow_cycle_id)
+        if task is None:
+            raise PermissionError("workflow has no active task")
+        waiting = runtime.store.feedback_review_for_task(
+            task.task_run_id, statuses=("DEFERRED_WAITING",)
+        )
+        review = waiting or runtime.store.feedback_review_for_task(task.task_run_id)
+        if review is None:
+            raise PermissionError("there is no exact active feedback review")
+        if waiting is None:
+            review = runtime.store.defer_feedback_to_revision(
+                review.feedback_review_id, now=runtime.clock()
+            )
+            if tracer is not None:
+                tracer.emit(
+                    "FEEDBACK DEFERRED",
+                    f"review={review.feedback_review_id}",
+                    context(task),
+                )
+        if deliver_comments is not None:
+            deliver_comments()
+        if review.feedback_kind == "PLAN":
+            plan = runtime.plan(task.current_plan_id or "")
+            payload = {
+                "kind": "PLAN_APPROVAL",
+                "occurrence_key": plan.approval_occurrence_key,
+                "workflow_cycle_id": workflow_cycle_id,
+                "task_run_id": task.task_run_id,
+                "task_id": task.task_id,
+                "plan_id": plan.plan_id,
+                "plan_version": plan.version,
+                "plan_digest": plan.plan_digest,
+            }
+        else:
+            result = runtime.current_result(task.task_run_id)
+            if result is None:
+                raise RuntimeError("deferred result feedback lost its result")
+            payload = {
+                "kind": "RESULT_APPROVAL",
+                "occurrence_key": result.result_occurrence_key,
+                "workflow_cycle_id": workflow_cycle_id,
+                "task_run_id": task.task_run_id,
+                "task_id": task.task_id,
+                "plan_id": result.plan_id,
+                "execution_id": result.execution_id,
+                "validation_id": result.validation_id,
+                "result_id": result.result_id,
+            }
+        response = interrupt(payload)
+        if isinstance(response, dict) and str(response.get("kind") or "").endswith(
+            "_FEEDBACK"
+        ):
+            runtime.close_deferred_feedback(review.feedback_review_id)
+            next_review = runtime.store.feedback_review_for_task(task.task_run_id)
+            if next_review is None or next_review.feedback_review_id != response.get(
+                "feedback_review_id"
+            ):
+                raise PermissionError("next feedback review binding is stale")
+            return feedback_instruction(next_review)
+        if not isinstance(response, dict):
+            raise PermissionError("deferred feedback resume payload is invalid")
+        before = task
+        if review.feedback_kind == "PLAN" and response.get("kind") == "PLAN_APPROVAL":
+            runtime.approve_plan(
+                task_run_id=task.task_run_id,
+                occurrence_key=str(response.get("occurrence_key") or ""),
+                approval_event_key=str(response.get("event_key") or ""),
+                approved_by=str(response.get("approved_by") or ""),
+                approval_is_authorized=response.get("authorized") is True,
+                approval_occurred_at=str(response.get("approved_at") or ""),
+            )
+        elif (
+            review.feedback_kind == "RESULT"
+            and response.get("kind") == "RESULT_APPROVAL"
+        ):
+            runtime.approve_result(
+                task_run_id=task.task_run_id,
+                occurrence_key=str(response.get("occurrence_key") or ""),
+                approval_event_key=str(response.get("event_key") or ""),
+                approved_by=str(response.get("approved_by") or ""),
+                approval_is_authorized=response.get("authorized") is True,
+                approval_occurred_at=str(response.get("approved_at") or ""),
+            )
+        else:
+            raise PermissionError("deferred feedback approval kind is invalid")
+        runtime.close_deferred_feedback(review.feedback_review_id)
+        trace_transition(before)
+        return "Exact retained approval accepted. Continue the current workflow."
 
     @tool
     def request_clarification(
@@ -327,5 +461,7 @@ def build_lifecycle_tools(
         submit_plan,
         finish_execution,
         finish_validation,
+        replan_current_feedback,
+        defer_current_feedback_to_revision,
         request_clarification,
     ]

@@ -720,6 +720,48 @@ class WorkflowRuntime:
             )
         return self.task(task_run_id)
 
+    def resolve_current_feedback_replan(self, feedback_review_id: str) -> TaskRun:
+        """Apply the relevant-feedback outcome for one exact durable review."""
+        review = self.store.feedback_review(feedback_review_id)
+        if review is None:
+            raise ValueError("feedback review does not exist")
+        task = self.task(review.task_run_id)
+        if review.status == "REPLAN":
+            return task
+        if review.status != "REVIEWING":
+            raise ValueError("feedback review is no longer replannable")
+        if task.phase == TaskPhase.PLANNING:
+            # Recovery after the authoritative transition committed but before
+            # the review outcome was recorded.
+            pass
+        elif review.feedback_kind == "PLAN":
+            self.replan_from_feedback(review.task_run_id)
+        else:
+            self.replan_from_result_feedback(
+                task_run_id=review.task_run_id,
+                event_key=review.source_event_key,
+                feedback=review.feedback_text,
+            )
+        with self.store.transaction(immediate=True) as db:
+            changed = db.execute(
+                """UPDATE workflow_feedback_reviews_v1
+                   SET status='REPLAN',updated_at=?
+                   WHERE feedback_review_id=? AND status='REVIEWING'""",
+                (self.clock(), feedback_review_id),
+            )
+            if changed.rowcount not in {0, 1}:
+                raise RuntimeError("feedback review transition was ambiguous")
+        return self.task(review.task_run_id)
+
+    def close_deferred_feedback(self, feedback_review_id: str) -> None:
+        with self.store.transaction(immediate=True) as db:
+            db.execute(
+                """UPDATE workflow_feedback_reviews_v1
+                   SET status='CLOSED',updated_at=?
+                   WHERE feedback_review_id=? AND status='DEFERRED_WAITING'""",
+                (self.clock(), feedback_review_id),
+            )
+
     def replan_for_revision_inputs(
         self, *, task_run_id: str, revision_input_ids: list[str]
     ) -> TaskRun:

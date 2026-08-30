@@ -45,6 +45,8 @@ _LIFECYCLE_TOOLS = {
     "submit_plan",
     "finish_execution",
     "finish_validation",
+    "replan_current_feedback",
+    "defer_current_feedback_to_revision",
     "request_clarification",
 }
 

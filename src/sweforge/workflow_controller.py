@@ -19,6 +19,7 @@ from .github_models import (
 )
 from .github_store import SQLiteGitHubStore, ThreadWorkspaceRecord
 from .lifecycle_context import render_accepted_lifecycle
+from .workflow_comment_delivery import deliver_pending_workflow_comments
 from .workflow_runtime import (
     TaskPhase,
     TaskRun,
@@ -106,6 +107,13 @@ class DeclarativeWorkflowController:
                     "unsolicited steering persisted",
                     TraceContext(thread_id=thread_id),
                 )
+        deliver_pending_workflow_comments(
+            store=self.store,
+            client=self.client,
+            thread_id=thread_id,
+            now=self.clock(),
+            tracer=self.tracer,
+        )
         cycle = self.runtime.cycle_for_thread(thread_id)
         if cycle is None:
             cycle = self._begin_cycle(thread_id)
@@ -181,9 +189,34 @@ class DeclarativeWorkflowController:
                 )
             resume = self._plan_wait_resume(cycle, task, driver)
             if resume is None:
-                driver.reconcile_interrupts(cycle=cycle, task=task)
-                return self._result(cycle, task, "WAITING_FOR_PLAN_APPROVAL")
-            driver.drive(cycle=cycle, task=task, prompt="", resume=resume)
+                reviewing = self.store.feedback_review_for_task(task.task_run_id)
+                deferred = self.store.feedback_review_for_task(
+                    task.task_run_id, statuses=("DEFERRED_WAITING",)
+                )
+                deferred_interrupt_missing = (
+                    deferred is not None
+                    and not self._has_pending_interrupt(
+                        driver,
+                        cycle,
+                        task,
+                        "PLAN_APPROVAL",
+                        deferred.occurrence_key,
+                    )
+                )
+                if reviewing is not None or deferred_interrupt_missing:
+                    driver.drive(
+                        cycle=cycle,
+                        task=task,
+                        prompt=(
+                            "Continue the exact durable plan-feedback checkpoint "
+                            "using the only authorized feedback gateway."
+                        ),
+                    )
+                else:
+                    driver.reconcile_interrupts(cycle=cycle, task=task)
+                    return self._result(cycle, task, "WAITING_FOR_PLAN_APPROVAL")
+            else:
+                driver.drive(cycle=cycle, task=task, prompt="", resume=resume)
         elif task.phase == TaskPhase.WAITING_FOR_RESULT_APPROVAL:
             if mode == InteractionMode.AUTO:
                 before = task
@@ -212,9 +245,34 @@ class DeclarativeWorkflowController:
                 )
             resume = self._result_wait_resume(cycle, task, driver)
             if resume is None:
-                driver.reconcile_interrupts(cycle=cycle, task=task)
-                return self._result(cycle, task, "WAITING_FOR_RESULT_APPROVAL")
-            driver.drive(cycle=cycle, task=task, prompt="", resume=resume)
+                reviewing = self.store.feedback_review_for_task(task.task_run_id)
+                deferred = self.store.feedback_review_for_task(
+                    task.task_run_id, statuses=("DEFERRED_WAITING",)
+                )
+                deferred_interrupt_missing = (
+                    deferred is not None
+                    and not self._has_pending_interrupt(
+                        driver,
+                        cycle,
+                        task,
+                        "RESULT_APPROVAL",
+                        deferred.occurrence_key,
+                    )
+                )
+                if reviewing is not None or deferred_interrupt_missing:
+                    driver.drive(
+                        cycle=cycle,
+                        task=task,
+                        prompt=(
+                            "Continue the exact durable result-feedback checkpoint "
+                            "using the only authorized feedback gateway."
+                        ),
+                    )
+                else:
+                    driver.reconcile_interrupts(cycle=cycle, task=task)
+                    return self._result(cycle, task, "WAITING_FOR_RESULT_APPROVAL")
+            else:
+                driver.drive(cycle=cycle, task=task, prompt="", resume=resume)
         elif task.phase == TaskPhase.WAITING_FOR_INPUT:
             resume = self._clarification_resume(cycle, task, driver)
             if resume is None:
@@ -522,6 +580,27 @@ class DeclarativeWorkflowController:
         if task.current_plan_id is None:
             raise RuntimeError("waiting task has no current plan")
         plan = self.runtime.plan(task.current_plan_id)
+        active_review = self.store.feedback_review_for_task(task.task_run_id)
+        if active_review is not None:
+            if (
+                active_review.feedback_kind != "PLAN"
+                or active_review.occurrence_key != plan.approval_occurrence_key
+            ):
+                raise RuntimeError("active plan feedback review is stale")
+            event = self.store.source_event(active_review.source_event_key)
+            if event is None:
+                raise RuntimeError("active plan feedback event disappeared")
+            if not self._has_pending_interrupt(
+                driver, cycle, task, "PLAN_APPROVAL", plan.approval_occurrence_key
+            ):
+                return None
+            return {
+                "kind": "PLAN_FEEDBACK",
+                "occurrence_key": plan.approval_occurrence_key,
+                "event_key": event["event_key"],
+                "feedback_review_id": active_review.feedback_review_id,
+                "feedback": active_review.feedback_text,
+            }
         root = self._root_event(cycle)
         for event in self.store.unconsumed_inputs(cycle.thread_id):
             if not self._same_target(event, root) or not self._after(
@@ -549,11 +628,34 @@ class DeclarativeWorkflowController:
                     "authorized": True,
                 }
             if starts_with_agent_invocation(event["body"]):
-                self._consume(event, cycle, "PLAN_FEEDBACK")
+                review = self.store.begin_feedback_review(
+                    event_key=event["event_key"],
+                    task_run_id=task.task_run_id,
+                    feedback_kind="PLAN",
+                    occurrence_key=plan.approval_occurrence_key,
+                    feedback_text=normalize_task(event["body"]),
+                    now=self.clock(),
+                )
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "FEEDBACK REVIEW START",
+                        f"review={review.feedback_review_id} kind=PLAN",
+                        TraceContext(
+                            thread_id=cycle.thread_id,
+                            workflow_cycle_id=cycle.workflow_cycle_id,
+                            cycle_id=cycle.cycle_id,
+                            task_id=task.task_id,
+                            task_run_id=task.task_run_id,
+                            phase=task.phase.value,
+                            origin_surface=event["origin_surface"],
+                            subject_number=event["subject_number"],
+                        ),
+                    )
                 return {
                     "kind": "PLAN_FEEDBACK",
                     "occurrence_key": plan.approval_occurrence_key,
                     "event_key": event["event_key"],
+                    "feedback_review_id": review.feedback_review_id,
                     "feedback": normalize_task(event["body"]),
                 }
         return None
@@ -604,6 +706,31 @@ class DeclarativeWorkflowController:
         result = self.runtime.current_result(task.task_run_id)
         if result is None:
             raise RuntimeError("waiting task has no current validated result")
+        active_review = self.store.feedback_review_for_task(task.task_run_id)
+        if active_review is not None:
+            if (
+                active_review.feedback_kind != "RESULT"
+                or active_review.occurrence_key != result.result_occurrence_key
+            ):
+                raise RuntimeError("active result feedback review is stale")
+            event = self.store.source_event(active_review.source_event_key)
+            if event is None:
+                raise RuntimeError("active result feedback event disappeared")
+            if not self._has_pending_interrupt(
+                driver,
+                cycle,
+                task,
+                "RESULT_APPROVAL",
+                result.result_occurrence_key,
+            ):
+                return None
+            return {
+                "kind": "RESULT_FEEDBACK",
+                "occurrence_key": result.result_occurrence_key,
+                "event_key": event["event_key"],
+                "feedback_review_id": active_review.feedback_review_id,
+                "feedback": active_review.feedback_text,
+            }
         root = self._root_event(cycle)
         for event in self.store.unconsumed_inputs(cycle.thread_id):
             if not self._same_target(event, root) or not self._after(
@@ -637,11 +764,34 @@ class DeclarativeWorkflowController:
                     "authorized": True,
                 }
             if starts_with_agent_invocation(event["body"]):
-                self._consume(event, cycle, "RESULT_FEEDBACK")
+                review = self.store.begin_feedback_review(
+                    event_key=event["event_key"],
+                    task_run_id=task.task_run_id,
+                    feedback_kind="RESULT",
+                    occurrence_key=result.result_occurrence_key,
+                    feedback_text=normalize_task(event["body"]),
+                    now=self.clock(),
+                )
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        "FEEDBACK REVIEW START",
+                        f"review={review.feedback_review_id} kind=RESULT",
+                        TraceContext(
+                            thread_id=cycle.thread_id,
+                            workflow_cycle_id=cycle.workflow_cycle_id,
+                            cycle_id=cycle.cycle_id,
+                            task_id=task.task_id,
+                            task_run_id=task.task_run_id,
+                            phase=task.phase.value,
+                            origin_surface=event["origin_surface"],
+                            subject_number=event["subject_number"],
+                        ),
+                    )
                 return {
                     "kind": "RESULT_FEEDBACK",
                     "occurrence_key": result.result_occurrence_key,
                     "event_key": event["event_key"],
+                    "feedback_review_id": review.feedback_review_id,
                     "feedback": normalize_task(event["body"]),
                 }
         return None

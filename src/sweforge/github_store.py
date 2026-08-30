@@ -24,6 +24,14 @@ from .github_models import (
     is_exact_agent_approval,
     starts_with_agent_invocation,
 )
+from .workflow_messages import (
+    PLAN_DEFERRED_FEEDBACK_MESSAGE,
+    RESULT_DEFERRED_FEEDBACK_MESSAGE,
+    UNSOLICITED_ACK_MESSAGE,
+    deferred_feedback_marker,
+    outbox_id_for,
+    revision_ack_marker,
+)
 
 
 class _SerializedSQLiteCursor(sqlite3.Cursor):
@@ -457,6 +465,39 @@ CREATE TABLE IF NOT EXISTS revision_inputs_v1 (
 );
 CREATE INDEX IF NOT EXISTS idx_revision_inputs_thread_status
     ON revision_inputs_v1(thread_id, status, queued_at, revision_input_id);
+CREATE TABLE IF NOT EXISTS workflow_feedback_reviews_v1 (
+    feedback_review_id TEXT PRIMARY KEY,
+    source_event_key TEXT NOT NULL UNIQUE REFERENCES source_events(event_key),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    workflow_cycle_id TEXT NOT NULL REFERENCES workflow_cycles_v1(workflow_cycle_id),
+    task_run_id TEXT NOT NULL REFERENCES workflow_task_runs_v1(task_run_id),
+    feedback_kind TEXT NOT NULL,
+    occurrence_key TEXT NOT NULL,
+    feedback_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'REVIEWING',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_reviews_task_status
+    ON workflow_feedback_reviews_v1(task_run_id, status, created_at);
+CREATE TABLE IF NOT EXISTS workflow_comment_outbox_v1 (
+    outbox_id TEXT PRIMARY KEY,
+    source_event_key TEXT NOT NULL REFERENCES source_events(event_key),
+    thread_id TEXT NOT NULL REFERENCES issue_threads(thread_id),
+    message_kind TEXT NOT NULL,
+    stable_marker TEXT NOT NULL UNIQUE,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    comment_id INTEGER,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    next_attempt_at TEXT NOT NULL,
+    delivered_at TEXT,
+    UNIQUE(source_event_key, message_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_comment_outbox_pending
+    ON workflow_comment_outbox_v1(thread_id, status, created_at);
 CREATE TABLE IF NOT EXISTS workflow_task_runs_v1 (
     task_run_id TEXT PRIMARY KEY,
     workflow_cycle_id TEXT NOT NULL REFERENCES workflow_cycles_v1(workflow_cycle_id),
@@ -1228,6 +1269,38 @@ class DeferredFollowupRecord:
     queued_at: str
     consumed_cycle_id: int | None
     consumed_at: str | None
+
+
+@dataclass(frozen=True)
+class FeedbackReviewRecord:
+    feedback_review_id: str
+    source_event_key: str
+    thread_id: str
+    workflow_cycle_id: str
+    task_run_id: str
+    feedback_kind: str
+    occurrence_key: str
+    feedback_text: str
+    status: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class WorkflowCommentOutboxRecord:
+    outbox_id: str
+    source_event_key: str
+    thread_id: str
+    message_kind: str
+    stable_marker: str
+    body: str
+    status: str
+    comment_id: int | None
+    error_message: str | None
+    created_at: str
+    updated_at: str
+    next_attempt_at: str
+    delivered_at: str | None
 
 
 @dataclass(frozen=True)
@@ -2479,9 +2552,7 @@ class SQLiteGitHubStore:
                 recorded_at=queued_at,
             )
             return "STALE_APPROVAL"
-        revision_input_id = (
-            "revision-input-" + hashlib.sha256(event_key.encode()).hexdigest()[:24]
-        )
+        revision_input_id = cls.revision_input_id_for(event_key)
         db.execute(
             """INSERT OR IGNORE INTO revision_inputs_v1(
                revision_input_id,source_event_key,thread_id,residual_text,
@@ -2497,7 +2568,52 @@ class SQLiteGitHubStore:
             status="REVISION_QUEUED",
             recorded_at=queued_at,
         )
+        marker = revision_ack_marker(revision_input_id)
+        cls._enqueue_workflow_comment_sql(
+            db,
+            source_event_key=event_key,
+            thread_id=thread_id,
+            message_kind="REVISION_INPUT_ACK",
+            marker=marker,
+            body=f"{marker}\n{UNSOLICITED_ACK_MESSAGE}",
+            now=queued_at,
+        )
         return "REVISION_QUEUED"
+
+    @staticmethod
+    def revision_input_id_for(event_key: str) -> str:
+        return "revision-input-" + hashlib.sha256(event_key.encode()).hexdigest()[:24]
+
+    @staticmethod
+    def _enqueue_workflow_comment_sql(
+        db: sqlite3.Connection,
+        *,
+        source_event_key: str,
+        thread_id: str,
+        message_kind: str,
+        marker: str,
+        body: str,
+        now: str,
+    ) -> None:
+        db.execute(
+            """INSERT OR IGNORE INTO workflow_comment_outbox_v1(
+               outbox_id,source_event_key,thread_id,message_kind,stable_marker,
+               body,status,created_at,updated_at,next_attempt_at)
+               VALUES(?,?,?,?,?,?,'PENDING',?,?,?)""",
+            (
+                outbox_id_for(
+                    source_event_key=source_event_key, message_kind=message_kind
+                ),
+                source_event_key,
+                thread_id,
+                message_kind,
+                marker,
+                body,
+                now,
+                now,
+                now,
+            ),
+        )
 
     @staticmethod
     def _latest_cycle_id_sql(db: sqlite3.Connection, thread_id: str) -> int:
@@ -5936,6 +6052,263 @@ class SQLiteGitHubStore:
                     routed.append(row["event_key"])
         return routed
 
+    def begin_feedback_review(
+        self,
+        *,
+        event_key: str,
+        task_run_id: str,
+        feedback_kind: str,
+        occurrence_key: str,
+        feedback_text: str,
+        now: str,
+    ) -> FeedbackReviewRecord:
+        """Bind one solicited feedback event to the exact open occurrence."""
+        if feedback_kind not in {"PLAN", "RESULT"}:
+            raise ValueError("feedback review kind is invalid")
+        review_id = (
+            "feedback-review-"
+            + hashlib.sha256(
+                f"{event_key}\0{feedback_kind}\0{occurrence_key}".encode()
+            ).hexdigest()[:24]
+        )
+        with self.transaction(immediate=True) as db:
+            existing = db.execute(
+                "SELECT * FROM workflow_feedback_reviews_v1 WHERE source_event_key=?",
+                (event_key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["feedback_review_id"] != review_id:
+                    raise ValueError("feedback event is bound to another occurrence")
+                return FeedbackReviewRecord(**dict(existing))
+            task = db.execute(
+                "SELECT * FROM workflow_task_runs_v1 WHERE task_run_id=?",
+                (task_run_id,),
+            ).fetchone()
+            event = db.execute(
+                "SELECT * FROM source_events WHERE event_key=? AND thread_id=?",
+                (event_key, task["thread_id"] if task is not None else ""),
+            ).fetchone()
+            expected_phase = (
+                "WAITING_FOR_PLAN_APPROVAL"
+                if feedback_kind == "PLAN"
+                else "WAITING_FOR_RESULT_APPROVAL"
+            )
+            if task is None or event is None or task["phase"] != expected_phase:
+                raise ValueError("feedback occurrence is no longer active")
+            cycle = db.execute(
+                "SELECT * FROM workflow_cycles_v1 WHERE workflow_cycle_id=?",
+                (task["workflow_cycle_id"],),
+            ).fetchone()
+            root = (
+                self._cycle_root_event_sql(db, cycle["root_input_id"])
+                if cycle is not None
+                else None
+            )
+            if root is None or not self._same_generic_target(event, root):
+                raise ValueError("feedback does not target the active interaction")
+            if feedback_kind == "PLAN":
+                plan = db.execute(
+                    "SELECT * FROM workflow_task_plans_v1 WHERE plan_id=?",
+                    (task["current_plan_id"],),
+                ).fetchone()
+                exact = plan and plan["approval_occurrence_key"] == occurrence_key
+            else:
+                result = db.execute(
+                    """SELECT * FROM workflow_task_results_v1
+                       WHERE task_run_id=? ORDER BY created_at DESC LIMIT 1""",
+                    (task_run_id,),
+                ).fetchone()
+                exact = result and result["result_occurrence_key"] == occurrence_key
+            if not exact:
+                raise ValueError("feedback approval occurrence is stale")
+            if db.execute(
+                "SELECT 1 FROM thread_input_consumptions WHERE event_key=?",
+                (event_key,),
+            ).fetchone():
+                raise ValueError("feedback event was already consumed")
+            db.execute(
+                """INSERT INTO workflow_feedback_reviews_v1(
+                   feedback_review_id,source_event_key,thread_id,
+                   workflow_cycle_id,task_run_id,feedback_kind,occurrence_key,
+                   feedback_text,status,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?, 'REVIEWING',?,?)""",
+                (
+                    review_id,
+                    event_key,
+                    task["thread_id"],
+                    task["workflow_cycle_id"],
+                    task_run_id,
+                    feedback_kind,
+                    occurrence_key,
+                    feedback_text.strip()[:4_000],
+                    now,
+                    now,
+                ),
+            )
+            self._record_disposition_sql(
+                db,
+                event_key=event_key,
+                thread_id=task["thread_id"],
+                cycle_id=task["cycle_id"],
+                status=f"{feedback_kind}_FEEDBACK_REVIEW",
+                recorded_at=now,
+            )
+        return self.feedback_review(review_id)  # type: ignore[return-value]
+
+    def feedback_review(self, review_id: str) -> FeedbackReviewRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM workflow_feedback_reviews_v1 WHERE feedback_review_id=?",
+            (review_id,),
+        ).fetchone()
+        return FeedbackReviewRecord(**dict(row)) if row else None
+
+    def feedback_review_for_task(
+        self, task_run_id: str, *, statuses: tuple[str, ...] = ("REVIEWING",)
+    ) -> FeedbackReviewRecord | None:
+        placeholders = ",".join("?" for _ in statuses)
+        rows = self.connection.execute(
+            f"""SELECT * FROM workflow_feedback_reviews_v1
+                WHERE task_run_id=? AND status IN ({placeholders})
+                ORDER BY created_at DESC,feedback_review_id DESC LIMIT 2""",
+            (task_run_id, *statuses),
+        ).fetchall()
+        if len(rows) > 1:
+            raise RuntimeError("multiple active feedback reviews are ambiguous")
+        return FeedbackReviewRecord(**dict(rows[0])) if rows else None
+
+    def defer_feedback_to_revision(
+        self, feedback_review_id: str, *, now: str
+    ) -> FeedbackReviewRecord:
+        """Queue the review's exact event while preserving plan/result authority."""
+        with self.transaction(immediate=True) as db:
+            review = db.execute(
+                "SELECT * FROM workflow_feedback_reviews_v1 WHERE feedback_review_id=?",
+                (feedback_review_id,),
+            ).fetchone()
+            if review is None:
+                raise ValueError("feedback review does not exist")
+            if review["status"] == "DEFERRED_WAITING":
+                return FeedbackReviewRecord(**dict(review))
+            if review["status"] != "REVIEWING":
+                raise ValueError("feedback review is no longer deferable")
+            task = db.execute(
+                "SELECT * FROM workflow_task_runs_v1 WHERE task_run_id=?",
+                (review["task_run_id"],),
+            ).fetchone()
+            expected_phase = (
+                "WAITING_FOR_PLAN_APPROVAL"
+                if review["feedback_kind"] == "PLAN"
+                else "WAITING_FOR_RESULT_APPROVAL"
+            )
+            if task is None or task["phase"] != expected_phase:
+                raise ValueError("feedback review became stale")
+            if review["feedback_kind"] == "PLAN":
+                exact = db.execute(
+                    """SELECT 1 FROM workflow_task_plans_v1
+                       WHERE plan_id=? AND approval_occurrence_key=?""",
+                    (task["current_plan_id"], review["occurrence_key"]),
+                ).fetchone()
+                message_kind = "PLAN_FEEDBACK_DEFERRED"
+                message = PLAN_DEFERRED_FEEDBACK_MESSAGE
+            else:
+                exact = db.execute(
+                    """SELECT 1 FROM workflow_task_results_v1
+                       WHERE task_run_id=? AND result_occurrence_key=?""",
+                    (task["task_run_id"], review["occurrence_key"]),
+                ).fetchone()
+                message_kind = "RESULT_FEEDBACK_DEFERRED"
+                message = RESULT_DEFERRED_FEEDBACK_MESSAGE
+            if exact is None:
+                raise ValueError("feedback approval occurrence became stale")
+            revision_input_id = self.revision_input_id_for(review["source_event_key"])
+            db.execute(
+                """INSERT OR IGNORE INTO revision_inputs_v1(
+                   revision_input_id,source_event_key,thread_id,residual_text,
+                   classification_reason,status,queued_at)
+                   VALUES(?,?,?,NULL,?,'PENDING',?)""",
+                (
+                    revision_input_id,
+                    review["source_event_key"],
+                    review["thread_id"],
+                    f"DEFERRED_{review['feedback_kind']}_FEEDBACK",
+                    now,
+                ),
+            )
+            marker = deferred_feedback_marker(feedback_review_id)
+            self._enqueue_workflow_comment_sql(
+                db,
+                source_event_key=review["source_event_key"],
+                thread_id=review["thread_id"],
+                message_kind=message_kind,
+                marker=marker,
+                body=f"{marker}\n{message}",
+                now=now,
+            )
+            db.execute(
+                """UPDATE workflow_feedback_reviews_v1
+                   SET status='DEFERRED_WAITING',updated_at=?
+                   WHERE feedback_review_id=? AND status='REVIEWING'""",
+                (now, feedback_review_id),
+            )
+        return self.feedback_review(feedback_review_id)  # type: ignore[return-value]
+
+    def pending_workflow_comments(
+        self, thread_id: str, *, due_at: str | None = None
+    ) -> list[WorkflowCommentOutboxRecord]:
+        if due_at is None:
+            rows = self.connection.execute(
+                """SELECT * FROM workflow_comment_outbox_v1
+                   WHERE thread_id=? AND status='PENDING'
+                   ORDER BY created_at,outbox_id""",
+                (thread_id,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                """SELECT * FROM workflow_comment_outbox_v1
+                   WHERE thread_id=? AND status='PENDING' AND next_attempt_at<=?
+                   ORDER BY created_at,outbox_id""",
+                (thread_id, due_at),
+            ).fetchall()
+        return [WorkflowCommentOutboxRecord(**dict(row)) for row in rows]
+
+    def update_workflow_comment(
+        self,
+        outbox_id: str,
+        *,
+        status: str,
+        now: str,
+        comment_id: int | None = None,
+        error_message: str | None = None,
+        next_attempt_at: str | None = None,
+    ) -> WorkflowCommentOutboxRecord:
+        if status not in {"PENDING", "DELIVERED", "AMBIGUOUS"}:
+            raise ValueError("workflow comment status is invalid")
+        with self.transaction(immediate=True) as db:
+            changed = db.execute(
+                """UPDATE workflow_comment_outbox_v1
+                   SET status=?,comment_id=?,error_message=?,updated_at=?,
+                       next_attempt_at=COALESCE(?,next_attempt_at),
+                       delivered_at=CASE WHEN ?='DELIVERED' THEN ? ELSE delivered_at END
+                   WHERE outbox_id=?""",
+                (
+                    status,
+                    comment_id,
+                    error_message,
+                    now,
+                    next_attempt_at,
+                    status,
+                    now,
+                    outbox_id,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise ValueError("workflow comment does not exist")
+        row = self.connection.execute(
+            "SELECT * FROM workflow_comment_outbox_v1 WHERE outbox_id=?",
+            (outbox_id,),
+        ).fetchone()
+        return WorkflowCommentOutboxRecord(**dict(row))
+
     def pending_revision_inputs(self, thread_id: str) -> list[sqlite3.Row]:
         return self.connection.execute(
             """SELECT r.*,se.repo_full_name,se.source_kind,se.source_id,
@@ -7665,7 +8038,7 @@ class SQLiteGitHubStore:
         ).fetchone()
         if generic is not None:
             return self._declarative_thread_runnable(
-                generic=generic, pending=pending, actionable=actionable
+                generic=generic, pending=pending, actionable=actionable, now=now
             )
         if state is None:
             return actionable
@@ -7707,9 +8080,16 @@ class SQLiteGitHubStore:
         return False
 
     def _declarative_thread_runnable(
-        self, *, generic: sqlite3.Row, pending: list[sqlite3.Row], actionable: bool
+        self,
+        *,
+        generic: sqlite3.Row,
+        pending: list[sqlite3.Row],
+        actionable: bool,
+        now: str,
     ) -> bool:
         status = generic["status"]
+        if self.pending_workflow_comments(generic["thread_id"], due_at=now):
+            return True
         pending_revision = bool(self.pending_revision_inputs(generic["thread_id"]))
         if status == "FAILED":
             return False
