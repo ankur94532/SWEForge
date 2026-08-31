@@ -435,7 +435,11 @@ CREATE TABLE IF NOT EXISTS thread_input_consumptions (
     purpose TEXT NOT NULL,
     status TEXT NOT NULL,
     claimed_at TEXT NOT NULL,
-    consumed_at TEXT
+    consumed_at TEXT,
+    -- Set only for a two-stage lifecycle resume: the exact occurrence this
+    -- event was bound to. ``consumed_at IS NULL`` means claimed but not yet
+    -- proven applied, so a restart may replay it against this occurrence only.
+    occurrence_key TEXT
 );
 CREATE TABLE IF NOT EXISTS clarification_requests (
     clarification_id TEXT PRIMARY KEY,
@@ -1276,6 +1280,7 @@ class WorkflowInputRecord:
     status: str
     claimed_at: str
     consumed_at: str | None
+    occurrence_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1495,6 +1500,16 @@ class SQLiteGitHubStore:
         if "config_generation_id" not in thread_columns:
             self.connection.execute(
                 "ALTER TABLE issue_threads ADD COLUMN config_generation_id TEXT"
+            )
+        consumption_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(thread_input_consumptions)"
+            )
+        }
+        if "occurrence_key" not in consumption_columns:
+            self.connection.execute(
+                "ALTER TABLE thread_input_consumptions ADD COLUMN occurrence_key TEXT"
             )
         cycle_columns = {
             row[1]
@@ -7736,6 +7751,81 @@ class SQLiteGitHubStore:
             )
         return self.input_consumption(event_key)  # type: ignore[return-value]
 
+    def claim_input_for_resume(
+        self,
+        event_key: str,
+        *,
+        thread_id: str,
+        cycle_id: int,
+        status: str,
+        occurrence_key: str,
+        claimed_at: str,
+    ) -> WorkflowInputRecord:
+        """Bind one human input to an exact occurrence without consuming it.
+
+        The row leaves this method with ``consumed_at IS NULL``: the input is
+        removed from the unconsumed candidate set so nothing else can select it
+        for a different purpose, but it is not yet recorded as applied. A worker
+        that dies before the transition lands leaves this claim behind, and the
+        next tick replays that exact event against that exact occurrence.
+        """
+        with self.transaction(immediate=True) as db:
+            db.execute(
+                """INSERT INTO thread_input_consumptions(
+                   event_key, thread_id, cycle_id, purpose, status, claimed_at,
+                   consumed_at, occurrence_key) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                   ON CONFLICT(event_key) DO NOTHING""",
+                (
+                    event_key,
+                    thread_id,
+                    cycle_id,
+                    InputPurpose.CLARIFICATION_ROUTED.value,
+                    status,
+                    claimed_at,
+                    occurrence_key,
+                ),
+            )
+        record = self.input_consumption(event_key)
+        assert record is not None
+        if record.occurrence_key != occurrence_key or record.status != status:
+            # An event already bound to one occurrence can never be rebound.
+            raise ValueError("human input is already bound to another occurrence")
+        return record
+
+    def finish_input_resume(
+        self,
+        event_key: str,
+        *,
+        applied_at: str,
+        status: str | None = None,
+    ) -> WorkflowInputRecord | None:
+        """Terminally record that a claimed input's transition is settled."""
+        with self.transaction(immediate=True) as db:
+            if status is None:
+                db.execute(
+                    """UPDATE thread_input_consumptions SET consumed_at=?
+                       WHERE event_key=? AND consumed_at IS NULL""",
+                    (applied_at, event_key),
+                )
+            else:
+                db.execute(
+                    """UPDATE thread_input_consumptions SET consumed_at=?,status=?
+                       WHERE event_key=? AND consumed_at IS NULL""",
+                    (applied_at, status, event_key),
+                )
+        return self.input_consumption(event_key)
+
+    def pending_resume_claim(self, thread_id: str) -> WorkflowInputRecord | None:
+        """Return the one claimed-but-unapplied lifecycle resume, if any."""
+        row = self.connection.execute(
+            """SELECT * FROM thread_input_consumptions
+               WHERE thread_id=? AND consumed_at IS NULL
+                 AND occurrence_key IS NOT NULL
+               ORDER BY claimed_at, event_key LIMIT 1""",
+            (thread_id,),
+        ).fetchone()
+        return self._input_record(row) if row else None
+
     def deferred_followup(
         self, source_event_key: str, *, deferred_id: str | None = None
     ) -> DeferredFollowupRecord | None:
@@ -8205,6 +8295,14 @@ class SQLiteGitHubStore:
         if task is None:
             return True
         if task["phase"] in {"PLANNING", "EXECUTING", "VALIDATING"}:
+            return True
+        if self.pending_resume_claim(generic["thread_id"]) is not None:
+            # A human input claimed for an exact occurrence but not yet proven
+            # applied. Claiming removes it from the unconsumed set, so without
+            # this clause a worker that died mid-delivery would strand the
+            # thread until the user repeated the action. The controller replays
+            # the exact claim, or reconciles it when the transition already
+            # landed.
             return True
         if self.feedback_review_for_task(task["task_run_id"]) is not None:
             # A semantic feedback review is still in flight. Beginning one

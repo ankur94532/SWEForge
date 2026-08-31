@@ -712,6 +712,18 @@ The two directions of user input stay distinct:
 
 Only the second interrupts anything, and only because SWEForge asked first.
 
+**Delivery is crash-safe.** A human lifecycle input — a plan approval, a result
+approval, a clarification answer — is durably *bound* to one exact workflow
+occurrence before its transition is attempted, and is only recorded as consumed
+once that transition provably landed. Attempting delivery is never enough. If a
+worker dies in between, the next tick replays that exact input against that
+exact occurrence; if the transition had already succeeded, recovery recognizes
+the existing authorization provenance and finalizes the input instead of
+applying it twice. A binding is never transferred: an input claimed for one plan
+or result occurrence can never authorize a newer one, and a superseded binding
+fails closed. In practice, nobody should have to repeat an approval or a
+clarification answer just because a SWEForge worker restarted.
+
 ### Untrusted input handling
 
 Every model-facing GitHub string is labelled as untrusted content in the prompt

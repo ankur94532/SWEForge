@@ -119,6 +119,10 @@ class DeclarativeWorkflowController:
             cycle = self._begin_cycle(thread_id)
             if cycle is None:
                 return ControllerResult(thread_id, "IDLE")
+        # Reconcile a claim left behind by a worker that died mid-delivery
+        # before any branch can return: its transition either provably landed
+        # or its occurrence was decided without it.
+        self._settle_resume_claim(cycle)
         if cycle.status == WorkflowCycleStatus.FAILED:
             failed_task = self.runtime.active_task(cycle.workflow_cycle_id)
             return ControllerResult(
@@ -217,6 +221,7 @@ class DeclarativeWorkflowController:
                     return self._result(cycle, task, "WAITING_FOR_PLAN_APPROVAL")
             else:
                 driver.drive(cycle=cycle, task=task, prompt="", resume=resume)
+                self._mark_resume_applied(resume)
         elif task.phase == TaskPhase.WAITING_FOR_RESULT_APPROVAL:
             if mode == InteractionMode.AUTO:
                 before = task
@@ -273,12 +278,14 @@ class DeclarativeWorkflowController:
                     return self._result(cycle, task, "WAITING_FOR_RESULT_APPROVAL")
             else:
                 driver.drive(cycle=cycle, task=task, prompt="", resume=resume)
+                self._mark_resume_applied(resume)
         elif task.phase == TaskPhase.WAITING_FOR_INPUT:
             resume = self._clarification_resume(cycle, task, driver)
             if resume is None:
                 driver.reconcile_interrupts(cycle=cycle, task=task)
                 return self._result(cycle, task, "WAITING_FOR_INPUT")
             driver.drive(cycle=cycle, task=task, prompt="", resume=resume)
+            self._mark_resume_applied(resume)
         else:
             driver.drive(
                 cycle=cycle,
@@ -607,6 +614,27 @@ class DeclarativeWorkflowController:
                 "feedback": active_review.feedback_text,
             }
         root = self._root_event(cycle)
+
+        def plan_payload(event: Any) -> dict[str, Any]:
+            return {
+                "kind": "PLAN_APPROVAL",
+                "occurrence_key": plan.approval_occurrence_key,
+                "event_key": event["event_key"],
+                "approved_by": event["author_login"],
+                "approved_at": event["source_created_at"],
+                "authorized": True,
+            }
+
+        replayed = self._claimed_resume(
+            cycle,
+            task,
+            driver,
+            kind="PLAN_APPROVAL",
+            occurrence_key=plan.approval_occurrence_key,
+            build=plan_payload,
+        )
+        if replayed is not None:
+            return replayed
         for event in self.store.unconsumed_inputs(cycle.thread_id):
             if not self._same_target(event, root) or not self._after(
                 event["source_created_at"], plan.posted_at
@@ -621,17 +649,11 @@ class DeclarativeWorkflowController:
                 authorized = self._authorized_approver(
                     root["repo_full_name"], event["author_login"]
                 )
-                self._consume(event, cycle, "PLAN_APPROVAL" if authorized else "STALE")
                 if not authorized:
+                    self._consume(event, cycle, "STALE")
                     continue
-                return {
-                    "kind": "PLAN_APPROVAL",
-                    "occurrence_key": plan.approval_occurrence_key,
-                    "event_key": event["event_key"],
-                    "approved_by": event["author_login"],
-                    "approved_at": event["source_created_at"],
-                    "authorized": True,
-                }
+                self._claim(event, cycle, "PLAN_APPROVAL", plan.approval_occurrence_key)
+                return plan_payload(event)
             if starts_with_agent_invocation(event["body"]):
                 review = self.store.begin_feedback_review(
                     event_key=event["event_key"],
@@ -675,6 +697,25 @@ class DeclarativeWorkflowController:
         if not occurrence:
             raise RuntimeError("waiting clarification occurrence is missing")
         root = self._root_event(cycle)
+
+        def clarification_payload(event: Any) -> dict[str, Any]:
+            return {
+                "kind": "CLARIFICATION_RESPONSE",
+                "occurrence_key": occurrence,
+                "event_key": event["event_key"],
+                "answer": normalize_task(event["body"]),
+            }
+
+        replayed = self._claimed_resume(
+            cycle,
+            task,
+            driver,
+            kind="CLARIFICATION_RESPONSE",
+            occurrence_key=occurrence,
+            build=clarification_payload,
+        )
+        if replayed is not None:
+            return replayed
         if not self._has_pending_interrupt(
             driver, cycle, task, "CLARIFICATION", occurrence
         ):
@@ -693,13 +734,8 @@ class DeclarativeWorkflowController:
                 self._consume(event, cycle, "STALE_APPROVAL")
                 continue
             if starts_with_agent_invocation(event["body"]):
-                self._consume(event, cycle, "CLARIFICATION_RESPONSE")
-                return {
-                    "kind": "CLARIFICATION_RESPONSE",
-                    "occurrence_key": occurrence,
-                    "event_key": event["event_key"],
-                    "answer": normalize_task(event["body"]),
-                }
+                self._claim(event, cycle, "CLARIFICATION_RESPONSE", occurrence)
+                return clarification_payload(event)
         return None
 
     def _result_wait_resume(
@@ -737,6 +773,27 @@ class DeclarativeWorkflowController:
                 "feedback": active_review.feedback_text,
             }
         root = self._root_event(cycle)
+
+        def result_payload(event: Any) -> dict[str, Any]:
+            return {
+                "kind": "RESULT_APPROVAL",
+                "occurrence_key": result.result_occurrence_key,
+                "event_key": event["event_key"],
+                "approved_by": event["author_login"],
+                "approved_at": event["source_created_at"],
+                "authorized": True,
+            }
+
+        replayed = self._claimed_resume(
+            cycle,
+            task,
+            driver,
+            kind="RESULT_APPROVAL",
+            occurrence_key=result.result_occurrence_key,
+            build=result_payload,
+        )
+        if replayed is not None:
+            return replayed
         for event in self.store.unconsumed_inputs(cycle.thread_id):
             if not self._same_target(event, root) or not self._after(
                 event["source_created_at"], result.posted_at
@@ -755,19 +812,13 @@ class DeclarativeWorkflowController:
                 authorized = self._authorized_approver(
                     root["repo_full_name"], event["author_login"]
                 )
-                self._consume(
-                    event, cycle, "RESULT_APPROVAL" if authorized else "STALE"
-                )
                 if not authorized:
+                    self._consume(event, cycle, "STALE")
                     continue
-                return {
-                    "kind": "RESULT_APPROVAL",
-                    "occurrence_key": result.result_occurrence_key,
-                    "event_key": event["event_key"],
-                    "approved_by": event["author_login"],
-                    "approved_at": event["source_created_at"],
-                    "authorized": True,
-                }
+                self._claim(
+                    event, cycle, "RESULT_APPROVAL", result.result_occurrence_key
+                )
+                return result_payload(event)
             if starts_with_agent_invocation(event["body"]):
                 review = self.store.begin_feedback_review(
                     event_key=event["event_key"],
@@ -911,6 +962,183 @@ class DeclarativeWorkflowController:
         except Exception:
             return False
         return str(permission).lower() in {"admin", "maintain", "write"}
+
+    # Interrupt kind for each claimed resume kind; the resume payload carries
+    # the same name except clarification, whose interrupt is CLARIFICATION.
+    _INTERRUPT_KIND = {
+        "PLAN_APPROVAL": "PLAN_APPROVAL",
+        "RESULT_APPROVAL": "RESULT_APPROVAL",
+        "CLARIFICATION_RESPONSE": "CLARIFICATION",
+    }
+
+    def _claim(
+        self,
+        event: Any,
+        cycle: WorkflowCycle,
+        status: str,
+        occurrence_key: str,
+    ) -> None:
+        """Bind an input to its occurrence before the transition is attempted."""
+        self.store.claim_input_for_resume(
+            event["event_key"],
+            thread_id=cycle.thread_id,
+            cycle_id=cycle.cycle_id,
+            status=status,
+            occurrence_key=occurrence_key,
+            claimed_at=self.clock(),
+        )
+
+    def _mark_resume_applied(self, resume: dict[str, Any] | None) -> None:
+        """Record successful application; delivery alone is never enough."""
+        if not resume:
+            return
+        kind = str(resume.get("kind") or "")
+        if kind not in self._INTERRUPT_KIND:
+            return
+        event_key = str(resume.get("event_key") or "")
+        if event_key:
+            self.store.finish_input_resume(event_key, applied_at=self.clock())
+
+    def _current_occurrence(self, task: TaskRun, kind: str) -> str | None:
+        """The exact occurrence a claimed input of this kind may still target."""
+        if kind == "PLAN_APPROVAL":
+            if task.current_plan_id is None:
+                return None
+            return self.runtime.plan(task.current_plan_id).approval_occurrence_key
+        if kind == "RESULT_APPROVAL":
+            result = self.runtime.current_result(task.task_run_id)
+            return result.result_occurrence_key if result else None
+        if kind == "CLARIFICATION_RESPONSE":
+            return task.clarification_occurrence_key
+        return None
+
+    def _occurrence_exists(self, table: str, column: str, claim: Any) -> bool:
+        """An artifact bearing this occurrence must exist to be replayable."""
+        return (
+            self.store.connection.execute(
+                f"SELECT 1 FROM {table} WHERE {column}=?",  # noqa: S608
+                (claim.occurrence_key,),
+            ).fetchone()
+            is not None
+        )
+
+    def _claim_verdict(self, claim: Any) -> str | None:
+        """Decide a claim from durable provenance about its exact occurrence.
+
+        Occurrence-scoped rather than task-scoped, so a claim is still settled
+        after its task finished or released ownership. Returns ``"APPLIED"``
+        when this exact event caused the transition, ``"SUPERSEDED"`` when the
+        occurrence was decided by something else or no longer exists, and
+        ``None`` while it remains legitimately replayable.
+        """
+        kind = claim.status
+        if kind == "PLAN_APPROVAL":
+            if not self._occurrence_exists(
+                "workflow_task_plans_v1", "approval_occurrence_key", claim
+            ):
+                return "SUPERSEDED"
+            decided = self.store.connection.execute(
+                """SELECT permit.approval_event_key AS event_key
+                   FROM workflow_task_permits_v1 AS permit
+                   JOIN workflow_task_plans_v1 AS plan ON plan.plan_id=permit.plan_id
+                   WHERE plan.approval_occurrence_key=?""",
+                (claim.occurrence_key,),
+            ).fetchone()
+        elif kind == "RESULT_APPROVAL":
+            if not self._occurrence_exists(
+                "workflow_task_results_v1", "result_occurrence_key", claim
+            ):
+                return "SUPERSEDED"
+            decided = self.store.connection.execute(
+                """SELECT approval_event_key AS event_key
+                   FROM workflow_task_result_approvals_v1
+                   WHERE result_occurrence_key=?""",
+                (claim.occurrence_key,),
+            ).fetchone()
+        elif kind == "CLARIFICATION_RESPONSE":
+            # resume_clarification clears the occurrence and restores the phase,
+            # so a task still parked on it is the only un-applied state.
+            waiting = self.store.connection.execute(
+                """SELECT 1 FROM workflow_task_runs_v1
+                   WHERE clarification_occurrence_key=? AND phase=?""",
+                (claim.occurrence_key, TaskPhase.WAITING_FOR_INPUT.value),
+            ).fetchone()
+            return None if waiting is not None else "APPLIED"
+        else:
+            return "SUPERSEDED"
+        if decided is None:
+            return None
+        return "APPLIED" if decided["event_key"] == claim.event_key else "SUPERSEDED"
+
+    def _settle_resume_claim(self, cycle: WorkflowCycle) -> None:
+        """Finalize any claim whose occurrence has already been decided.
+
+        A claim that is still un-decided is deliberately left alone: the waiting
+        branch replays it against its exact occurrence.
+        """
+        claim = self.store.pending_resume_claim(cycle.thread_id)
+        if claim is None:
+            return
+        verdict = (
+            self._claim_verdict(claim)
+            if claim.status in self._INTERRUPT_KIND
+            else "SUPERSEDED"
+        )
+        if verdict is None:
+            return
+        self.store.finish_input_resume(
+            claim.event_key,
+            applied_at=self.clock(),
+            status=None if verdict == "APPLIED" else "STALE",
+        )
+        if self.tracer is not None:
+            self.tracer.emit(
+                "RESUME RECONCILED" if verdict == "APPLIED" else "RESUME STALE",
+                f"kind={claim.status} event={claim.event_key}",
+                TraceContext(
+                    thread_id=cycle.thread_id,
+                    workflow_cycle_id=cycle.workflow_cycle_id,
+                    cycle_id=cycle.cycle_id,
+                ),
+            )
+
+    def _claimed_resume(
+        self,
+        cycle: WorkflowCycle,
+        task: TaskRun,
+        driver: WorkflowAgentDriver,
+        *,
+        kind: str,
+        occurrence_key: str,
+        build: Callable[[Any], dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Replay an unapplied claim against its exact pending interrupt."""
+        claim = self.store.pending_resume_claim(cycle.thread_id)
+        if (
+            claim is None
+            or claim.status != kind
+            or claim.occurrence_key != occurrence_key
+        ):
+            return None
+        event = self.store.source_event(claim.event_key)
+        if event is None:
+            self.store.finish_input_resume(
+                claim.event_key, applied_at=self.clock(), status="STALE"
+            )
+            return None
+        if not self._has_pending_interrupt(
+            driver, cycle, task, self._INTERRUPT_KIND[kind], occurrence_key
+        ):
+            # No interrupt and no proof of application: fail closed and keep the
+            # claim durable for diagnosis rather than rebinding the input.
+            return None
+        if self.tracer is not None:
+            self.tracer.emit(
+                "RESUME REPLAYED",
+                f"kind={kind} event={claim.event_key}",
+                self._trace_context(cycle, task),
+            )
+        return build(event)
 
     def _consume(self, event: Any, cycle: WorkflowCycle, status: str) -> None:
         self.store.record_input_disposition(
