@@ -687,6 +687,54 @@ def test_clarification_keeps_owner_and_rejects_approval_as_answer(tmp_path):
     FakeDriver.clarify_once = False
 
 
+def test_plain_comment_without_agent_does_not_answer_a_clarification(tmp_path):
+    """Only an `@agent ...` reply is a solicited answer."""
+    FakeDriver.events = []
+    FakeDriver.verdicts = {}
+    FakeDriver.clarify_once = True
+    FakeDriver.clarified = False
+    FakePublisher.calls = []
+    server = _server(tmp_path)
+    _record(
+        server.config.db,
+        "issues",
+        _event(
+            SourceKind.ISSUE, "root", "@agent ask if needed", "2026-01-01T00:00:00Z"
+        ),
+    )
+    thread_id = "github:41:issue:9"
+    server._worker_entry(thread_id)
+
+    chatter = _event(
+        SourceKind.ISSUE_COMMENT,
+        "chatter",
+        "I think the existing API is fine, personally.",
+        "2026-01-01T00:40:00Z",
+    )
+    _record(server.config.db, "issue_comments", chatter)
+    server._worker_entry(thread_id)
+    store = SQLiteGitHubStore(server.config.db)
+    task = store.connection.execute("SELECT * FROM workflow_task_runs_v1").fetchone()
+    assert task["phase"] == "WAITING_FOR_INPUT"
+    assert ("implementation", "CLARIFIED") not in FakeDriver.events
+    store.close()
+
+    answer = _event(
+        SourceKind.ISSUE_COMMENT,
+        "answer",
+        "@agent use the existing API",
+        "2026-01-01T00:41:00Z",
+    )
+    _record(server.config.db, "issue_comments", answer)
+    server._worker_entry(thread_id)
+    store = SQLiteGitHubStore(server.config.db)
+    task = store.connection.execute("SELECT * FROM workflow_task_runs_v1").fetchone()
+    assert task["phase"] == "WAITING_FOR_PLAN_APPROVAL"
+    assert ("implementation", "CLARIFIED") in FakeDriver.events
+    store.close()
+    FakeDriver.clarify_once = False
+
+
 def test_queued_deferred_followup_becomes_generic_revision_cycle(tmp_path):
     FakeDriver.events = []
     FakeDriver.verdicts = {}

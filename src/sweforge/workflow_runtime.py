@@ -832,7 +832,16 @@ class WorkflowRuntime:
 
     def assert_execution_authorized(self, task_run_id: str) -> TaskPermit:
         task = self.task(task_run_id)
-        if task.phase != TaskPhase.EXECUTING:
+        # A task paused for clarification *from* execution is still the durable
+        # owner of an authorized execution: LangGraph replays the clarification
+        # gateway before ``resume_clarification`` runs, so the durable phase is
+        # still WAITING_FOR_INPUT at that moment. Only the application creates
+        # that state, and only from EXECUTING. Every permit, plan, mode and
+        # provenance check below is unchanged.
+        if task.phase != TaskPhase.EXECUTING and not (
+            task.phase == TaskPhase.WAITING_FOR_INPUT
+            and task.waiting_from_phase == TaskPhase.EXECUTING
+        ):
             raise PermissionError("task is not executing")
         cycle = self.cycle(task.workflow_cycle_id)
         if (

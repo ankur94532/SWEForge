@@ -465,6 +465,12 @@ lifecycle authority, deterministic task scheduling, or the publication
 eligibility proof — which independently checks that permit and result-approval
 provenance match the thread's recorded interaction mode.
 
+AUTO removes the *routine* plan and result approval pauses; it does not force
+the model to guess. An AUTO issue can still ask a narrowly scoped
+[clarification](#feedback-and-revision-loops) when progress would otherwise
+require inventing a decision only a human owns, and it waits for that answer.
+Nothing in AUTO answers the question for it.
+
 ## Skills and capabilities
 
 Skills are repo-scoped, operator-installed **procedural knowledge**. They are
@@ -680,12 +686,31 @@ A revision does not simply inherit the raw initial model conversation: revision
 cycles run under their own LangGraph checkpoint identity
 (`{thread_id}:revision:{workflow_cycle_id}`).
 
-**Clarification.** During execution the agent may call `request_clarification`
-when specific missing information blocks safe continuation. That performs a
-native checkpoint interrupt, the task enters `WAITING_FOR_INPUT`, and the
-question is posted back to the originating surface. Resume is selected by
+**Clarification.** From **planning, execution or validation**, the root agent
+may call `request_clarification` when a missing human decision materially
+blocks safe progress — not for anything it could discover with its own
+authorized tools, and never for routine approval. It is an application-owned
+root lifecycle service, available in every normal runnable phase without a
+workflow having to name it, and it is never given to the bounded investigator
+or to a feedback review.
+
+Calling it performs a native checkpoint interrupt and posts the question back to
+the originating surface. The same task stays the active owner, records the phase
+it paused from, and enters `WAITING_FOR_INPUT`; no peer task starts. The answer
+resumes that exact task in that exact originating phase. It authorizes nothing:
+an execution-phase clarification still needs its permit to be valid on resume,
+and an answer is never a plan or result approval. Resume is selected by
 interrupt occurrence, so two clarifications each receive their own answer, and
 an exact `@agent approve` is not accepted as an answer.
+
+The two directions of user input stay distinct:
+
+| Input | Effect |
+| --- | --- |
+| Unsolicited `@agent …` steering during active work | durably queued, never interrupts the running model call, handled at the next safe revision boundary |
+| An answer to a clarification SWEForge itself asked | resumes the current task in the current cycle |
+
+Only the second interrupts anything, and only because SWEForge asked first.
 
 ### Untrusted input handling
 

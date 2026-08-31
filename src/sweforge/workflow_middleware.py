@@ -28,6 +28,26 @@ RESEARCH_TOOLS = frozenset({"ls", "read_file", "glob", "grep", "search_issue_mem
 # it is authorized here for EXECUTING only.
 HARNESS_EXECUTION_TOOLS = frozenset({"write_todos"})
 
+# Root-only lifecycle services the application owns in every normal runnable
+# phase. ``request_clarification`` is a durable gateway, not domain authority:
+# it persists one occurrence, keeps the same active task, records the
+# originating phase, interrupts, and resumes exactly there. It approves,
+# authorizes and finishes nothing, so it is authorized here rather than being
+# repeated in every repository workflow. It stays recognized workflow
+# vocabulary, so specs that already name it keep parsing unchanged.
+ROOT_LIFECYCLE_SERVICES = frozenset({"request_clarification"})
+
+CLARIFICATION_GUIDANCE = (
+    " You may call request_clarification when a missing human decision "
+    "materially prevents safe progress in this phase. Do not ask for anything "
+    "discoverable with your current authorized skills and tools, and do not ask "
+    "merely because one approach would be easier. Never ask for routine "
+    "approval: the lifecycle gateways own plan and result authorization. Ask "
+    "one narrow, concrete question, preferring CHOICE, BOOLEAN or VALUE when "
+    "the answer space is structured and TEXT only for genuinely open-ended "
+    "missing information. Otherwise proceed autonomously."
+)
+
 EXECUTION_TODO_GUIDANCE = (
     " Native `write_todos` working memory is available for this execution "
     "phase. Use it when the authorized plan needs three or more distinct "
@@ -246,10 +266,14 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
             if snapshot.phase == TaskPhase.EXECUTING
             else frozenset()
         )
+        # Only PLANNING, EXECUTING and VALIDATING reach here; the restricted
+        # feedback-review branches returned above and must not be able to
+        # escape their exact replan/defer decision by asking a question.
         return (
             configured
             | validation_service
             | harness
+            | ROOT_LIFECYCLE_SERVICES
             | {
                 _phase_gateway(snapshot.phase),
                 "task",
@@ -268,6 +292,8 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
             "Authorized procedural skills: "
             f"{', '.join(snapshot.skills or (snapshot.skill,))}."
         )
+        if "request_clarification" in allowed:
+            prompt += CLARIFICATION_GUIDANCE
         if snapshot.phase == TaskPhase.EXECUTING and "write_todos" in allowed:
             prompt += (
                 f" Execution identity: task_run={snapshot.task_run_id} "
@@ -390,11 +416,17 @@ class DelegatedWorkflowPolicyMiddleware(AgentMiddleware):
         # The intersection with ``configured_tools`` already excludes it, but the
         # subtraction keeps that true if either set ever grows.
         return (
-            RESEARCH_TOOLS
-            | frozenset(
-                name for name, effect in self.tool_effects.items() if effect == "read"
+            (
+                RESEARCH_TOOLS
+                | frozenset(
+                    name
+                    for name, effect in self.tool_effects.items()
+                    if effect == "read"
+                )
             )
-        ) - HARNESS_EXECUTION_TOOLS
+            - HARNESS_EXECUTION_TOOLS
+            - ROOT_LIFECYCLE_SERVICES
+        )
 
     def wrap_model_call(self, request, handler):
         snapshot = self.authority.snapshot()
