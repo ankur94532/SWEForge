@@ -315,12 +315,26 @@ def derive_revision_spec(initial: WorkflowSpec) -> WorkflowSpec:
     def ordered(values):
         return list(dict.fromkeys(values))
 
-    all_skills = ordered(
-        skill
-        for task in initial.tasks
-        for phase in (task.planning, task.execution, task.validation)
-        for skill in phase.skills
-    )
+    def phase_skills(select, label):
+        """Union one phase's skills across tasks, in declaration order.
+
+        Each phase is derived independently: a revision may use everything the
+        original workflow was trusted to use in the SAME phase, and never a
+        skill it was only trusted with elsewhere.
+        """
+        skills = ordered(
+            skill for task in initial.tasks for skill in select(task).skills
+        )
+        if not skills:
+            # Every parsed phase requires a primary skill, so an empty union is
+            # an impossible internal state. Fail rather than silently borrow
+            # another phase's skill.
+            raise ValueError(f"revision {label} phase derived no trusted skill")
+        return skills
+
+    planning_skills = phase_skills(lambda task: task.planning, "planning")
+    execution_skills = phase_skills(lambda task: task.execution, "execution")
+    validation_skills = phase_skills(lambda task: task.validation, "validation")
     research = {"ls", "read_file", "glob", "grep", "search_issue_memory"}
     trusted_research = ordered(
         tool
@@ -355,18 +369,18 @@ def derive_revision_spec(initial: WorkflowSpec) -> WorkflowSpec:
                 "id": "revision",
                 "depends_on": [],
                 "planning": {
-                    "skill": all_skills[0],
-                    "skills": all_skills[1:],
+                    "skill": planning_skills[0],
+                    "skills": planning_skills[1:],
                     "tools": planning_tools,
                 },
                 "execution": {
-                    "skill": all_skills[0],
-                    "skills": all_skills[1:],
+                    "skill": execution_skills[0],
+                    "skills": execution_skills[1:],
                     "tools": execution_tools,
                 },
                 "validation": {
-                    "skill": all_skills[0],
-                    "skills": all_skills[1:],
+                    "skill": validation_skills[0],
+                    "skills": validation_skills[1:],
                     "tools": validation_tools,
                 },
             }

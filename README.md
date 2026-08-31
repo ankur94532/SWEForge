@@ -630,9 +630,25 @@ gateways, and decides one thing:
 **Generic revision workflow.** The structured, operator-declared workflow runs
 **once** per issue. After the initial workflow completes, later independent
 steering is handled by a derived single-task `revision` workflow that reuses the
-same IssueThread, worktree, branch and pull request. Its planning phase is
-stripped of mutation tools; its skill set is the union of the initial
-workflow's skills, exposed through the same progressive catalog.
+same IssueThread, worktree, branch and pull request.
+
+Its capability envelope is a deterministic **phase-wise** union of what the
+original workflow was trusted with in that same phase:
+
+| Revision phase | Skills | Tools |
+| --- | --- | --- |
+| PLANNING | every task's planning skills | every task's planning tools, minus mutation |
+| EXECUTING | every task's execution skills | every task's execution tools |
+| VALIDATING | every task's validation skills | every task's validation tools |
+
+plus the trusted research tools the original workflow already used. Capabilities
+do not leak across phases: a skill the original workflow trusted only during
+execution is not advertised — or readable — while the revision is planning. A
+skill legitimately named in two original phases appears in both derived sets,
+because each phase is derived independently. Ordering follows task declaration
+order and then each phase's own skill order, deduplicated first-occurrence-wins,
+so the derivation is stable. The revision model chooses freely within that
+envelope, exposed through the same progressive skill catalog.
 
 Batching:
 

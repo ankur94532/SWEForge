@@ -5,13 +5,17 @@ import pytest
 
 from sweforge.agent import build_durable_workflow_agent, build_workflow_agent
 from sweforge.agent_trace import AgentTracer
+from sweforge.github_models import RepositoryRef, SourceEvent, SourceKind, SubjectKind
+from sweforge.github_store import SQLiteGitHubStore
 from sweforge.workflow_middleware import (
     DelegatedWorkflowPolicyMiddleware,
+    WorkflowAuthority,
     WorkflowPolicyMiddleware,
     WorkflowPolicySnapshot,
     WorkflowSkillsMiddleware,
 )
-from sweforge.workflow_runtime import TaskPhase
+from sweforge.workflow_runtime import TaskPhase, WorkflowCycleKind, WorkflowRuntime
+from sweforge.workflow_spec import derive_revision_spec, parse_workflow_spec
 
 
 class Runtime:
@@ -585,3 +589,215 @@ def test_reviewing_feedback_still_authorizes_its_replayed_gateway(phase, kind, g
     # The review stays read-only: no mutation escapes through this branch.
     assert "edit_file" not in allowed
     assert "finish_execution" not in allowed
+
+
+# --- phase-wise revision skill authority ----------------------------------
+
+
+def _phase_skill_spec():
+    """Original workflow whose three phases carry visibly distinct skills."""
+    return parse_workflow_spec(
+        {
+            "version": 1,
+            "workflow_id": "phase-skills",
+            "tasks": [
+                {
+                    "id": task_id,
+                    "depends_on": depends,
+                    "planning": {
+                        "skill": f"plan-{task_id}",
+                        "tools": ["read_file", "glob"],
+                    },
+                    "execution": {
+                        "skill": f"execute-{task_id}",
+                        "tools": ["read_file", "edit_file", "execute"],
+                    },
+                    "validation": {
+                        "skill": f"validate-{task_id}",
+                        "tools": ["read_file", "run_validation"],
+                    },
+                }
+                for task_id, depends in (("api", []), ("db", ["api"]))
+            ],
+        }
+    )
+
+
+@pytest.fixture
+def revision_authority(tmp_path):
+    """A real revision cycle over the derived phase-wise envelope."""
+    store = SQLiteGitHubStore(tmp_path / "state.db")
+    repo = RepositoryRef(321, "example/repo")
+    event = SourceEvent(
+        repo_id=repo.repo_id,
+        repo_full_name=repo.full_name,
+        source_kind=SourceKind.ISSUE_COMMENT,
+        source_id="1",
+        source_updated_at="2026-01-01T00:00:00Z",
+        source_created_at="2026-01-01T00:00:00Z",
+        subject_kind=SubjectKind.ISSUE,
+        subject_number=9,
+        author_login="owner",
+        body="@agent revise",
+        html_url=None,
+    )
+    store.upsert_repository(repo.repo_id, repo.full_name, "now")
+    store.record_batch(
+        repo.repo_id, "issue_comments", [event], since="now", etag=None, polled_at="now"
+    )
+    thread_id = store.source_event(event.event_key)["thread_id"]
+    engine = WorkflowRuntime(store, clock=lambda: "2026-01-01T00:10:00Z")
+    revision_spec = derive_revision_spec(_phase_skill_spec())
+    cycle = engine.initialize_cycle(
+        thread_id=thread_id,
+        cycle_id=1,
+        root_input_id=event.event_key,
+        spec=revision_spec,
+        spec_ref="derived",
+        cycle_kind=WorkflowCycleKind.REVISION,
+        revision_sequence=1,
+    )
+    task = engine.select_active_task(cycle.workflow_cycle_id)
+    authority = WorkflowAuthority(engine, cycle.workflow_cycle_id, revision_spec)
+    yield engine, authority, task
+    store.close()
+
+
+def _advance_to_executing(engine, task):
+    plan = engine.submit_posted_plan(
+        task_run_id=task.task_run_id,
+        plan_text="revision plan",
+        posted_comment_id=1,
+        posted_at="2026-01-01T00:11:00Z",
+    )
+    engine.approve_plan(
+        task_run_id=task.task_run_id,
+        occurrence_key=plan.approval_occurrence_key,
+        approval_event_key="approval",
+        approved_by="maintainer",
+        approval_is_authorized=True,
+        approval_occurred_at="2026-01-01T00:12:00Z",
+    )
+
+
+def _advance_to_validating(engine, task):
+    engine.finish_execution(
+        task.task_run_id,
+        evidence={
+            "reported": {"done": True},
+            "tool_observations": [{"command": "t", "exit_code": 0, "output": "ok"}],
+        },
+    )
+
+
+PLANNING_SKILLS = ("plan-api", "plan-db")
+EXECUTION_SKILLS = ("execute-api", "execute-db")
+VALIDATION_SKILLS = ("validate-api", "validate-db")
+
+
+def test_revision_snapshot_exposes_exactly_the_derived_phase_skills(
+    revision_authority,
+):
+    engine, authority, task = revision_authority
+
+    assert authority.snapshot().skills == PLANNING_SKILLS
+    _advance_to_executing(engine, task)
+    assert authority.snapshot().skills == EXECUTION_SKILLS
+    _advance_to_validating(engine, task)
+    assert authority.snapshot().skills == VALIDATION_SKILLS
+
+
+def test_revision_skill_catalog_advertises_only_the_current_phase(revision_authority):
+    engine, authority, task = revision_authority
+
+    def catalog():
+        result = WorkflowSkillsMiddleware(
+            authority,
+            lambda _cycle_id, name: skill_content(
+                name, f"Guidance for {name}.", f"BODY {name}"
+            ),
+        ).wrap_model_call(
+            ModelRequest(tools=[SimpleNamespace(name="read_file")]), lambda item: item
+        )
+        return result.system_message.content
+
+    for advance, present, absent in (
+        (None, PLANNING_SKILLS, EXECUTION_SKILLS + VALIDATION_SKILLS),
+        (_advance_to_executing, EXECUTION_SKILLS, PLANNING_SKILLS + VALIDATION_SKILLS),
+        (_advance_to_validating, VALIDATION_SKILLS, PLANNING_SKILLS + EXECUTION_SKILLS),
+    ):
+        if advance is not None:
+            advance(engine, task)
+        prompt = catalog()
+        for name in present:
+            assert f"- {name}: Guidance for {name}." in prompt
+            assert f"/skills/{name}/SKILL.md" in prompt
+            assert f"BODY {name}" not in prompt
+        for name in absent:
+            assert name not in prompt
+
+
+def test_reading_another_revision_phase_skill_is_rejected(revision_authority):
+    engine, authority, task = revision_authority
+    policy = WorkflowPolicyMiddleware(authority)
+
+    # Planning may read its own skills, never an execution- or validation-only one.
+    assert (
+        policy.wrap_tool_call(
+            tool_request("read_file", {"file_path": "/skills/plan-api/SKILL.md"}),
+            lambda _item: "ok",
+        )
+        == "ok"
+    )
+    for name in EXECUTION_SKILLS + VALIDATION_SKILLS:
+        with pytest.raises(PermissionError, match="inactive task/phase skill"):
+            policy.wrap_tool_call(
+                tool_request("read_file", {"file_path": f"/skills/{name}/SKILL.md"}),
+                lambda _item: "ok",
+            )
+
+    _advance_to_executing(engine, task)
+    assert (
+        policy.wrap_tool_call(
+            tool_request("read_file", {"file_path": "/skills/execute-db/SKILL.md"}),
+            lambda _item: "ok",
+        )
+        == "ok"
+    )
+    for name in PLANNING_SKILLS + VALIDATION_SKILLS:
+        with pytest.raises(PermissionError, match="inactive task/phase skill"):
+            policy.wrap_tool_call(
+                tool_request("read_file", {"file_path": f"/skills/{name}/SKILL.md"}),
+                lambda _item: "ok",
+            )
+
+
+def test_single_skill_revision_phase_still_eagerly_loads_its_body(tmp_path):
+    """A one-skill phase keeps the eager-load path rather than a catalog."""
+    single = parse_workflow_spec(
+        {
+            "version": 1,
+            "workflow_id": "single",
+            "tasks": [
+                {
+                    "id": "only",
+                    "depends_on": [],
+                    "planning": {"skill": "plan-only", "tools": ["read_file"]},
+                    "execution": {"skill": "execute-only", "tools": ["read_file"]},
+                    "validation": {
+                        "skill": "validate-only",
+                        "tools": ["read_file", "run_validation"],
+                    },
+                }
+            ],
+        }
+    )
+    revision = derive_revision_spec(single)
+    assert revision.tasks[0].planning.skills == ("plan-only",)
+
+    authority = Authority(skills=("plan-only",))
+    result = WorkflowSkillsMiddleware(
+        authority, lambda _cycle_id, name: f"FULL {name} BODY"
+    ).wrap_model_call(ModelRequest(tools=[]), lambda item: item)
+    assert "[Trusted skill: plan-only]" in result.system_message.content
+    assert "FULL plan-only BODY" in result.system_message.content
