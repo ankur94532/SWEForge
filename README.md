@@ -91,13 +91,16 @@ feedback concerns the current approval scope.
 5. `@agent approve`, exactly and alone, is the only deterministic approval. It
    must target the current pending occurrence and come from a user with proven
    `admin`, `maintain` or `write` permission.
-6. Repository authority comes from operator-installed configuration
+6. Agent working memory is not workflow state. Deep Agents TODOs decompose an
+   already-authorized plan during `EXECUTING`; they never advance a phase,
+   finish a task, or widen what the plan authorizes.
+7. Repository authority comes from operator-installed configuration
    generations. Files inside the target repository are never treated as
    workflow, skill, tool, MCP or credential configuration.
-7. A cycle is bound to one immutable workflow specification digest (and, when
+8. A cycle is bound to one immutable workflow specification digest (and, when
    configured, one repository configuration generation). Restart rehydrates
    that exact specification.
-8. Fail closed. Missing sandbox, missing skill, missing credential, missing
+9. Fail closed. Missing sandbox, missing skill, missing credential, missing
    evidence, stale approval, ambiguous GitHub comment match — all stop the
    work rather than degrade it.
 
@@ -367,6 +370,56 @@ Scheduling is deterministic and serialized:
 
 If the dispatcher fails a task terminally, the task and its cycle become
 `FAILED`: no publication, no plan completion, no further model spend.
+
+### Three levels of planning
+
+Three separate things are called "planning", and keeping them apart is what
+makes the system safe to run:
+
+| Level | Owner | Decides | Authoritative? |
+| --- | --- | --- | --- |
+| Workflow DAG (`WorkflowSpec`) | operator / application | which tasks exist and in what order | yes — deterministic scheduling |
+| SWEForge PLANNING phase | root agent, then a human or AUTO policy | **what** work is authorized | yes — `submit_plan` + exact approval |
+| Deep Agents TODOs (`write_todos`) | model | **how** the authorized work gets carried out | no |
+
+`write_todos` is LangChain's native `TodoListMiddleware` tool, supplied by the
+Deep Agents harness. SWEForge does not reimplement it; it authorizes it, and
+only during `EXECUTING`:
+
+```
+PLANNING     configured planning tools + planning skills + submit_plan + task
+EXECUTING    configured execution tools + execution skills + finish_execution
+             + task + write_todos
+VALIDATING   configured validation tools + validation skills + run_validation
+             + finish_validation + task
+```
+
+Because the rule is phase-based, it applies to revision cycles for free, and a
+repository's `workflow.yaml` never has to name `write_todos` to get ordinary
+execution decomposition. The name is deliberately not part of the operator tool
+vocabulary — a workflow that lists it is still rejected as an unknown tool.
+
+TODOs are adaptive working memory for a non-trivial execution: *inspect the
+implementation, reproduce, make the smallest fix, update tests, run tests,
+review the diff*. The model is expected to revise and reorder them as it learns
+more, and to skip them entirely for trivial work.
+
+They are never workflow authority. Writing, updating or completing every TODO
+does not advance a phase, finish a task, approve a plan or result, expand what
+the approved plan authorizes, affect scheduling or dependencies, or substitute
+for `finish_execution` — which remains the only way out of `EXECUTING`. A
+`write_todos` call still passes the normal policy path, including the
+execution-permit revalidation every execution-phase root call gets, so a stale
+or de-authorized execution cannot keep writing todos. The bounded read-only
+investigator never receives the tool at all.
+
+Todo state lives in the native `todos` graph channel, so it persists across the
+IssueThread's checkpoint. Deep Agents marks that channel `OmitFromInput`, so
+there is no supported external way to reset it and SWEForge deliberately does
+not invent its own todo storage to fake one. Instead, the execution prompt
+carries the current task/plan/attempt identity and requires the model to
+replace any TODO that does not belong to it. Revision cycles get a separate
+checkpoint identity, so they start from an empty list regardless.
 
 ### MANUAL mode
 

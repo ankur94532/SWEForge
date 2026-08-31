@@ -19,6 +19,30 @@ from .workflow_spec import WorkflowSpec
 MUTATING_TOOLS = frozenset({"write_file", "edit_file", "execute"})
 RESEARCH_TOOLS = frozenset({"ls", "read_file", "glob", "grep", "search_issue_memory"})
 
+# Deep Agents / LangChain harness capabilities the root agent gets from the
+# agent framework itself rather than from operator domain configuration.
+# ``write_todos`` is native ``TodoListMiddleware`` working memory: it decomposes
+# an already-authorized plan into execution steps and mutates nothing outside
+# the agent's own graph state. It is deliberately absent from
+# ``BUILTIN_WORKFLOW_TOOLS`` so a repository workflow never has to name it, and
+# it is authorized here for EXECUTING only.
+HARNESS_EXECUTION_TOOLS = frozenset({"write_todos"})
+
+EXECUTION_TODO_GUIDANCE = (
+    " Native `write_todos` working memory is available for this execution "
+    "phase. Use it when the authorized plan needs three or more distinct "
+    "steps (for example: inspect implementation, reproduce, make the smallest "
+    "fix, update tests, run tests, review the final diff), and skip it for "
+    "trivial work. TODOs describe HOW you carry out the exact currently "
+    "authorized plan; they can never broaden WHAT that plan authorizes. They "
+    "are non-authoritative scratch state: completing every TODO does not "
+    "finish this phase, does not make the task DONE, and does not replace "
+    "finish_execution, which remains the only way to leave EXECUTING. Todo "
+    "state persists across this thread's checkpoint, so if any existing TODO "
+    "does not belong to the execution identity above, replace the whole list "
+    "with TODOs for this identity before relying on it."
+)
+
 
 @dataclass(frozen=True, slots=True)
 class WorkflowPolicySnapshot:
@@ -35,6 +59,8 @@ class WorkflowPolicySnapshot:
     feedback_review_id: str | None = None
     feedback_review_kind: str | None = None
     feedback_review_status: str | None = None
+    current_plan_id: str | None = None
+    execution_attempt: int = 0
 
 
 class WorkflowAuthority:
@@ -120,6 +146,8 @@ class WorkflowAuthority:
             feedback_review_id=(review.feedback_review_id if review else None),
             feedback_review_kind=(review.feedback_kind if review else None),
             feedback_review_status=(review.status if review else None),
+            current_plan_id=task.current_plan_id,
+            execution_attempt=task.execution_attempt,
         )
 
 
@@ -210,9 +238,18 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
         validation_service = (
             {"run_validation"} if snapshot.phase == TaskPhase.VALIDATING else set()
         )
+        # Native Deep Agents todo working memory is an execution-phase harness
+        # capability. Planning and validation stay structurally read-only and
+        # never receive it; the feedback-review branches above already returned.
+        harness = (
+            HARNESS_EXECUTION_TOOLS
+            if snapshot.phase == TaskPhase.EXECUTING
+            else frozenset()
+        )
         return (
             configured
             | validation_service
+            | harness
             | {
                 _phase_gateway(snapshot.phase),
                 "task",
@@ -231,6 +268,12 @@ class WorkflowPolicyMiddleware(AgentMiddleware):
             "Authorized procedural skills: "
             f"{', '.join(snapshot.skills or (snapshot.skill,))}."
         )
+        if snapshot.phase == TaskPhase.EXECUTING and "write_todos" in allowed:
+            prompt += (
+                f" Execution identity: task_run={snapshot.task_run_id} "
+                f"plan={snapshot.current_plan_id} "
+                f"attempt={snapshot.execution_attempt}." + EXECUTION_TODO_GUIDANCE
+            )
         if snapshot.feedback_review_status == "REVIEWING":
             prompt += (
                 " You are reviewing exact solicited user feedback for the current "
@@ -343,9 +386,15 @@ class DelegatedWorkflowPolicyMiddleware(AgentMiddleware):
 
     @property
     def research_tools(self) -> frozenset[str]:
-        return RESEARCH_TOOLS | frozenset(
-            name for name, effect in self.tool_effects.items() if effect == "read"
-        )
+        # Harness working memory belongs to the workflow-owning root agent only.
+        # The intersection with ``configured_tools`` already excludes it, but the
+        # subtraction keeps that true if either set ever grows.
+        return (
+            RESEARCH_TOOLS
+            | frozenset(
+                name for name, effect in self.tool_effects.items() if effect == "read"
+            )
+        ) - HARNESS_EXECUTION_TOOLS
 
     def wrap_model_call(self, request, handler):
         snapshot = self.authority.snapshot()

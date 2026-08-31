@@ -23,7 +23,7 @@ from deepagents.middleware.permissions import FilesystemPermission
 from deepagents.middleware.skills import SkillsMiddleware
 from deepagents.middleware.summarization import create_summarization_middleware
 from langchain.agents import create_agent
-from langchain.agents.middleware import AgentMiddleware
+from langchain.agents.middleware import AgentMiddleware, TodoListMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import InjectedToolCallId, tool
@@ -160,6 +160,14 @@ def build_durable_workflow_agent(
         tracer=tracer,
         tool_effects=effects,
     )
+    # Native LangChain/Deep Agents todo working memory. Supplying the middleware
+    # is what creates the real `write_todos` tool and its `todos` graph channel;
+    # SWEForge only authorizes it, and `WorkflowPolicyMiddleware` filters it to
+    # EXECUTING. Its own prose is suppressed with `system_prompt=""` so todo
+    # guidance reaches the model only through the execution-phase policy prompt,
+    # and it is listed last so it wraps innermost and never rewrites the system
+    # message the workflow middleware above it composed.
+    todos = TodoListMiddleware(system_prompt="")
     return build_workflow_agent(
         model=planning_model,
         tools=[*extra_tools, *lifecycle_tools],
@@ -182,6 +190,7 @@ def build_durable_workflow_agent(
             policy,
             WorkflowSkillsMiddleware(authority, read_skill, tracer=tracer),
             *(middleware or []),
+            todos,
         ],
         subagents=subagents,
     )
